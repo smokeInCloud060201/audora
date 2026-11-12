@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Audora",
+  "version": "0.1.0",
+  "identifier": "com.audora.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --dir apps/desktop/ui dev",
+    "beforeBuildCommand": "pnpm --dir apps/desktop/ui build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Audora",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 360,
+        "minHeight": 168,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost data: blob:; media-src 'self' asset: https://asset.localhost blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://api.github.com https://github.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app", "msi", "nsis", "deb", "appimage"],
+    "resources": [
+      "../../../THIRD_PARTY_NOTICES.md",
+      "../../../sbom.cdx.json"
+    ],
+    "icon": [
+      "../../../assets/icons/32x32.png",
+      "../../../assets/icons/icon.png"
+    ],
+    "licenseFile": "../../../LICENSE",
+    "copyright": "Copyright (c) 2026 Audora Contributors",
+    "category": "Video",
+    "shortDescription": "Local-first desktop audio & video player with timestamped notes",
+    "longDescription": "Cross-platform desktop audio and video player built with Rust and Tauri 2 that pairs clean playback with effortless timestamped notes.",
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "entitlements": "./Entitlements.plist",
+      "hardenedRuntime": true,
+      "signingIdentity": null,
+      "files": {
+        "Resources/uninstall-cleanup.sh": "./installer/macos/uninstall-cleanup.sh"
+      }
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "nsis": {
+        "installerHooks": "./installer/windows/nsis-hooks.nsh"
+      }
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/audora/postrm": "./installer/linux/postrm"
+        }
+      }
+    }
+  }
+}

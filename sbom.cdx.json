@@ -1,0 +1,82 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:7c3f8a40-6289-41f9-b532-9b194127e4c1",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "audora",
+      "version": "0.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "rusqlite",
+      "version": "0.32.1",
+      "licenses": [{ "license": { "id": "MIT" } }]
+    },
+    {
+      "type": "library",
+      "name": "serde",
+      "version": "1.0.215",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }]
+    },
+    {
+      "type": "library",
+      "name": "serde_json",
+      "version": "1.0.133",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }]
+    },
+    {
+      "type": "library",
+      "name": "thiserror",
+      "version": "2.0.3",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }]
+    },
+    {
+      "type": "library",
+      "name": "tracing",
+      "version": "0.1.40",
+      "licenses": [{ "license": { "id": "MIT" } }]
+    },
+    {
+      "type": "library",
+      "name": "sha2",
+      "version": "0.10.8",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }]
+    },
+    {
+      "type": "library",
+      "name": "tao",
+      "version": "0.31.1",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }]
+    },
+    {
+      "type": "library",
+      "name": "wry",
+      "version": "0.48.1",
+      "licenses": [{ "license": { "id": "Apache-2.0" } }]
+    },
+    {
+      "type": "library",
+      "name": "gstreamer",
+      "version": "1.28.1",
+      "licenses": [{ "license": { "id": "LGPL-2.1-or-later" } }]
+    },
+    {
+      "type": "library",
+      "name": "react",
+      "version": "19.0.0",
+      "licenses": [{ "license": { "id": "MIT" } }]
+    }
+  ]
+}

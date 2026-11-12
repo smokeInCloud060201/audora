@@ -1,0 +1,29 @@
+<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="audora-icon-32-clip">
+      <rect width="32" height="32" rx="7.04"/>
+    </clipPath>
+    <filter id="audora-aperture-glow-32" x="1.92" y="3.2" width="28.16" height="28.16" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="1.28"/>
+      <feGaussianBlur stdDeviation="1.92"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.47451 0 0 0 0 0.843137 0 0 0 0 0.74902 0 0 0 0.18 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="dropShadow"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="dropShadow" result="shape"/>
+    </filter>
+  </defs>
+  <g clip-path="url(#audora-icon-32-clip)">
+    <rect width="32" height="32" rx="7.04" fill="#101816"/>
+    <g filter="url(#audora-aperture-glow-32)">
+      <circle cx="16" cy="16" r="10.24" fill="#79D7BF"/>
+    </g>
+    <rect x="8.48" y="13.44" width="1.344" height="5.12" rx="0.672" fill="#101816"/>
+    <rect x="11.904" y="11.52" width="1.344" height="8.96" rx="0.672" fill="#101816"/>
+    <rect x="15.328" y="9.6" width="1.344" height="12.8" rx="0.672" fill="#101816"/>
+    <rect x="18.752" y="11.04" width="1.344" height="9.92" rx="0.672" fill="#101816"/>
+    <rect x="22.176" y="12.8" width="1.344" height="6.4" rx="0.672" fill="#101816"/>
+    <circle cx="22.576" cy="9.456" r="1.2" fill="#101816"/>
+    <rect x="0.5" y="0.5" width="31" height="31" rx="6.54" stroke="#FFFFFF" stroke-opacity="0.08"/>
+  </g>
+</svg>

@@ -2,7 +2,7 @@
 
 Audora is distributed under the **Apache License, Version 2.0** ([LICENSE](LICENSE)).
 
-This file documents the third-party open-source components used by Audora, their licenses, and instructions for replacing dynamically linked **LGPL-2.1+** multimedia libraries in accordance with [ADR 0002](docs/adr/0002-project-licensing-and-codec-policy.md) and [FORMAT_AND_LICENSE_MATRIX.md](docs/FORMAT_AND_LICENSE_MATRIX.md).
+This file documents the third-party open-source components used by Audora, their licenses, and instructions for replacing dynamically linked **LGPL-2.1+** multimedia libraries in accordance with [ADR 0002](.docs/adr/0002-project-licensing-and-codec-policy.md) and [FORMAT_AND_LICENSE_MATRIX.md](.docs/FORMAT_AND_LICENSE_MATRIX.md).
 
 ---
 

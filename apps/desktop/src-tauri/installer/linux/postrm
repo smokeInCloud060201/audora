@@ -1,0 +1,22 @@
+#!/bin/sh
+# Audora Debian/Ubuntu postrm hook
+set -e
+
+case "$1" in
+  purge|remove)
+    if [ -n "${SUDO_USER:-}" ]; then
+      USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    else
+      USER_HOME="${HOME:-}"
+    fi
+
+    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
+      rm -rf "$USER_HOME/.local/share/com.audora.desktop"
+      rm -rf "$USER_HOME/.local/share/audora"
+      rm -rf "$USER_HOME/.cache/com.audora.desktop"
+      rm -rf "$USER_HOME/.config/com.audora.desktop"
+    fi
+    ;;
+esac
+
+exit 0

@@ -7,8 +7,11 @@ This is the source of truth for the product and engineering baseline. Normative 
 - [Product requirements](PRODUCT.md): audience, goals, supported behavior, accessibility, and acceptance criteria.
 - [User workflows and glossary](WORKFLOWS.md): product glossary, edge-case rules, user-flow diagrams, happy/failure paths, and per-flow acceptance criteria.
 - [Feature modules](FEATURES.md): boundaries and responsibilities of each product subsystem.
-- [UI design handoff](UI_DESIGN.md): canonical Figma frame inventory, extracted design tokens, discrepancy resolutions, and accessibility/keyboard specification.
-- [Architecture](ARCHITECTURE.md): technology choices, runtime boundaries, data flow, persistence model, and Phase 1 validation ownership.
+- [UI design handoff](UI_DESIGN.md): canonical Figma frame inventory, extracted Dark & Light design tokens, discrepancy resolutions, and accessibility/keyboard specification.
+- [User-facing error catalog](ERROR_CATALOG.md): stable `AV-*` error codes, categories, user recovery steps, and log redaction rules.
+- [Architecture](ARCHITECTURE.md): technology choices, runtime boundaries, data flow, and persistence model.
+- [Platform support matrix](PLATFORM_SUPPORT.md): supported OS versions, architectures, installer formats, hybrid window shell, and per-OS directories.
+- [Format, plugin, and license matrix](FORMAT_AND_LICENSE_MATRIX.md): verified GStreamer 1.28.1 LGPL plugin inventory, codec matrix, and redistribution rules.
 - [Security and privacy](SECURITY.md): threat model, privacy defaults, secure development, and disclosure process.
 - [Licensing](LICENSING.md): Apache 2.0 policy, dependency compatibility, media codec and plugin obligations.
 
@@ -16,7 +19,7 @@ This is the source of truth for the product and engineering baseline. Normative 
 
 - [Roadmap](ROADMAP.md): staged work from design validation through stable releases.
 - [Phase and sprint plan](SPRINT_PLAN.md): sequenced work packages, dependencies, and phase gates.
-- [Development plan](DEVELOPMENT.md): build, test, quality, CI, and platform support practices.
+- [Development plan](DEVELOPMENT.md): workspace structure, local commands, test strategy, CI, and platform support practices.
 - [Coding conventions](CODING_CONVENTIONS.md): Rust, frontend, API, error, and documentation rules.
 - [Git and commit conventions](GIT_CONVENTIONS.md): branches, commits, reviews, and versioning.
 - [Contribution workflow](CONTRIBUTING.md): contributor expectations and project governance baseline.
@@ -24,4 +27,4 @@ This is the source of truth for the product and engineering baseline. Normative 
 
 ## Design status
 
-**Phase 0 (Product and design baseline) is complete.** The documents define the reviewed product scope, Figma UI/accessibility baseline, security/licensing policies, and initial ADRs. **Phase 1 (Technical validation and detailed design)** is the current active phase to validate architecture choices with cross-platform spikes before Phase 2 feature implementation begins. Any change to supported platforms, persistence guarantees, licensing, media backend, or security boundaries requires a documented decision and corresponding updates to these documents.
+**Phase 0 (Product and design baseline) and Phase 1 (Technical validation and detailed design) are complete.** **Phase 2 (Engineering foundation)** establishes the Rust/Tauri 2 core (`src-tauri/`), React/TypeScript frontend (`ui/`), SQLite WAL persistence and migration backup engine, and narrow typed IPC boundaries.

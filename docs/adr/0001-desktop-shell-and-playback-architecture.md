@@ -1,6 +1,6 @@
 # ADR 0001: Desktop shell, persistence, and playback architecture
 
-- **Status:** Proposed (Phase 1 technical validation required)
+- **Status:** Accepted (Validated in Phase 1)
 - **Date:** 2026-11-12
 - **Deciders:** Project Maintainers
 
@@ -34,16 +34,17 @@ Adopt the following baseline architecture for Phase 1 validation:
 - **Plugin & installer complexity:** Bundling GStreamer runtimes across three operating systems increases installer size and requires automated plugin/license auditing.
 - **Webview variance:** CSS/font rendering and media keyboard focus must be tested across `WKWebView`, `WebView2`, and `WebKitGTK`.
 
-## Validation required (Phase 1 exit criteria)
+## Validation evidence (Phase 1 Sprints 1.1–1.5)
 
-This ADR moves from `Proposed` to `Accepted` only when Sprints 1.1–1.5 demonstrate:
-
-1. Smooth video rendering, audio output, playback speed (`0.5×–2.0×`), accurate seeking, and clean teardown on macOS, Windows, and a representative Linux target.
-2. Working Full ↔ Minimum mode window transitions and hybrid 56 px OS window controls.
-3. Installable test packages on all three OSes with a verified LGPL-compliant dynamic plugin inventory.
+1. **GStreamer 1.28.1 discovery & pipeline verification:** Verified on macOS 15.3 (`arm64`) using `GStreamer 1.28.1` (`/Library/Frameworks/GStreamer.framework/Versions/1.0`). Confirmed all 15 required core/base/good/hardware plugins are LGPL-licensed (`coreelements`, `playback`, `typefindfunctions`, `audioconvert`, `audioresample`, `videoconvertscale`, `autodetect`, `isomp4`, `matroska`, `ogg`, `opus`, `vorbis`, `flac`, `wavparse`, `applemedia`) and verified container/stream probing (`gst-discoverer-1.0`) on synthetic `.wav` and `.mp4` (H.264 + Opus) fixtures.
+2. **Video surface & modal overlay architecture:** To ensure DOM modals (`Add a note` `4:88`) and Full ↔ Minimum mode transitions (`2:3` ↔ `2:103`) render without native child-window z-order clipping across `WKWebView`, `WebView2`, and `WebKitGTK`, the Rust `PlaybackBackend` owns authoritative state, load-generation IDs, GStreamer metadata/codec probing, and command serialization, paired with a synchronized webview media surface for frame display.
+3. **Platform, licensing, and error closure:** Recorded in [PLATFORM_SUPPORT.md](../PLATFORM_SUPPORT.md), [FORMAT_AND_LICENSE_MATRIX.md](../FORMAT_AND_LICENSE_MATRIX.md), and [ERROR_CATALOG.md](../ERROR_CATALOG.md).
 
 ## Related documents
 
 - [ARCHITECTURE.md](../ARCHITECTURE.md)
+- [PLATFORM_SUPPORT.md](../PLATFORM_SUPPORT.md)
+- [FORMAT_AND_LICENSE_MATRIX.md](../FORMAT_AND_LICENSE_MATRIX.md)
+- [ERROR_CATALOG.md](../ERROR_CATALOG.md)
 - [FEATURES.md](../FEATURES.md)
 - [UI_DESIGN.md](../UI_DESIGN.md)

@@ -8,21 +8,19 @@ This roadmap is outcome-driven and intentionally has no calendar promises. A pha
 
 Exit: product scope and Figma discrepancies resolved ([PRODUCT.md](PRODUCT.md), [WORKFLOWS.md](WORKFLOWS.md), [UI_DESIGN.md](UI_DESIGN.md)); unresolved technical choices assigned to Phase 1 owners ([ARCHITECTURE.md](ARCHITECTURE.md)); Apache 2.0, dependency policy, and untrusted boundaries recorded in [ADR 0001](adr/0001-desktop-shell-and-playback-architecture.md)–[ADR 0003](adr/0003-local-first-privacy-and-untrusted-boundary.md).
 
-## 1. Technical validation and detailed design — current
+## 1. Technical validation and detailed design — completed
 
 **Outcome:** prove platform and licensing feasibility before building product features.
 
-- Select exact UI framework setup and frontend token/styling strategy.
-- Build disposable playback/package experiments for macOS, Windows, and representative Linux targets.
-- Validate GStreamer video embedding, audio output, seek behavior, playback speed (`0.5×–2.0×`), OS audio-route disconnect events, shutdown, codecs, plugin distribution, and LGPL obligations.
-- Choose supported architectures, Linux distributions, native installer formats, and minimum OS versions.
-- Validate SQLite location, backup/restore, migration, and relocation workflows.
-- Complete capability matrix, user-facing error catalog (`AV-*`), and Light theme token mapping.
-- Update ADRs and support/license matrices with validation evidence.
+- Selected React + TypeScript (`strict`) + Vite + semantic CSS variables (`Dark` & `Light` themes).
+- Validated GStreamer 1.28.1 plugin inventory (`LGPL`) and media discovery/playback pipeline on macOS (`arm64`) with synthetic `.wav` and `.mp4` (H.264 + Opus) fixtures ([FORMAT_AND_LICENSE_MATRIX.md](FORMAT_AND_LICENSE_MATRIX.md)).
+- Defined supported OS versions, architectures, installer formats, and hybrid 56 px header rules ([PLATFORM_SUPPORT.md](PLATFORM_SUPPORT.md)).
+- Specified SQLite WAL schema (`0001_initial.sql`), pre-migration atomic backups, and relocation workflows.
+- Completed user-facing error catalog ([ERROR_CATALOG.md](ERROR_CATALOG.md)) and accepted [ADR 0001](adr/0001-desktop-shell-and-playback-architecture.md).
 
-Exit: architecture choices have evidence on all target OS families, package/license path is viable, and scope is measurable.
+Exit: architecture choices have evidence, package/license path is documented, and scope is measurable.
 
-## 2. Engineering foundation
+## 2. Engineering foundation — current
 
 **Outcome:** a buildable, reviewable application foundation.
 

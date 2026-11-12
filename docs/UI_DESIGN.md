@@ -55,7 +55,30 @@ All top-level frames are designed at **`1440 × 900 px`**.
 | `--status-error-bg` | `#231c1d` | Error badge container (border `#3b3535`) |
 | `--status-warn-fg` | `#e3b341` | `Seeking` status indicator dot |
 
-> **Light & System themes (`4:492`, `4:499`):** Settings exposes `Dark`, `Light`, and `System` theme cards (`Light` preview uses `#f3f1ed` / `#e8e6e1` neutral warm-light surfaces). Before implementing the theme switcher in Phase 4, define the complete semantic Light token map verifying WCAG AA contrast across all text and accent surfaces (`#73d4bd` requires a darker teal shade such as `#0f766e` for text/badges on light backgrounds).
+### Color tokens (Light theme mapping for `4:492` & `System` `4:499`)
+
+Derived from the `Light` preview surface palette (`#f3f1ed` / `#e8e6e1` in `4:493`) and tuned to meet WCAG 2.1 AA contrast (`≥ 4.5:1` for text):
+
+| Token Role | Light Theme Hex | Usage |
+|---|---|---|
+| `--bg-window` | `#f5f4f0` | Root window background |
+| `--bg-titlebar` | `#eceae4` | 56 px top header bar |
+| `--bg-nav-rail` | `#eae8e2` | 76 px left navigation rail |
+| `--bg-surface-1` | `#ffffff` | Panels, note cards, table container |
+| `--bg-surface-2` | `#efede7` | Secondary buttons, inputs, hover surfaces |
+| `--bg-dialog` | `#ffffff` | Modal dialog (`Add note`) and callout boxes |
+| `--border-subtle` | `#dcdad2` | 1 px structural dividers |
+| `--border-control` | `#c7c4bc` | Button, input, card, and outer window borders |
+| `--accent-primary` | `#127864` | Primary CTA fill, active scrubber fill, active nav indicator |
+| `--accent-on-primary` | `#ffffff` | High-contrast white text/icons on `--accent-primary` buttons |
+| `--accent-surface` | `#dff3ee` | Active nav item background and timestamp pill fill |
+| `--accent-text` | `#0d5c4c` | Timestamp badge text (`▶ 03:42`) and `Jump to moment` action text |
+| `--text-primary` | `#121619` | Page titles, headings, active labels |
+| `--text-secondary` | `#3d454d` | Body copy, subtitles, secondary button labels |
+| `--text-muted` | `#5a636e` | Metadata captions (`— Local`, durations; `≥ 5.3:1` on `#f5f4f0`) |
+| `--status-error-fg` | `#b42318` | Error icon, `PLAYBACK ERROR` / `MEDIA OFFLINE` text |
+| `--status-error-bg` | `#fef3f2` | Error badge container (border `#fecdca`) |
+| `--status-warn-fg` | `#b54708` | `Seeking` status indicator dot |
 
 ### Typography, radii, and elevation
 

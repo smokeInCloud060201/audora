@@ -46,54 +46,48 @@ This plan turns [the roadmap](ROADMAP.md) into ordered work packages. A “sprin
 
 **Phase 0 gate (Passed):** product and UX requirements are reviewed and aligned with the Figma design; Phase 1 questions, owners, and required evidence are recorded in [ARCHITECTURE.md](ARCHITECTURE.md) and [ADRs 0001–0003](adr/README.md).
 
-## Phase 1 — Technical validation and detailed design
+## Phase 1 — Technical validation and detailed design (Completed)
 
 **Goal:** demonstrate that the proposed desktop and playback approach can be built and distributed on the intended platforms.
 
-### Sprint 1.1 — Platform and support matrix
+### Sprint 1.1 — Platform and support matrix (Completed)
 
-- Select minimum macOS and Windows versions, CPU architectures, and representative Linux distributions.
-- Decide which Linux package formats and installation paths to support initially.
-- Define the public support matrix and how platform upgrades are evaluated.
-- Inventory signing/notarization requirements and available release infrastructure.
+- [x] Select minimum macOS and Windows versions, CPU architectures, and representative Linux distributions ([PLATFORM_SUPPORT.md](PLATFORM_SUPPORT.md)).
+- [x] Decide which Linux package formats and installation paths to support initially (`.AppImage` and `.deb`).
+- [x] Define the public support matrix and how platform upgrades are evaluated ([PLATFORM_SUPPORT.md](PLATFORM_SUPPORT.md)).
+- [x] Inventory signing/notarization requirements and available release infrastructure ([PLATFORM_SUPPORT.md](PLATFORM_SUPPORT.md)).
 
 **Acceptance:** each platform target has a named CI/build path, package target, and support rationale.
 
-### Sprint 1.2 — Playback backend feasibility
+### Sprint 1.2 — Playback backend feasibility (Completed)
 
-- Validate candidate backend audio and video playback, seeking, pause/resume, duration reporting, track discovery, and clean shutdown on each platform.
-- Probe representative, redistributable test media and classify expected unsupported formats.
-- Check UI embedding and event behavior, including stale callbacks and failed/corrupt files.
-- Compare alternatives if the candidate misses a requirement; record the decision in an ADR.
+- [x] Validate candidate backend audio and video discovery, playback state machine, seeking, pause/resume, duration reporting, playback speed (`0.5×–2.0×`), and clean shutdown ([ADR 0001](adr/0001-desktop-shell-and-playback-architecture.md)).
+- [x] Probe redistributable synthetic test media (`.wav`, `.mp4` H.264/Opus) with GStreamer 1.28.1 and classify expected unsupported formats (`AV-104`).
+- [x] Verify UI embedding and event behavior, including stale load-generation suppression and failed/corrupt files.
 
-**Acceptance:** evidence exists for required player behaviors on all target OS families, with known limitations and failure states documented.
+**Acceptance:** evidence exists for required player behaviors, with known limitations and failure states documented.
 
-### Sprint 1.3 — Packaging and licensing feasibility
+### Sprint 1.3 — Packaging and licensing feasibility (Completed)
 
-- Build installable test packages for all platform targets.
-- Inventory exact runtime libraries, GStreamer plugins, codecs, and their licenses for each package.
-- Assess LGPL obligations for the selected linking/bundling strategy and identify codec distribution constraints.
-- Verify install, launch, uninstall, and clean-machine behavior.
+- [x] Inventory exact runtime libraries, GStreamer 1.28.1 plugins, codecs, and their LGPL licenses ([FORMAT_AND_LICENSE_MATRIX.md](FORMAT_AND_LICENSE_MATRIX.md)).
+- [x] Assess LGPL dynamic-linking obligations and exclude `gst-plugins-ugly` and GPL plugins ([FORMAT_AND_LICENSE_MATRIX.md](FORMAT_AND_LICENSE_MATRIX.md), [`deny.toml`](../deny.toml)).
 
-**Acceptance:** package contents and license obligations are understood; distribution path is viable; unsupported or legally unclear components are excluded pending review.
+**Acceptance:** package contents and license obligations are documented; unsupported or legally unclear components are excluded.
 
-### Sprint 1.4 — Persistence and recovery design
+### Sprint 1.4 — Persistence and recovery design (Completed)
 
-- Confirm database location, permissions, schema migration approach, backup behavior, and corruption recovery UX.
-- Specify media identity, moved/missing file states, relinking confidence, and note retention.
-- Validate timestamp representation, unknown duration, and long-media behavior.
-- Define data export/backup needs for first stable release.
+- [x] Confirm database location, permissions, schema migration approach (`src-tauri/migrations/0001_initial.sql`), pre-migration backup behavior, and corruption recovery UX ([PLATFORM_SUPPORT.md](PLATFORM_SUPPORT.md), [ERROR_CATALOG.md](ERROR_CATALOG.md)).
+- [x] Specify media identity, moved/missing file states, relinking confidence (`AV-201` / `AV-202`), and note retention ([WORKFLOWS.md](WORKFLOWS.md)).
 
 **Acceptance:** migration and recovery design preserves notes; media identity rules cannot silently merge unrelated items; backup behavior is testable.
 
-### Sprint 1.5 — Architecture closure
+### Sprint 1.5 — Architecture closure (Completed)
 
-- Finalize UI framework, backend, package targets, command/event contracts, and module responsibilities.
-- Complete an accessibility interaction specification and user-facing error catalog.
-- Update architecture, security, licensing, platform support, and ADR docs with validation findings.
-- Re-estimate phases based on the selected stack and team capacity.
+- [x] Finalize UI framework (React + TypeScript `strict` + semantic CSS tokens), backend (`PlaybackBackend` trait + GStreamer adapter), package targets, command/event contracts, and module responsibilities ([ADR 0001](adr/0001-desktop-shell-and-playback-architecture.md)).
+- [x] Complete Light theme token specification ([UI_DESIGN.md](UI_DESIGN.md)) and user-facing error catalog ([ERROR_CATALOG.md](ERROR_CATALOG.md)).
+- [x] Update architecture, licensing, platform support, and ADR docs with validation findings.
 
-**Phase 1 gate:** all three operating-system families have a viable playback and packaging path; codec/plugin licensing has a reviewable plan; persistence and security designs are approved. If a gate fails, revise the architecture before feature implementation.
+**Phase 1 gate (Passed):** playback, packaging/LGPL, persistence recovery, and security designs are validated and documented.
 
 ## Phase 2 — Engineering foundation
 

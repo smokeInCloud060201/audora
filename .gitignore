@@ -1,0 +1,37 @@
+# OS & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Rust / Tauri
+target/
+**/*.rs.bk
+
+# Frontend / Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Logs, local databases & diagnostics
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Secrets, signing material & generated installers
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key
+*.dmg
+*.msi
+*.exe
+*.AppImage
+*.deb
+*.rpm

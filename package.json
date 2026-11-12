@@ -1,0 +1,18 @@
+{
+  "name": "audora-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev:ui": "pnpm --dir ui dev",
+    "build:ui": "pnpm --dir ui build",
+    "typecheck": "pnpm --dir ui typecheck",
+    "test:ui": "pnpm --dir ui test",
+    "fmt:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml",
+    "fmt:check": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
+    "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "check": "pnpm typecheck && pnpm test:ui && pnpm fmt:check && pnpm lint:rust && pnpm test:rust"
+  }
+}

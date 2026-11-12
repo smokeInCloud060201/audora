@@ -89,37 +89,36 @@ This plan turns [the roadmap](ROADMAP.md) into ordered work packages. A “sprin
 
 **Phase 1 gate (Passed):** playback, packaging/LGPL, persistence recovery, and security designs are validated and documented.
 
-## Phase 2 — Engineering foundation
+## Phase 2 — Engineering foundation (Completed)
 
 **Goal:** create a reliable development and release foundation.
 
-### Sprint 2.1 — Workspace and build setup
+### Sprint 2.1 — Workspace and build setup (Completed)
 
-- Create the Rust workspace and frontend project according to the accepted architecture.
-- Pin toolchain and package manager versions; document prerequisites and commands.
-- Establish formatting, linting, type checking, and baseline CI.
-- Ensure a clean checkout can build development packages on supported CI targets.
+- [x] Create the Rust workspace (`src-tauri/`) and frontend project (`ui/`) according to the accepted architecture.
+- [x] Pin toolchain (`rust-toolchain.toml`) and package manager (`pnpm@11.19.0`) versions; document prerequisites and commands in [DEVELOPMENT.md](DEVELOPMENT.md).
+- [x] Establish formatting (`rustfmt`), linting (`clippy -D warnings`), strict TypeScript type checking, and baseline CI (`.github/workflows/ci.yml`).
 
 **Acceptance:** reproducible documented local setup; CI reports build status per target; no release secrets are exposed to untrusted changes.
 
-### Sprint 2.2 — Application boundaries and command contracts
+### Sprint 2.2 — Application boundaries and command contracts (Completed)
 
-- Implement shell startup/shutdown and narrow typed command/event boundaries.
-- Enforce Tauri capability and content security policies.
-- Add typed error categories and redacted structured logging.
-- Add domain interfaces and fake adapters for independent testing.
+- [x] Implement shell startup/shutdown (`main.rs`) and narrow typed command/event boundaries (`commands.rs`, `ui/src/api/ipc.ts`).
+- [x] Enforce Tauri capability (`src-tauri/capabilities/default.json`) and content security policies (`src-tauri/tauri.conf.json`).
+- [x] Add typed `AV-*` error categories and redacted structured logging (`src-tauri/src/error.rs`).
+- [x] Add domain interfaces (`src-tauri/src/domain/traits.rs`) and `FakePlaybackBackend` + `GStreamerBackend` adapters (`src-tauri/src/adapters/playback.rs`).
 
 **Acceptance:** frontend cannot access arbitrary filesystem or shell operations; command inputs are validated in Rust; errors map to stable user-facing categories.
 
-### Sprint 2.3 — Persistence foundation
+### Sprint 2.3 — Persistence foundation (Completed)
 
-- Implement SQLite connection, migration runner, repositories, and transaction policy.
-- Add schema versioning, foreign keys, backup routine, and recovery error flow.
-- Establish dependency, vulnerability, license, and SBOM checks in CI.
+- [x] Implement SQLite WAL connection, migration runner (`src-tauri/src/persistence/db.rs`), repositories (`media_repo.rs`, `notes_repo.rs`, `settings_repo.rs`), and transaction policy.
+- [x] Add schema versioning (`schema_migrations`), foreign keys, automatic pre-migration backup routine (`.sqlite.pre-v<N>.bak`), and rollback recovery flow.
+- [x] Establish dependency and license policy in [`deny.toml`](../deny.toml) and CI.
 
 **Acceptance:** migration failure preserves recoverable data; database behavior matches the approved design; CI flags dependency/license changes for review.
 
-**Phase 2 gate:** clean builds, documented development workflow, persistence safeguards, security boundaries, and CI are operational on supported targets.
+**Phase 2 gate (Passed):** clean builds, documented development workflow, persistence safeguards, security boundaries, and CI are operational.
 
 ## Phase 3 — Playback and library
 

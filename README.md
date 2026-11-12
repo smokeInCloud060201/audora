@@ -6,7 +6,7 @@ Audora is planned as a complete, maintainable open-source product, not a throwaw
 
 ## Project status
 
-**Phase 0 (Product and design baseline) is complete; Phase 1 (Technical validation and detailed design) is ready to start.** Read [the documentation index](docs/README.md) for the product specification, workflows, Figma UI/accessibility baseline, architecture, security model, engineering rules, and release roadmap.
+**Phases 0, 1, and 2 are complete.** The repository includes the reviewed product/UX/architecture specifications (`docs/`), the Rust application core and SQLite WAL persistence engine (`src-tauri/`), and the React + TypeScript UI shell (`ui/`). Read [the documentation index](docs/README.md) for the product specification, workflows, Figma UI/accessibility baseline, architecture, security model, engineering rules, and release roadmap.
 
 ## Intended platforms
 

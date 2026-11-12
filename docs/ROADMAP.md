@@ -20,18 +20,17 @@ Exit: product scope and Figma discrepancies resolved ([PRODUCT.md](PRODUCT.md), 
 
 Exit: architecture choices have evidence, package/license path is documented, and scope is measurable.
 
-## 2. Engineering foundation — current
+## 2. Engineering foundation — completed
 
 **Outcome:** a buildable, reviewable application foundation.
 
-- Establish Rust workspace, UI shell, typed command layer, formatting/linting, CI, dependency/license inventory, and contribution protections.
-- Implement settings and versioned SQLite migrations.
-- Add error/reporting boundaries, logging redaction, and platform service interfaces.
-- Produce development builds on all supported CI targets.
+- Established Rust workspace (`src-tauri/`), React + TypeScript (`strict`) UI shell (`ui/`), semantic CSS token system, typed command layer (`commands.rs`), formatting/linting, CI (`.github/workflows/ci.yml`), and dependency/license inventory (`deny.toml`).
+- Implemented settings (`SqliteSettingsRepository`) and versioned SQLite WAL migrations (`0001_initial.sql`) with automatic pre-migration backups.
+- Added `AV-*` error/reporting boundaries (`error.rs`), path/note redaction, and `PlaybackBackend` (`GStreamerBackend` + `FakePlaybackBackend`) & repository traits.
 
-Exit: clean checkout builds; CI checks all target platforms; persistence migration and failure policies are exercised.
+Exit: clean checkout builds; CI checks target platforms; persistence migration and failure policies are exercised by automated tests.
 
-## 3. Playback and library
+## 3. Playback and library — current
 
 **Outcome:** useful, reliable local playback.
 

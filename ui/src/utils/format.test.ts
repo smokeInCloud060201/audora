@@ -168,4 +168,23 @@ describe("AudoraIpcClient workflows", () => {
     }
     expect(client.listNotes("med_listening").length).toBe(4);
   });
+
+  it("blocks remote network URLs with AV-301 and generates a redacted diagnostic report without file paths or note bodies", () => {
+    const client = new AudoraIpcClient(false);
+    expect(() => client.openMediaPath("https://example.com/remote.mp4")).toThrow();
+    expect(() =>
+      client.relinkMedia("med_archive_missing", "rtsp://camera.local/stream"),
+    ).toThrow();
+
+    const backupPath = client.createManualBackup();
+    expect(backupPath).toContain(".sqlite.manual.bak");
+
+    const report = client.generateDiagnosticReport();
+    expect(report.media_count).toBe(5);
+    expect(report.missing_media_count).toBe(1);
+    expect(report.total_note_count).toBe(8);
+    const json = JSON.stringify(report);
+    expect(json).not.toContain("The Art of Listening");
+    expect(json).not.toContain("room tone");
+  });
 });

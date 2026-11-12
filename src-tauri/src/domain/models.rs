@@ -297,3 +297,20 @@ impl Default for AppSettings {
         }
     }
 }
+
+/// Redacted, user-reviewable diagnostic report (`docs/SECURITY.md`).
+///
+/// Never includes file paths, user home directories, or note bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticReport {
+    pub app_version: String,
+    pub os_family: String,
+    pub arch: String,
+    pub schema_version: i64,
+    pub media_count: usize,
+    pub missing_media_count: usize,
+    pub total_note_count: usize,
+    pub playback_state: PlaybackState,
+    pub last_error_code: Option<String>,
+    pub generated_at: String,
+}

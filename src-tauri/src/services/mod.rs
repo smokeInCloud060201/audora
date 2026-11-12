@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{
-    AppSettings, Availability, BackendEvent, CreateNoteInput, LibraryFilter, LibrarySearchResult,
-    MediaItem, MediaRepository, Note, NotesRepository, PlaybackBackend, PlaybackCommand,
-    PlaybackSnapshot, PlaybackState, RelinkMediaRecord, RepeatMode, SettingsRepository,
-    TimestampPrecision, UpdateNoteInput, WindowMode, MAX_NOTE_BODY_CHARS, MAX_PLAYBACK_RATE,
-    MAX_SEARCH_QUERY_CHARS, MIN_PLAYBACK_RATE,
+    AppSettings, Availability, BackendEvent, CreateNoteInput, DiagnosticReport, LibraryFilter,
+    LibrarySearchResult, MediaItem, MediaRepository, Note, NotesRepository, PlaybackBackend,
+    PlaybackCommand, PlaybackSnapshot, PlaybackState, RelinkMediaRecord, RepeatMode,
+    SettingsRepository, TimestampPrecision, UpdateNoteInput, WindowMode, MAX_NOTE_BODY_CHARS,
+    MAX_PLAYBACK_RATE, MAX_SEARCH_QUERY_CHARS, MIN_PLAYBACK_RATE,
 };
 use crate::error::{redact_path, AppError, AppResult};
 
@@ -69,13 +69,34 @@ impl AudoraAppService {
         }
     }
 
-    /// Opens a local media file, probes its stream metadata without modifying the source file,
-    /// records/updates its library entry, increments the load generation, and loads it for playback.
-    pub fn open_media(&self, raw_path: &str) -> AppResult<MediaItem> {
+    fn validate_local_media_path(raw_path: &str) -> AppResult<&str> {
         let trimmed = raw_path.trim();
         if trimmed.is_empty() {
             return Err(AppError::validation("Media file path must not be empty"));
         }
+        if trimmed.chars().any(char::is_control) {
+            return Err(AppError::validation(
+                "Media file path contains invalid control characters",
+            ));
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        for forbidden_scheme in [
+            "http://", "https://", "rtsp://", "rtsps://", "ftp://", "sftp://", "ws://", "wss://",
+            "mms://",
+        ] {
+            if lower.starts_with(forbidden_scheme) {
+                return Err(AppError::validation(
+                    "Audora only opens local files on your device; remote network URLs are not permitted.",
+                ));
+            }
+        }
+        Ok(trimmed)
+    }
+
+    /// Opens a local media file, probes its stream metadata without modifying the source file,
+    /// records/updates its library entry, increments the load generation, and loads it for playback.
+    pub fn open_media(&self, raw_path: &str) -> AppResult<MediaItem> {
+        let trimmed = Self::validate_local_media_path(raw_path)?;
         let path = Path::new(trimmed);
         let file_name = path
             .file_name()
@@ -677,10 +698,7 @@ impl AudoraAppService {
         new_path: &str,
         confirm_mismatch: bool,
     ) -> AppResult<MediaItem> {
-        let trimmed_path = new_path.trim();
-        if trimmed_path.is_empty() {
-            return Err(AppError::validation("Relink file path must not be empty"));
-        }
+        let trimmed_path = Self::validate_local_media_path(new_path)?;
 
         let current = self
             .media_repo
@@ -798,5 +816,32 @@ impl AudoraAppService {
             }
         }
         self.get_playback_snapshot()
+    }
+
+    /// Generates a redacted, user-reviewable diagnostic report (`docs/SECURITY.md`).
+    ///
+    /// Guarantees that zero file paths, filenames, or note contents appear in the report.
+    pub fn generate_diagnostic_report(&self) -> AppResult<DiagnosticReport> {
+        let all_media = self.media_repo.list_media(None, LibraryFilter::All)?;
+        let media_count = all_media.len();
+        let missing_media_count = all_media
+            .iter()
+            .filter(|m| m.availability == Availability::Missing)
+            .count();
+        let total_note_count: usize = all_media.iter().map(|m| m.note_count).sum();
+        let snap = self.get_playback_snapshot()?;
+
+        Ok(DiagnosticReport {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            os_family: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            schema_version: 1,
+            media_count,
+            missing_media_count,
+            total_note_count,
+            playback_state: snap.state,
+            last_error_code: snap.error.map(|e| e.code.as_str().to_owned()),
+            generated_at: now_timestamp_string(),
+        })
     }
 }

@@ -41,6 +41,80 @@ impl Database {
         Self::open_with_migrations(path, BUILTIN_MIGRATIONS)
     }
 
+    /// Opens an on-disk SQLite database, or if the file is corrupted, preserves the damaged file
+    /// at `<name>.sqlite.corrupt.bak` and restores from the latest available backup or initializes
+    /// a fresh database so user files are never silently overwritten (`Sprint 5.1`).
+    pub fn open_or_recover(path: impl AsRef<Path>) -> AppResult<Self> {
+        let db_path = path.as_ref().to_path_buf();
+        match Self::open(&db_path) {
+            Ok(db) => {
+                if db.verify_integrity().unwrap_or(false) {
+                    return Ok(db);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    code = err.code().as_str(),
+                    "Database open failed; preserving corrupt file before recovery"
+                );
+            }
+        }
+
+        if db_path.exists() {
+            let corrupt_bak = db_path.with_extension("sqlite.corrupt.bak");
+            let _ = fs::copy(&db_path, &corrupt_bak);
+            let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+            let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+            let _ = fs::remove_file(&wal_path);
+            let _ = fs::remove_file(&shm_path);
+
+            let manual_bak = db_path.with_extension("sqlite.manual.bak");
+            let pre_v1_bak = db_path.with_extension("sqlite.pre-v1.bak");
+
+            if manual_bak.exists() {
+                let _ = fs::copy(&manual_bak, &db_path);
+            } else if pre_v1_bak.exists() {
+                let _ = fs::copy(&pre_v1_bak, &db_path);
+            } else {
+                let _ = fs::remove_file(&db_path);
+            }
+        }
+
+        let mut recovered = Self::open(&db_path)?;
+        let corrupt_bak = db_path.with_extension("sqlite.corrupt.bak");
+        if corrupt_bak.exists() {
+            recovered.last_backup_path = Some(corrupt_bak);
+        }
+        Ok(recovered)
+    }
+
+    /// Runs `PRAGMA integrity_check` to verify SQLite B-tree and page consistency.
+    pub fn verify_integrity(&self) -> AppResult<bool> {
+        self.with_conn(|conn| {
+            let status: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
+            Ok(status.eq_ignore_ascii_case("ok"))
+        })
+    }
+
+    /// Creates an on-demand manual backup snapshot (`<name>.sqlite.manual.bak`) after checkpointing WAL.
+    pub fn create_manual_backup(&self) -> AppResult<Option<PathBuf>> {
+        let Some(ref db_path) = self.db_path else {
+            return Ok(None);
+        };
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        self.with_conn(|conn| {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            Ok(())
+        })?;
+        let backup_path = db_path.with_extension("sqlite.manual.bak");
+        fs::copy(db_path, &backup_path).map_err(|e| {
+            AppError::persistence(format!("Failed to create manual database backup: {e}"))
+        })?;
+        Ok(Some(backup_path))
+    }
+
     /// Opens an on-disk SQLite database with a custom migration slice (used for testing recovery).
     pub fn open_with_migrations(
         path: impl AsRef<Path>,

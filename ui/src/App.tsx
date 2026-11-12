@@ -3,6 +3,7 @@ import { ipcClient } from "./api/ipc";
 import type {
   AppErrorPayload,
   AppSettings,
+  DiagnosticReport,
   LibraryFilter,
   MediaItem,
   Note,
@@ -72,6 +73,8 @@ export function App(): React.ReactElement {
 
   // Undo toast for deleted note (Frame 4:578)
   const [deletedNoteToast, setDeletedNoteToast] = useState<Note | null>(null);
+  const [backupStatusMessage, setBackupStatusMessage] = useState<string | null>(null);
+  const [diagnosticReport, setDiagnosticReport] = useState<DiagnosticReport | null>(null);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2216,6 +2219,55 @@ export function App(): React.ReactElement {
                         </div>
                         <code>~/Library/Application Support/com.audora.app/audora.sqlite</code>
                       </div>
+
+                      <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => {
+                            const backupPath = ipcClient.createManualBackup();
+                            setBackupStatusMessage(`Backup snapshot saved to ${backupPath}`);
+                          }}
+                        >
+                          Create backup snapshot
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() =>
+                            setDiagnosticReport(ipcClient.generateDiagnosticReport())
+                          }
+                        >
+                          Preview redacted diagnostic report
+                        </button>
+                      </div>
+
+                      {backupStatusMessage && (
+                        <div
+                          role="status"
+                          style={{ fontSize: 12, color: "var(--accent-text)" }}
+                        >
+                          ✓ {backupStatusMessage}
+                        </div>
+                      )}
+
+                      {diagnosticReport && (
+                        <pre
+                          data-testid="diagnostic-report-preview"
+                          style={{
+                            margin: 0,
+                            padding: 12,
+                            borderRadius: 8,
+                            background: "var(--bg-inset)",
+                            border: "1px solid var(--border-control)",
+                            fontSize: 11,
+                            color: "var(--text-secondary)",
+                            overflowX: "auto",
+                          }}
+                        >
+                          {JSON.stringify(diagnosticReport, null, 2)}
+                        </pre>
+                      )}
                     </section>
                   )}
 
@@ -2436,6 +2488,15 @@ export function App(): React.ReactElement {
           </button>
         </div>
       )}
+
+      {/* Assistive Technology Live Announcement Region */}
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {activeMedia
+          ? `${activeMedia.display_name}, ${snapshot.state} at ${formatDurationMs(
+              snapshot.position_ms,
+            )}`
+          : "No media loaded"}
+      </div>
     </div>
   );
 }

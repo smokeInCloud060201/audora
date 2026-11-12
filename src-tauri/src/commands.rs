@@ -3,8 +3,8 @@
 //! All commands return `Result<T, AppErrorPayload>` with stable `AV-*` error codes (`docs/ERROR_CATALOG.md`).
 
 use crate::domain::{
-    AppSettings, CreateNoteInput, LibraryFilter, LibrarySearchResult, MediaItem, Note,
-    PlaybackCommand, PlaybackSnapshot, UpdateNoteInput, WindowMode,
+    AppSettings, CreateNoteInput, DiagnosticReport, LibraryFilter, LibrarySearchResult, MediaItem,
+    Note, PlaybackCommand, PlaybackSnapshot, UpdateNoteInput, WindowMode,
 };
 use crate::error::AppErrorPayload;
 use crate::services::AudoraAppService;
@@ -133,6 +133,12 @@ impl CommandDispatcher {
     pub fn set_window_mode(&self, mode: WindowMode) -> CommandResult<AppSettings> {
         self.service
             .set_window_mode(mode)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn generate_diagnostic_report(&self) -> CommandResult<DiagnosticReport> {
+        self.service
+            .generate_diagnostic_report()
             .map_err(|err| err.to_payload())
     }
 }

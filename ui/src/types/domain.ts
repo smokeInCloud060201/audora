@@ -132,3 +132,16 @@ export interface AppSettings {
 export type PrimarySection = "library" | "now_playing" | "settings";
 
 export type SidePanelTab = "queue" | "notes";
+
+export interface DiagnosticReport {
+  app_version: string;
+  os_family: string;
+  arch: string;
+  schema_version: number;
+  media_count: number;
+  missing_media_count: number;
+  total_note_count: number;
+  playback_state: PlaybackState;
+  last_error_code: ErrorCode | null;
+  generated_at: string;
+}

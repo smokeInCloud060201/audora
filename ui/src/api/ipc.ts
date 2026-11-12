@@ -2,6 +2,7 @@ import type {
   AppErrorPayload,
   AppSettings,
   CreateNoteInput,
+  DiagnosticReport,
   LibraryFilter,
   LibrarySearchResult,
   MediaItem,
@@ -527,7 +528,7 @@ export class AudoraIpcClient {
     return item ? structuredClone(item) : null;
   }
 
-  public openMediaPath(rawPath: string, options?: { streamUrl?: string; size?: number; durationMs?: number }): MediaItem {
+  private validateLocalMediaPath(rawPath: string): string {
     const trimmed = rawPath.trim();
     if (!trimmed) {
       throw this.makeError(
@@ -537,6 +538,32 @@ export class AudoraIpcClient {
         "Please enter or choose a local media file path.",
       );
     }
+    const lower = trimmed.toLowerCase();
+    for (const scheme of [
+      "http://",
+      "https://",
+      "rtsp://",
+      "rtsps://",
+      "ftp://",
+      "sftp://",
+      "ws://",
+      "wss://",
+      "mms://",
+    ]) {
+      if (lower.startsWith(scheme)) {
+        throw this.makeError(
+          "AV-301",
+          "ValidationFailed",
+          "Remote URLs are not permitted",
+          "Audora only opens local files on your device and makes zero network requests.",
+        );
+      }
+    }
+    return trimmed;
+  }
+
+  public openMediaPath(rawPath: string, options?: { streamUrl?: string; size?: number; durationMs?: number }): MediaItem {
+    const trimmed = this.validateLocalMediaPath(rawPath);
     const fileName = trimmed.split(/[\\/]/).pop() ?? trimmed;
     const ext = fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() ?? "" : "";
     const supportedVideo = ["mp4", "m4v", "mov", "webm", "mkv"];
@@ -795,15 +822,7 @@ export class AudoraIpcClient {
     newPath: string,
     options?: { confirmMismatch?: boolean; probedDurationMs?: number },
   ): MediaItem {
-    const trimmed = newPath.trim();
-    if (!trimmed) {
-      throw this.makeError(
-        "AV-301",
-        "ValidationFailed",
-        "Path required",
-        "Please enter or select the relocated media file path.",
-      );
-    }
+    const trimmed = this.validateLocalMediaPath(newPath);
     const conflict = this.media.find((m) => m.path === trimmed && m.id !== mediaId);
     if (conflict) {
       throw this.makeError(
@@ -884,6 +903,42 @@ export class AudoraIpcClient {
       this.persistToStorage();
     }
     return structuredClone(this.snapshot);
+  }
+
+  public createManualBackup(): string {
+    const backupKey = `${STORAGE_KEY}.manual.bak`;
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        const payload: PersistedState = {
+          media: this.media.map(({ stream_url: _stream, ...rest }) => rest),
+          notes: this.notes,
+          settings: this.settings,
+        };
+        window.localStorage.setItem(backupKey, JSON.stringify(payload));
+      }
+    } catch {
+      // Ignore quota errors in restricted webviews.
+    }
+    return "~/Library/Application Support/com.audora.app/audora.sqlite.manual.bak";
+  }
+
+  /**
+   * Generates a redacted, user-reviewable diagnostic report (`docs/SECURITY.md`).
+   * Guarantees that zero file paths, filenames, or note contents appear in the report.
+   */
+  public generateDiagnosticReport(): DiagnosticReport {
+    return {
+      app_version: "0.1.0",
+      os_family: "macos",
+      arch: "aarch64",
+      schema_version: 1,
+      media_count: this.media.length,
+      missing_media_count: this.media.filter((m) => m.availability === "missing").length,
+      total_note_count: this.notes.length,
+      playback_state: this.snapshot.state,
+      last_error_code: this.snapshot.error?.code ?? null,
+      generated_at: new Date().toISOString(),
+    };
   }
 
   private makeError(

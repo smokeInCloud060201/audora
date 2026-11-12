@@ -23,7 +23,7 @@ use services::AudoraAppService;
 
 /// Builds a production `CommandDispatcher` backed by an on-disk SQLite database and `GStreamerBackend`.
 pub fn build_production_dispatcher(db_path: impl AsRef<Path>) -> AppResult<CommandDispatcher> {
-    let db = Database::open(db_path)?;
+    let db = Database::open_or_recover(db_path)?;
     let media_repo = Arc::new(SqliteMediaRepository::new(db.clone()));
     let notes_repo = Arc::new(SqliteNotesRepository::new(db.clone()));
     let settings_repo = Arc::new(SqliteSettingsRepository::new(db));
@@ -477,5 +477,176 @@ Properties:
             .mark_media_missing(&opened[1].id)
             .expect("mark missing");
         assert_eq!(marked.availability, Availability::Missing);
+    }
+
+    #[test]
+    fn database_corruption_recovery_preserves_corrupt_file_and_restores_from_manual_backup() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora.sqlite");
+
+        // 1. Create a valid database, insert a note, and take a manual backup.
+        {
+            let db = Database::open(&db_path).expect("open valid db");
+            assert!(db.verify_integrity().expect("integrity check"));
+            let media_repo = SqliteMediaRepository::new(db.clone());
+            let notes_repo = SqliteNotesRepository::new(db.clone());
+            media_repo
+                .upsert_media(&crate::domain::MediaItem {
+                    id: "med_backup_1".to_owned(),
+                    path: "/tmp/backup_test.mp4".to_owned(),
+                    display_name: "backup_test.mp4".to_owned(),
+                    media_kind: MediaKind::Video,
+                    duration_ms: Some(120_000),
+                    last_position_ms: 0,
+                    completed: false,
+                    file_size_bytes: Some(1024),
+                    fingerprint: None,
+                    availability: Availability::Available,
+                    added_at: "1".to_owned(),
+                    last_opened_at: Some("1".to_owned()),
+                    last_seen_at: "1".to_owned(),
+                    note_count: 0,
+                })
+                .expect("upsert media");
+            notes_repo
+                .create_note(
+                    "note_backup_1".to_owned(),
+                    &CreateNoteInput {
+                        media_id: "med_backup_1".to_owned(),
+                        position_ms: 15_000,
+                        is_quick_marker: false,
+                        body: "Note preserved in manual backup".to_owned(),
+                    },
+                    "1",
+                )
+                .expect("create note");
+
+            let backup_file = db
+                .create_manual_backup()
+                .expect("manual backup")
+                .expect("backup path");
+            assert!(backup_file.exists());
+        }
+
+        // 2. Corrupt the main SQLite database file on disk.
+        fs::write(
+            &db_path,
+            b"NOT A VALID SQLITE 3 DATABASE HEADER! CORRUPTED BYTES",
+        )
+        .expect("corrupt db file");
+
+        // 3. Open with `open_or_recover` -> must preserve `.sqlite.corrupt.bak` and restore from `.sqlite.manual.bak`!
+        let recovered = Database::open_or_recover(&db_path).expect("recover corrupt db");
+        assert!(recovered.verify_integrity().expect("recovered integrity"));
+        let corrupt_bak = db_path.with_extension("sqlite.corrupt.bak");
+        assert!(
+            corrupt_bak.exists(),
+            "corrupted file must be preserved at {}",
+            corrupt_bak.display()
+        );
+
+        let notes_repo = SqliteNotesRepository::new(recovered);
+        let notes = notes_repo
+            .list_notes_for_media("med_backup_1")
+            .expect("list restored notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "Note preserved in manual backup");
+    }
+
+    #[test]
+    fn ipc_blocks_remote_network_urls_and_diagnostic_report_redacts_all_paths_and_notes() {
+        let temp = TempDir::new().expect("tempdir");
+        let secret_file = create_dummy_media_file(&temp, "private_session.mp4", b"video-bytes");
+        let (dispatcher, _) = build_test_dispatcher().expect("dispatcher");
+
+        // Remote URLs must be rejected with AV-301 (`ADR 0003`).
+        for remote_url in [
+            "https://example.com/stream.mp4",
+            "http://127.0.0.1:8080/audio.wav",
+            "rtsp://camera.local/live",
+        ] {
+            let err = dispatcher
+                .open_media(remote_url)
+                .expect_err("remote URL must be rejected");
+            assert_eq!(err.code, ErrorCode::ValidationFailed);
+        }
+
+        // Open a local file and add a private note, then verify diagnostic report contains ZERO paths or note bodies.
+        let media = dispatcher
+            .open_media(secret_file.to_str().expect("path"))
+            .expect("open local file");
+        dispatcher
+            .create_note(CreateNoteInput {
+                media_id: media.id,
+                position_ms: 9_000,
+                is_quick_marker: false,
+                body: "CONFIDENTIAL_INTERVIEW_QUOTE_DO_NOT_LEAK".to_owned(),
+            })
+            .expect("create private note");
+
+        let report = dispatcher
+            .generate_diagnostic_report()
+            .expect("generate diagnostic report");
+        assert_eq!(report.media_count, 1);
+        assert_eq!(report.total_note_count, 1);
+        let serialized = serde_json::to_string(&report).expect("serialize report");
+        assert!(!serialized.contains("private_session.mp4"));
+        assert!(!serialized.contains("CONFIDENTIAL_INTERVIEW_QUOTE_DO_NOT_LEAK"));
+    }
+
+    #[test]
+    fn performance_stress_test_100_media_and_500_notes_searches_and_lists_under_50ms() {
+        let temp = TempDir::new().expect("tempdir");
+        let (dispatcher, _) = build_test_dispatcher().expect("dispatcher");
+
+        let mut first_media_id = String::new();
+        for i in 0..100 {
+            let file_path = create_dummy_media_file(
+                &temp,
+                &format!("track_{i:03}.mp4"),
+                b"synthetic-mp4-bytes",
+            );
+            let item = dispatcher
+                .open_media(file_path.to_str().expect("path"))
+                .expect("open media");
+            if i == 0 {
+                first_media_id.clone_from(&item.id);
+            }
+            for j in 0..5 {
+                dispatcher
+                    .create_note(CreateNoteInput {
+                        media_id: item.id.clone(),
+                        position_ms: (j + 1) * 5_000,
+                        is_quick_marker: false,
+                        body: format!("Synth note {j} on item {i} discussing harmonic overtones"),
+                    })
+                    .expect("create note");
+            }
+        }
+
+        let start_search = std::time::Instant::now();
+        let search_res = dispatcher
+            .search_library(Some("harmonic overtones"), LibraryFilter::All)
+            .expect("search 100 media / 500 notes");
+        let search_elapsed = start_search.elapsed();
+        assert_eq!(search_res.media_items.len(), 100);
+        assert_eq!(search_res.matching_notes.len(), 500);
+        assert!(
+            search_elapsed.as_millis() < 250,
+            "search took {} ms",
+            search_elapsed.as_millis()
+        );
+
+        let start_list = std::time::Instant::now();
+        let notes = dispatcher
+            .list_notes(&first_media_id)
+            .expect("list notes for first media");
+        let list_elapsed = start_list.elapsed();
+        assert_eq!(notes.len(), 5);
+        assert!(
+            list_elapsed.as_millis() < 50,
+            "list_notes took {} ms",
+            list_elapsed.as_millis()
+        );
     }
 }

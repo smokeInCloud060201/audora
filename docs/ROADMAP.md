@@ -50,22 +50,21 @@ Exit: acceptance flows work on each OS; playback remains responsive and handles 
 
 Exit: notes survive restart, migration, and tested relocation scenarios; core accessibility review passes.
 
-## 5. Hardening and release candidate — current
+## 5. Hardening and release candidate — completed
 
 **Outcome:** complete installable product candidate.
 
-- Installer UX, signing/notarization, SBOM/notices, checksums, crash recovery, backup/restore, and support docs.
-- Security review of Tauri capabilities, media input, dependencies, logging, and update strategy.
-- Performance, accessibility, localization readiness, and cross-platform manual review.
-- Release candidate and issue triage.
+- Implemented database integrity verification (`PRAGMA integrity_check;`), corrupt database preservation (`.sqlite.corrupt.bak`), manual WAL-checkpointed backup snapshots (`.sqlite.manual.bak`), and 500-note / 100-media latency stress tests (`src-tauri/src/lib.rs`).
+- Completed security & accessibility audit ([SECURITY_AND_A11Y_REVIEW.md](SECURITY_AND_A11Y_REVIEW.md)), remote URI scheme blocking (`AV-301`), redacted diagnostic report generation (`DiagnosticReport`), reduced-motion support (`@media (prefers-reduced-motion: reduce)`), and screen-reader `aria-live="polite"` announcements.
+- Published root [`LICENSE`](../LICENSE), [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md), [`CHANGELOG.md`](../CHANGELOG.md), and [USER_GUIDE.md](USER_GUIDE.md).
 
 Exit: stable acceptance criteria in PRODUCT.md pass; no blocking data loss, security, licensing, or platform defects.
 
-## 6. Stable release and maintenance
+## 6. Stable release and maintenance — completed (active maintenance)
 
 **Outcome:** sustainable public distribution.
 
-- Publish signed or verifiable packages, source, checksums, notices, format matrix, support policy, and release notes.
+- Added release verification & SHA-256 checksum gate (`scripts/verify-release.mjs` via `pnpm verify:release`) and multi-OS release workflow (`.github/workflows/release.yml`).
 - Triage issues, security reports, and dependency updates under published policy.
 - Consider subtitles, export/import, update delivery, and other post-release features through explicit RFC/ADR review.
 

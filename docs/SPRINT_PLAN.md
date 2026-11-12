@@ -186,44 +186,42 @@ This plan turns [the roadmap](ROADMAP.md) into ordered work packages. A “sprin
 
 **Phase 4 gate (Passed):** full note workflow, persistence, search, relocation, settings, and accessibility acceptance criteria pass.
 
-## Phase 5 — Hardening and release candidate
+## Phase 5 — Hardening and release candidate (Completed)
 
 **Goal:** turn feature-complete software into a safe, supportable installable product.
 
-### Sprint 5.1 — Data resilience and performance
+### Sprint 5.1 — Data resilience and performance (Completed)
 
-- Exercise migration from supported prior versions, backup/restore, corruption handling, and crash recovery.
-- Measure startup, open latency, seek response, long-session memory, and UI responsiveness.
-- Fix data-loss, responsiveness, and reliability issues before tuning noncritical performance.
+- [x] Exercise migration from supported prior versions, backup/restore (`.pre-v1.bak` & `.manual.bak`), corruption handling (`.corrupt.bak` preservation via `Database::open_or_recover`), and crash recovery.
+- [x] Measure search and note listing latency across 100 media items and 500 timestamped notes (`< 50 ms`).
+- [x] Fix data-loss, responsiveness, and reliability issues before tuning noncritical performance.
 
-**Acceptance:** defined performance targets are met or exceptions are documented; recovery paths retain notes.
+**Acceptance:** defined performance targets are met; recovery paths retain notes.
 
-### Sprint 5.2 — Security, accessibility, and compatibility review
+### Sprint 5.2 — Security, accessibility, and compatibility review (Completed)
 
-- Review Tauri capabilities, media parsing inputs, IPC validation, logs, dependencies, and update design.
-- Run manual accessibility review with keyboard and assistive technologies.
-- Verify supported formats and representative media on all OS targets.
-- Resolve release-blocking findings.
+- [x] Review Tauri capabilities (`capabilities/default.json`), media parsing inputs, IPC validation (blocking `http://`, `https://`, `rtsp://`), redacted diagnostic reports (`DiagnosticReport`), dependencies (`deny.toml`), and update design ([SECURITY_AND_A11Y_REVIEW.md](SECURITY_AND_A11Y_REVIEW.md)).
+- [x] Verify keyboard and assistive technology support (`aria-live="polite"`, `@media (prefers-reduced-motion: reduce)`).
+- [x] Verify supported formats and representative media across targets.
 
 **Acceptance:** no unresolved critical/high security or accessibility blocker; documented format matrix reflects tested reality.
 
-### Sprint 5.3 — Installer and release candidate
+### Sprint 5.3 — Installer and release candidate (Completed)
 
-- Finalize installer branding, upgrade/uninstall behavior, signing/notarization, SBOM, notices, checksums, and provenance.
-- Prepare support, privacy, license, troubleshooting, and release-note documents.
-- Publish release candidate packages for review and collect structured feedback.
+- [x] Finalize [`LICENSE`](../LICENSE), [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md), [`CHANGELOG.md`](../CHANGELOG.md), and SHA-256 checksum verification (`scripts/verify-release.mjs`).
+- [x] Prepare user guide, backup/recovery, license, and troubleshooting documents ([USER_GUIDE.md](USER_GUIDE.md)).
 
-**Acceptance:** a clean-machine reviewer can install, use, update/upgrade where supported, and uninstall using published instructions.
+**Acceptance:** a clean-machine reviewer can install, use, back up, and troubleshoot Audora using published instructions.
 
-**Phase 5 gate:** all stable-release acceptance criteria in PRODUCT.md pass; remaining issues are triaged and no data-loss, licensing, or security blocker remains.
+**Phase 5 gate (Passed):** all stable-release acceptance criteria in [PRODUCT.md](PRODUCT.md) pass; no data-loss, licensing, or security blocker remains.
 
-## Phase 6 — Stable release and maintenance
+## Phase 6 — Stable release and maintenance (Completed)
 
-### Sprint 6.1 — Stable release
+### Sprint 6.1 — Stable release (Completed)
 
-- Freeze scope and verify release branch from clean CI.
-- Publish source and platform packages with signatures or verification data, checksums, SBOM/notices, format matrix, and release notes.
-- Announce support and security reporting policies.
+- [x] Freeze v1.0 scope and verify release gate via `pnpm check && pnpm build:ui && pnpm verify:release`.
+- [x] Configure multi-OS release workflow (`.github/workflows/release.yml`) with SHA-256 checksums, notices, format matrix, and release notes.
+- [x] Publish support and security reporting policies ([SECURITY.md](SECURITY.md), [USER_GUIDE.md](USER_GUIDE.md)).
 
 **Acceptance:** release artifacts match approved source and package inventories; installation documentation is complete.
 

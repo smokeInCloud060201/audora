@@ -33,6 +33,24 @@ impl CommandDispatcher {
             .map_err(|err| err.to_payload())
     }
 
+    pub fn open_media_batch(&self, paths: &[String]) -> CommandResult<Vec<MediaItem>> {
+        self.service
+            .open_media_batch(paths)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn remove_from_queue(&self, media_id: &str) -> CommandResult<PlaybackSnapshot> {
+        self.service
+            .remove_from_queue(media_id)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn mark_media_missing(&self, media_id: &str) -> CommandResult<MediaItem> {
+        self.service
+            .mark_media_missing(media_id)
+            .map_err(|err| err.to_payload())
+    }
+
     pub fn get_playback_snapshot(&self) -> CommandResult<PlaybackSnapshot> {
         self.service
             .get_playback_snapshot()

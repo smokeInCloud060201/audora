@@ -47,9 +47,22 @@ fn main() {
     match build_production_dispatcher(&db_path) {
         Ok(dispatcher) => {
             let settings = dispatcher.get_settings().unwrap_or_default();
+            let cli_paths: Vec<String> = env::args()
+                .skip(1)
+                .filter(|arg| !arg.starts_with('-'))
+                .collect();
+            if !cli_paths.is_empty() {
+                if let Err(err) = dispatcher.open_media_batch(&cli_paths) {
+                    tracing::warn!(
+                        code = err.code.as_str(),
+                        "Failed to open CLI media arguments"
+                    );
+                }
+            }
             tracing::info!(
                 mode = ?settings.window_mode,
                 theme = ?settings.theme,
+                cli_files = cli_paths.len(),
                 "Audora application core initialized"
             );
         }

@@ -30,27 +30,27 @@ Exit: architecture choices have evidence, package/license path is documented, an
 
 Exit: clean checkout builds; CI checks target platforms; persistence migration and failure policies are exercised by automated tests.
 
-## 3. Playback and library — current
+## 3. Playback and library — completed
 
 **Outcome:** useful, reliable local playback.
 
-- Open/drop files; metadata probing; playback state machine; session queue with repeat/shuffle; transport, seek, speed, volume controls, and Full/Minimum modes.
-- Per-media progress tracking (`%`) and `Resume where I left off`; missing/unsupported/corrupt media states; OS open-with behavior.
-- Format matrix, backend capability reporting, and platform package verification.
+- Implemented single-file, multi-file, non-recursive folder open (`open_media_batch`), drag-and-drop, CLI open-with (`main.rs`), and library row actions (`Play now`, `Add to queue`, `Mark missing`, `Remove from library`).
+- Implemented playback state machine with monotonic load-generation IDs, `<video>`/`<audio>` element sync + real-time clock fallback, interactive volume slider (`0–100%`), speed multiplier (`0.5×–2.0×` with pitch preservation), status badges (`Playing`, `Paused`, `Seeking`, `Ended`, `Loading`, `Error`), dedicated audio-only waveform artwork canvas (`Frame 4:3`), and Full/Minimum modes (`? Help` popover `Frame 2:115`).
+- Implemented per-media progress tracking (`%`), `Resume where I left off`, session queue (`Repeat Off/All/One`, `Shuffle`, item removal, auto-advance on `Ended`), and missing/unsupported/corrupt media states (`AV-101`–`AV-104`).
 
 Exit: acceptance flows work on each OS; playback remains responsive and handles backend failure without data loss.
 
-## 4. Timestamped notes and organization
+## 4. Timestamped notes and organization — completed
 
 **Outcome:** the product's defining note-and-return workflow.
 
-- Create quick markers and text notes, edit/delete, list, search (`⌘/Ctrl+K`), and seek back.
-- Persist notes transactionally; support unavailable media and explicit relinking (`Find file…`).
-- Keyboard shortcuts, accessibility, theme selection (`Dark / Light / System`), and timestamp precision settings.
+- Implemented quick markers (`Shift+N`), text notes (`N`, `⌘/Ctrl+Enter`), edit/delete with 6-second `Undo` toast (`Frame 4:578`), chronological list, scrubber note marker ticks, out-of-range note badges, local search (`⌘/Ctrl+K`) with direct `▶ mm:ss — Jump to moment` results, and seek back.
+- Persisted notes transactionally in SQLite WAL (`src-tauri/`) and `localStorage` (`ui/`); implemented Missing Media view (`Frame 4:339`) with preserved notes list (`Frame 4:378`), duplicate conflict blocking (`AV-201`), and Relink Mismatch Confirmation Modal (`AV-202`).
+- Completed all 6 Settings sub-navigation categories (`Appearance` with miniature Dark/Light/System window previews and live `prefers-color-scheme` listener, `Playback` with headphone disconnect pause listener, `Notes`, `Keyboard`, `Privacy`, `About`).
 
 Exit: notes survive restart, migration, and tested relocation scenarios; core accessibility review passes.
 
-## 5. Hardening and release candidate
+## 5. Hardening and release candidate — current
 
 **Outcome:** complete installable product candidate.
 

@@ -405,4 +405,77 @@ Properties:
         assert_eq!(meta.video_codec.as_deref(), Some("H.264 (Main Profile)"));
         assert_eq!(meta.audio_codec.as_deref(), Some("Opus"));
     }
+
+    #[test]
+    fn batch_folder_open_is_non_recursive_and_queue_respects_repeat_and_shuffle() {
+        let temp = TempDir::new().expect("tempdir");
+        let _a = create_dummy_media_file(&temp, "01_intro.mp4", b"video-1");
+        let _b = create_dummy_media_file(&temp, "02_field.wav", b"audio-2");
+        let _c = create_dummy_media_file(&temp, "03_outro.mp3", b"audio-3");
+        let _ignored = create_dummy_media_file(&temp, "notes.txt", b"ignore-text");
+
+        // Nested subfolder must NOT be scanned recursively (per `docs/SECURITY.md`).
+        let nested_dir = temp.path().join("nested");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        fs::write(nested_dir.join("hidden.mp4"), b"nested-video").expect("write nested");
+
+        let (dispatcher, _) = build_test_dispatcher().expect("dispatcher");
+        let folder_str = temp.path().to_str().expect("folder str").to_owned();
+        let opened = dispatcher
+            .open_media_batch(&[folder_str])
+            .expect("open folder batch");
+        assert_eq!(opened.len(), 3);
+        assert_eq!(opened[0].display_name, "01_intro.mp4");
+        assert_eq!(opened[1].display_name, "02_field.wav");
+        assert_eq!(opened[2].display_name, "03_outro.mp3");
+
+        let snap = dispatcher.get_playback_snapshot().expect("snap");
+        assert_eq!(snap.queue.len(), 3);
+        assert_eq!(snap.media_id.as_deref(), Some(opened[0].id.as_str()));
+
+        // Test Shuffle skips to index (0 + 2) % 3 = 2.
+        dispatcher
+            .playback_command(PlaybackCommand::SetShuffle { shuffle: true })
+            .expect("enable shuffle");
+        let shuffled_snap = dispatcher
+            .playback_command(PlaybackCommand::Next)
+            .expect("next with shuffle");
+        assert_eq!(
+            shuffled_snap.media_id.as_deref(),
+            Some(opened[2].id.as_str())
+        );
+
+        // Disable shuffle, enable Repeat All, and verify Next wraps from index 2 -> 0.
+        dispatcher
+            .playback_command(PlaybackCommand::SetShuffle { shuffle: false })
+            .expect("disable shuffle");
+        dispatcher
+            .playback_command(PlaybackCommand::SetRepeat {
+                mode: crate::domain::RepeatMode::All,
+            })
+            .expect("repeat all");
+        let wrapped_snap = dispatcher
+            .playback_command(PlaybackCommand::Next)
+            .expect("next wrap");
+        assert_eq!(
+            wrapped_snap.media_id.as_deref(),
+            Some(opened[0].id.as_str())
+        );
+
+        // Remove first item from queue -> active item advances to index 0 of remaining queue (`opened[1]`).
+        let after_remove = dispatcher
+            .remove_from_queue(&opened[0].id)
+            .expect("remove from queue");
+        assert_eq!(after_remove.queue.len(), 2);
+        assert_eq!(
+            after_remove.media_id.as_deref(),
+            Some(opened[1].id.as_str())
+        );
+
+        // Mark `opened[1]` missing explicitly -> availability becomes Missing while preserving library item.
+        let marked = dispatcher
+            .mark_media_missing(&opened[1].id)
+            .expect("mark missing");
+        assert_eq!(marked.availability, Availability::Missing);
+    }
 }

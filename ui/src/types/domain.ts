@@ -41,6 +41,7 @@ export interface MediaItem {
   last_opened_at: string | null;
   last_seen_at: string;
   note_count: number;
+  stream_url?: string;
 }
 
 export type PlaybackState =

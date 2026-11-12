@@ -466,3 +466,226 @@
   font-size: 13px;
   z-index: 60;
 }
+
+/* Audio-Only Canvas (Frame 4:3) */
+.audio-canvas {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  margin: 24px 36px;
+  padding: 36px;
+  border-radius: var(--radius-card);
+  background: radial-gradient(circle at 50% 45%, #162321 0%, #0b0e12 75%);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+  text-align: center;
+}
+
+.audio-ring-outer {
+  position: absolute;
+  width: 520px;
+  height: 520px;
+  border-radius: 50%;
+  border: 1px solid rgba(115, 212, 189, 0.08);
+  pointer-events: none;
+}
+
+.audio-ring-inner {
+  position: absolute;
+  width: 420px;
+  height: 420px;
+  border-radius: 50%;
+  border: 1px solid rgba(115, 212, 189, 0.14);
+  pointer-events: none;
+}
+
+.audio-artwork-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 280px;
+  height: 240px;
+  border-radius: 16px;
+  background-color: var(--bg-surface-1);
+  border: 1px solid var(--border-control);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+  margin-bottom: 24px;
+  padding: 24px;
+  z-index: 1;
+}
+
+.waveform-bars {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 96px;
+}
+
+.waveform-bar {
+  width: 6px;
+  border-radius: 3px;
+  background-color: var(--accent-primary);
+  transition: opacity 0.2s ease;
+}
+
+/* Scrubber Note Markers (Sprint 4.2) */
+.scrubber-track-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1;
+}
+
+.scrubber-note-marker {
+  position: absolute;
+  top: -5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--accent-text);
+  border: 1px solid var(--bg-window);
+  transform: translateX(-50%);
+  cursor: pointer;
+  z-index: 2;
+  padding: 0;
+}
+
+.scrubber-note-marker:hover {
+  transform: translateX(-50%) scale(1.35);
+}
+
+/* Status Pills (Frame 4:583-4:600) */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: var(--radius-badge);
+  font-size: 11px;
+  font-weight: 600;
+  background-color: var(--bg-surface-2);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-control);
+}
+
+.status-pill[data-state="playing"] {
+  background-color: var(--accent-badge-bg);
+  color: var(--accent-text);
+  border-color: var(--accent-primary);
+}
+
+.status-pill[data-state="failed"] {
+  background-color: var(--status-error-bg);
+  color: var(--status-error-text);
+  border-color: var(--status-error-border);
+}
+
+/* Minimum Mode Help Popover (Frame 2:115) */
+.minimum-help-popover {
+  width: 324px;
+  padding: 14px 16px;
+  border-radius: var(--radius-card);
+  background-color: var(--bg-surface-1);
+  border: 1px solid var(--border-control);
+  box-shadow: var(--shadow-modal);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Settings Sub-Navigation & Theme Preview Cards (Frame 4:441) */
+.settings-layout {
+  display: flex;
+  gap: 36px;
+  max-width: 960px;
+}
+
+.settings-subnav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 190px;
+  flex-shrink: 0;
+}
+
+.settings-subnav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-radius: var(--radius-control);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-subnav-btn:hover {
+  background-color: var(--bg-surface-2);
+  color: var(--text-primary);
+}
+
+.settings-subnav-btn[aria-current="true"] {
+  background-color: var(--accent-surface);
+  color: var(--accent-primary);
+  border-color: var(--border-control);
+  font-weight: 600;
+}
+
+.theme-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.theme-preview-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--border-control);
+  background-color: var(--bg-surface-2);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.theme-preview-card[aria-pressed="true"] {
+  border-color: var(--accent-primary);
+  background-color: var(--accent-surface);
+}
+
+.theme-mini-window {
+  height: 54px;
+  border-radius: 6px;
+  border: 1px solid var(--border-control);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 6px 8px;
+}
+
+.drop-zone-overlay {
+  position: fixed;
+  inset: 12px;
+  border-radius: var(--radius-dialog);
+  border: 2px dashed var(--accent-primary);
+  background-color: rgba(15, 32, 28, 0.86);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  z-index: 80;
+  pointer-events: none;
+}

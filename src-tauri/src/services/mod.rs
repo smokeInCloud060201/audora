@@ -194,6 +194,108 @@ impl AudoraAppService {
         Ok(saved)
     }
 
+    /// Opens a batch of file or single-level directory paths (`Flow 1` in `docs/WORKFLOWS.md`),
+    /// adding all valid media files to the session queue and loading the first item for playback.
+    ///
+    /// Per `docs/SECURITY.md`, directory inspection is strictly non-recursive (single level only).
+    pub fn open_media_batch(&self, raw_paths: &[String]) -> AppResult<Vec<MediaItem>> {
+        if raw_paths.is_empty() {
+            return Err(AppError::validation("At least one media path is required"));
+        }
+
+        let mut expanded_paths: Vec<String> = Vec::new();
+        for raw in raw_paths {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let p = Path::new(trimmed);
+            if p.is_dir() {
+                let mut dir_files: Vec<String> = fs::read_dir(p)
+                    .map_err(|_| {
+                        AppError::media_unreadable("Unable to read selected folder contents.")
+                    })?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|entry_path| {
+                        entry_path.is_file() && Self::is_supported_media_extension(entry_path)
+                    })
+                    .filter_map(|entry_path| entry_path.to_str().map(str::to_owned))
+                    .collect();
+                dir_files.sort();
+                expanded_paths.extend(dir_files);
+            } else {
+                expanded_paths.push(trimmed.to_owned());
+            }
+        }
+
+        if expanded_paths.is_empty() {
+            return Err(AppError::media_unavailable(
+                "No supported audio or video files were found in the selection.",
+            ));
+        }
+
+        let mut opened_items = Vec::with_capacity(expanded_paths.len());
+        for path_str in &expanded_paths {
+            let item = self.open_media(path_str)?;
+            opened_items.push(item);
+        }
+
+        // Keep the first opened item active while leaving all opened items in the queue.
+        if opened_items.len() > 1 {
+            let first = &opened_items[0];
+            let _ = self.open_media(&first.path)?;
+        }
+
+        Ok(opened_items)
+    }
+
+    fn is_supported_media_extension(path: &Path) -> bool {
+        matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("mp4" | "mov" | "webm" | "mkv" | "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a")
+        )
+    }
+
+    /// Removes a media item from the active session queue without deleting its library record.
+    pub fn remove_from_queue(&self, media_id: &str) -> AppResult<PlaybackSnapshot> {
+        let mut snap = self
+            .snapshot
+            .lock()
+            .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+        let current_idx = snap.queue.iter().position(|id| id == media_id);
+        snap.queue.retain(|id| id != media_id);
+
+        if snap.media_id.as_deref() == Some(media_id) {
+            if snap.queue.is_empty() {
+                let _ = self.playback_backend.stop();
+                snap.media_id = None;
+                snap.state = PlaybackState::Idle;
+                snap.position_ms = 0;
+            } else {
+                let next_idx = current_idx
+                    .unwrap_or(0)
+                    .min(snap.queue.len().saturating_sub(1));
+                snap.media_id = Some(snap.queue[next_idx].clone());
+                snap.position_ms = 0;
+            }
+        }
+        Ok(snap.clone())
+    }
+
+    /// Marks a media item as `Missing` when its underlying file is moved or offline.
+    pub fn mark_media_missing(&self, media_id: &str) -> AppResult<MediaItem> {
+        let now = now_timestamp_string();
+        self.media_repo
+            .update_availability(media_id, Availability::Missing, &now)?;
+        self.media_repo
+            .get_by_id(media_id)?
+            .ok_or_else(|| AppError::validation("Media item not found"))
+    }
+
     /// Returns the current authoritative `PlaybackSnapshot`.
     pub fn get_playback_snapshot(&self) -> AppResult<PlaybackSnapshot> {
         let snap = self
@@ -292,9 +394,12 @@ impl AudoraAppService {
             PlaybackCommand::Next => {
                 if let Some(current_id) = snap.media_id.clone() {
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
-                        let next_idx = if idx + 1 < snap.queue.len() {
+                        let len = snap.queue.len();
+                        let next_idx = if snap.shuffle && len > 2 {
+                            Some((idx + 2) % len)
+                        } else if idx + 1 < len {
                             Some(idx + 1)
-                        } else if snap.repeat_mode == RepeatMode::All && !snap.queue.is_empty() {
+                        } else if (snap.repeat_mode == RepeatMode::All || snap.shuffle) && len > 0 {
                             Some(0)
                         } else {
                             None
@@ -393,6 +498,24 @@ impl AudoraAppService {
                     let _ = self.playback_backend.play(snap.generation);
                     snap.position_ms = 0;
                     snap.state = PlaybackState::Playing;
+                } else if let Some(current_id) = snap.media_id.clone() {
+                    if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
+                        let len = snap.queue.len();
+                        let next_idx = if snap.shuffle && len > 2 {
+                            Some((idx + 2) % len)
+                        } else if idx + 1 < len {
+                            Some(idx + 1)
+                        } else if snap.repeat_mode == RepeatMode::All && len > 1 {
+                            Some(0)
+                        } else {
+                            None
+                        };
+                        if let Some(i) = next_idx {
+                            snap.media_id = Some(snap.queue[i].clone());
+                            snap.position_ms = 0;
+                            snap.state = PlaybackState::Playing;
+                        }
+                    }
                 }
             }
             BackendEvent::Failed { detail } => {

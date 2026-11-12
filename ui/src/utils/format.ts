@@ -30,6 +30,24 @@ export function formatTimestamp(
   return base;
 }
 
+export function formatDurationMs(
+  ms: number | null | undefined,
+  precision: TimestampPrecision = "nearest_second",
+): string {
+  return formatTimestamp(ms, precision);
+}
+
+export function progressPercent(
+  positionMs: number,
+  durationMs: number | null | undefined,
+): number {
+  if (!durationMs || durationMs <= 0 || positionMs <= 0) {
+    return 0;
+  }
+  const clamped = Math.min(positionMs, durationMs);
+  return Math.min(100, Math.floor((clamped * 100) / durationMs));
+}
+
 /**
  * Computes progress percentage (0..100) for a `MediaItem` (`Frame 4:206`).
  */

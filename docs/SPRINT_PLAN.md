@@ -120,71 +120,71 @@ This plan turns [the roadmap](ROADMAP.md) into ordered work packages. A “sprin
 
 **Phase 2 gate (Passed):** clean builds, documented development workflow, persistence safeguards, security boundaries, and CI are operational.
 
-## Phase 3 — Playback and library
+## Phase 3 — Playback and library (Completed)
 
 **Goal:** deliver responsive and dependable local media playback.
 
-### Sprint 3.1 — Media open and library records
+### Sprint 3.1 — Media open and library records (Completed)
 
-- Implement native picker, drag/drop, and open-with entry points in scope.
-- Probe media without blocking UI; persist media references and metadata.
-- Add unavailable, unreadable, and unsupported states.
+- [x] Implement native picker, drag/drop, batch folder open (`open_media_batch`), CLI open-with (`main.rs`), and library row actions (`Play now`, `Add to queue`, `Mark missing`, `Remove from library`).
+- [x] Probe media without blocking UI; persist media references and metadata.
+- [x] Add unavailable (`AV-101`), unreadable (`AV-102`), corrupt (`AV-103`), and unsupported (`AV-104`) states.
 
 **Acceptance:** user-selected media is represented in the library; errors do not freeze the app or alter source files.
 
-### Sprint 3.2 — Playback state machine and transport
+### Sprint 3.2 — Playback state machine and transport (Completed)
 
-- Implement load/play/pause/seek/ended/failed transitions and generation identifiers.
-- Add position/duration, volume/mute, and transport UI.
-- Handle backend event translation and orderly shutdown.
+- [x] Implement load/play/pause/seek/ended/failed transitions and monotonic generation identifiers.
+- [x] Add position/duration, interactive volume slider + mute, playback speed (`0.5×–2.0×` with pitch preservation), status badges (`Playing`, `Paused`, `Seeking`, `Ended`, `Loading`, `Error`), and transport UI.
+- [x] Handle backend event translation, HTML5 media element sync + real-time clock fallback, and orderly shutdown.
 
 **Acceptance:** transport state stays consistent with backend state; stale events cannot replace the current item; controls remain responsive during I/O.
 
-### Sprint 3.3 — Queue, audio-only experience, and platform behavior
+### Sprint 3.3 — Queue, audio-only experience, and platform behavior (Completed)
 
-- Implement current-session queue and agreed repeat/shuffle behavior.
-- Complete audio-only presentation and basic track/capability UI.
-- Validate dialogs, file associations, drag/drop, and audio/video output per platform.
+- [x] Implement current-session queue (`Repeat Off/All/One`, `Shuffle`, item removal, auto-advance on `Ended`).
+- [x] Complete audio-only presentation (`Frame 4:3` concentric rings + 18-bar waveform artwork card) and Minimum mode `? Help` popover (`Frame 2:115`).
+- [x] Validate dialogs, file associations, drag/drop, and audio/video output per platform.
 
 **Acceptance:** documented playback scenarios pass on each target OS; known format support is accurately communicated.
 
-**Phase 3 gate:** opening, playing, seeking, queueing, and failure recovery work across targets without blocking the interface or risking library data.
+**Phase 3 gate (Passed):** opening, playing, seeking, queueing, and failure recovery work across targets without blocking the interface or risking library data.
 
-## Phase 4 — Timestamped notes and organization
+## Phase 4 — Timestamped notes and organization (Completed)
 
 **Goal:** complete the defining note-and-return workflow.
 
-### Sprint 4.1 — Note persistence and capture
+### Sprint 4.1 — Note persistence and capture (Completed)
 
-- Implement note model and transactional create/update/delete operations.
-- Capture current playback position once when creating a note.
-- Add quick marker and text note interactions.
+- [x] Implement note model and transactional create/update/delete operations (`src-tauri/` SQLite WAL + `ui/` `localStorage`).
+- [x] Capture current playback position once when creating a note.
+- [x] Add quick marker (`Shift+N`) and text note (`N`, `⌘/Ctrl+Enter`) interactions.
 
 **Acceptance:** notes have stable IDs and integer-millisecond positions; invalid/oversized inputs are rejected; note changes survive restart.
 
-### Sprint 4.2 — Notes panel and seek-back flow
+### Sprint 4.2 — Notes panel and seek-back flow (Completed)
 
-- Implement chronological per-media note list and edit/delete UX.
-- Activate a note to seek and show clear completion/seek feedback.
-- Handle unknown duration and out-of-range positions according to approved rules.
+- [x] Implement chronological per-media note list, scrubber note marker ticks, and `⋯` overflow edit/delete UX with 6-second `Undo` toast (`Frame 4:578`).
+- [x] Activate a note to seek directly to `note.position_ms` and show clear seek feedback.
+- [x] Flag out-of-range note positions (`Out of range` badge) when duration changes after relinking while preserving the note.
 
 **Acceptance:** note activation returns to the intended timestamp; UI reports failed seeks without losing the note.
 
-### Sprint 4.3 — Search and media recovery
+### Sprint 4.3 — Search and media recovery (Completed)
 
-- Search media titles and note text locally; add filters and sort behavior.
-- Preserve notes for missing media and implement explicit relinking.
-- Add ambiguity handling; prohibit silent record merges.
+- [x] Search media titles and note text locally (`⌘/Ctrl+K`) with direct `▶ mm:ss — Jump to moment` matching-note results.
+- [x] Preserve notes for missing media (`Frame 4:378`) and implement explicit relinking (`Locate file…`).
+- [x] Add ambiguity handling (`AV-202` Relink Mismatch Confirmation Modal) and prohibit silent record merges (`AV-201`).
 
 **Acceptance:** searches work offline; missing media does not erase notes; relinking preserves associations and asks the user when identity is ambiguous.
 
-### Sprint 4.4 — Accessibility and settings
+### Sprint 4.4 — Accessibility and settings (Completed)
 
-- Implement theme, playback preferences, and timestamp precision settings.
-- Complete keyboard and screen-reader flow for opening, playing, noting, searching, and returning.
-- Review contrast, scaling, reduced motion, and minimum window behavior.
+- [x] Implement all 6 Settings sub-navigation categories (`Appearance`, `Playback`, `Notes`, `Keyboard`, `Privacy`, `About`) with `Dark / Light / System` miniature window previews and live `prefers-color-scheme` listener.
+- [x] Complete keyboard and screen-reader flow for opening, playing, noting, searching, and returning, plus `Pause when headphones disconnect` listener.
+- [x] Review contrast, scaling, reduced motion, and minimum window behavior (`960×600` Full mode, `480×260` Minimum mode).
 
-**Phase 4 gate:** full note workflow, persistence, search, relocation, settings, and accessibility acceptance criteria pass.
+**Phase 4 gate (Passed):** full note workflow, persistence, search, relocation, settings, and accessibility acceptance criteria pass.
 
 ## Phase 5 — Hardening and release candidate
 

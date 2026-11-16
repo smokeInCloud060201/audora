@@ -34,6 +34,94 @@
 .audora-logo-svg {
   display: block;
   flex-shrink: 0;
+  transition: transform 0.25s ease, filter 0.25s ease;
+}
+
+.audora-logo-svg.is-playing {
+  animation: audora-mark-pulse 1.8s ease-in-out infinite;
+}
+
+.audora-logo-svg .audora-mark-bg {
+  transition: fill 0.25s ease;
+}
+
+.audora-logo-svg.is-playing .audora-mark-bg {
+  animation: audora-mark-rect-glow 1.8s ease-in-out infinite;
+}
+
+.audora-logo-svg .audora-mark-bar {
+  transform-box: view-box;
+  transform-origin: 31px 31px;
+  transition: transform 0.22s ease;
+}
+
+.audora-logo-svg.is-playing .audora-mark-bar.bar-1 {
+  animation: audora-eq-bounce 0.72s ease-in-out -0.12s infinite alternate;
+}
+
+.audora-logo-svg.is-playing .audora-mark-bar.bar-2 {
+  animation: audora-eq-bounce-tall 0.62s ease-in-out -0.38s infinite alternate;
+}
+
+.audora-logo-svg.is-playing .audora-mark-bar.bar-3 {
+  animation: audora-eq-bounce-mid 0.82s ease-in-out -0.24s infinite alternate;
+}
+
+.audora-logo-svg.is-playing .audora-mark-bar.bar-4 {
+  animation: audora-eq-bounce-tall 0.68s ease-in-out -0.52s infinite alternate;
+}
+
+.audora-logo-svg.is-playing .audora-mark-bar.bar-5 {
+  animation: audora-eq-bounce 0.78s ease-in-out -0.18s infinite alternate;
+}
+
+@keyframes audora-mark-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 0 rgba(121, 215, 191, 0));
+  }
+  50% {
+    transform: scale(1.06);
+    filter: drop-shadow(0 0 8px rgba(121, 215, 191, 0.55));
+  }
+}
+
+@keyframes audora-mark-rect-glow {
+  0%,
+  100% {
+    fill: #79d7bf;
+  }
+  50% {
+    fill: #98ebd6;
+  }
+}
+
+@keyframes audora-eq-bounce {
+  0% {
+    transform: scaleY(0.45);
+  }
+  100% {
+    transform: scaleY(1.45);
+  }
+}
+
+@keyframes audora-eq-bounce-mid {
+  0% {
+    transform: scaleY(0.38);
+  }
+  100% {
+    transform: scaleY(1.12);
+  }
+}
+
+@keyframes audora-eq-bounce-tall {
+  0% {
+    transform: scaleY(0.42);
+  }
+  100% {
+    transform: scaleY(1.28);
+  }
 }
 
 .audora-mark {
@@ -1443,7 +1531,45 @@
   width: 6px;
   border-radius: 3px;
   background-color: var(--accent-primary);
-  transition: opacity 0.2s ease;
+  transform-origin: center;
+  transition: opacity 0.2s ease, transform 0.25s ease;
+}
+
+.waveform-bars.is-playing .waveform-bar {
+  animation: audora-waveform-dance var(--wave-dur, 860ms) ease-in-out var(--wave-delay, 0ms) infinite alternate;
+  will-change: transform;
+}
+
+.audio-canvas.is-playing .audio-ring-inner {
+  animation: audora-ring-breathe 3.6s ease-in-out infinite;
+}
+
+.audio-canvas.is-playing .audio-ring-outer {
+  animation: audora-ring-breathe 3.6s ease-in-out -1.8s infinite;
+}
+
+@keyframes audora-waveform-dance {
+  0% {
+    transform: scaleY(0.32);
+  }
+  50% {
+    transform: scaleY(0.86);
+  }
+  100% {
+    transform: scaleY(1.15);
+  }
+}
+
+@keyframes audora-ring-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.75;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
 }
 
 /* Scrubber Note Markers (Sprint 4.2) */

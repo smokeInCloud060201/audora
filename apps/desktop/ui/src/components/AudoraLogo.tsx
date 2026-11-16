@@ -8,6 +8,8 @@ interface AudoraLogoProps {
    * "icon" renders the full Listening Aperture app icon (`12:9` / `12:45`) for dialogs & About cards.
    */
   variant?: "mark" | "icon";
+  /** Animates the logo mark & equalizer bars when media is actively playing (e.g., in Minimum Mode). */
+  isPlaying?: boolean;
   className?: string;
 }
 
@@ -19,6 +21,7 @@ interface AudoraLogoProps {
 export const AudoraLogo: React.FC<AudoraLogoProps> = ({
   size = 28,
   variant = "mark",
+  isPlaying = false,
   className = "",
 }) => {
   const uid = useId().replace(/:/g, "");
@@ -31,16 +34,16 @@ export const AudoraLogo: React.FC<AudoraLogoProps> = ({
         viewBox="0 0 62 62"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
-        className={`audora-logo-svg ${className}`.trim()}
+        className={`audora-logo-svg ${isPlaying ? "is-playing" : ""} ${className}`.trim()}
         aria-hidden="true"
         data-node-id="12:89"
       >
-        <rect width="62" height="62" rx="16" fill="#79D7BF" />
-        <rect x="9" y="26.5" width="4" height="9" rx="2" fill="#10201C" />
-        <rect x="19" y="22.36" width="4" height="17.28" rx="2" fill="#10201C" />
-        <rect x="29" y="18.04" width="4" height="25.92" rx="2" fill="#10201C" />
-        <rect x="39" y="21.46" width="4" height="19.08" rx="2" fill="#10201C" />
-        <rect x="49" y="25.24" width="4" height="11.52" rx="2" fill="#10201C" />
+        <rect className="audora-mark-bg" width="62" height="62" rx="16" fill="#79D7BF" />
+        <rect className="audora-mark-bar bar-1" x="9" y="26.5" width="4" height="9" rx="2" fill="#10201C" />
+        <rect className="audora-mark-bar bar-2" x="19" y="22.36" width="4" height="17.28" rx="2" fill="#10201C" />
+        <rect className="audora-mark-bar bar-3" x="29" y="18.04" width="4" height="25.92" rx="2" fill="#10201C" />
+        <rect className="audora-mark-bar bar-4" x="39" y="21.46" width="4" height="19.08" rx="2" fill="#10201C" />
+        <rect className="audora-mark-bar bar-5" x="49" y="25.24" width="4" height="11.52" rx="2" fill="#10201C" />
       </svg>
     );
   }

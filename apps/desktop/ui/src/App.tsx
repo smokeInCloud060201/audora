@@ -1017,7 +1017,7 @@ export function App(): React.ReactElement {
             }}
           >
             <div className="minimum-titlebar-left">
-              <AudoraLogo variant="mark" size={28} />
+              <AudoraLogo variant="mark" size={28} isPlaying={snapshot.state === "playing"} />
               <div className="minimum-titlebar-meta">
                 <p className="minimum-media-title" data-node-id="20:9">
                   {activeMedia ? activeMedia.display_name : "No media loaded"}
@@ -1191,7 +1191,7 @@ export function App(): React.ReactElement {
       {/* Hybrid 56px Header Bar (Frame 2:4 & Brand System 12:68) */}
       <header className="audora-titlebar" data-tauri-drag-region>
         <div className="titlebar-brand">
-          <AudoraLogo variant="mark" size={28} />
+          <AudoraLogo variant="mark" size={28} isPlaying={snapshot.state === "playing"} />
           <span className="brand-title">Audora</span>
         </div>
 
@@ -1424,19 +1424,29 @@ export function App(): React.ReactElement {
                   </div>
                 ) : activeMedia?.media_kind === "audio" ? (
                   /* Dedicated Audio-Only Canvas (Frame 4:3) */
-                  <div className="audio-canvas" data-testid="audio-only-canvas">
+                  <div
+                    className={`audio-canvas ${snapshot.state === "playing" ? "is-playing" : ""}`}
+                    data-testid="audio-only-canvas"
+                  >
                     <div className="audio-ring-outer" aria-hidden="true" />
                     <div className="audio-ring-inner" aria-hidden="true" />
                     <div className="audio-artwork-card">
-                      <div className="waveform-bars" aria-hidden="true">
+                      <div
+                        className={`waveform-bars ${snapshot.state === "playing" ? "is-playing" : ""}`}
+                        aria-hidden="true"
+                      >
                         {WAVEFORM_BAR_HEIGHTS.map((h, idx) => (
                           <span
                             key={idx}
                             className="waveform-bar"
-                            style={{
-                              height: `${h}px`,
-                              opacity: snapshot.state === "playing" ? 0.95 : 0.55,
-                            }}
+                            style={
+                              {
+                                height: `${h}px`,
+                                opacity: snapshot.state === "playing" ? 0.95 : 0.55,
+                                "--wave-dur": `${700 + ((idx * 137) % 460)}ms`,
+                                "--wave-delay": `-${(idx * 95) % 820}ms`,
+                              } as React.CSSProperties
+                            }
                           />
                         ))}
                       </div>

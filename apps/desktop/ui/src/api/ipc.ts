@@ -158,6 +158,164 @@ export class AudoraIpcClient {
     }
   }
 
+  private isBareFileName(rawPath: string): boolean {
+    return !rawPath.includes("/") && !rawPath.includes("\\");
+  }
+
+  private normalizeComparablePath(rawPath: string): string {
+    const normalized = rawPath.trim().replace(/\\/g, "/");
+    const stripped = normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
+    return stripped.toLowerCase();
+  }
+
+  private computeLocalStreamUrl(
+    rawPath: string,
+    explicitStreamUrl?: string,
+  ): string | undefined {
+    if (
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost") &&
+      (rawPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawPath))
+    ) {
+      return `/__audora_media?path=${encodeURIComponent(rawPath)}`;
+    }
+    return explicitStreamUrl;
+  }
+
+  private areMediaItemsDuplicate(a: MediaItem, b: MediaItem): boolean {
+    if (this.normalizeComparablePath(a.path) === this.normalizeComparablePath(b.path)) {
+      return true;
+    }
+    const aBare = this.isBareFileName(a.path);
+    const bBare = this.isBareFileName(b.path);
+    if (aBare !== bBare && a.display_name.toLowerCase() === b.display_name.toLowerCase()) {
+      if (a.file_size_bytes != null && b.file_size_bytes != null) {
+        return a.file_size_bytes === b.file_size_bytes;
+      }
+      const sameNameCount = this.media.filter(
+        (m) => m.display_name.toLowerCase() === a.display_name.toLowerCase(),
+      ).length;
+      return sameNameCount <= 2;
+    }
+    return false;
+  }
+
+  private findMatchingMediaItem(
+    candidatePath: string,
+    fileName: string,
+    fileSizeBytes?: number | null,
+  ): MediaItem | undefined {
+    const normCandidate = this.normalizeComparablePath(candidatePath);
+    const byPath = this.media.find(
+      (m) => this.normalizeComparablePath(m.path) === normCandidate,
+    );
+    if (byPath) {
+      return byPath;
+    }
+
+    const candidateBare = this.isBareFileName(candidatePath);
+    const lowerName = fileName.toLowerCase();
+    const sameNameOpposite = this.media.filter(
+      (m) =>
+        this.isBareFileName(m.path) !== candidateBare &&
+        m.display_name.toLowerCase() === lowerName,
+    );
+    if (sameNameOpposite.length === 0) {
+      return undefined;
+    }
+    if (fileSizeBytes != null) {
+      const bySize = sameNameOpposite.find(
+        (m) => m.file_size_bytes != null && m.file_size_bytes === fileSizeBytes,
+      );
+      if (bySize) {
+        return bySize;
+      }
+    }
+    if (
+      sameNameOpposite.length === 1 &&
+      (fileSizeBytes == null || sameNameOpposite[0].file_size_bytes == null)
+    ) {
+      return sameNameOpposite[0];
+    }
+    return undefined;
+  }
+
+  private deduplicateMediaRecords(): boolean {
+    if (this.media.length < 2) {
+      return false;
+    }
+    const kept: MediaItem[] = [];
+    const idRemap = new Map<string, string>();
+
+    for (const candidate of this.media) {
+      const existing = kept.find((k) => this.areMediaItemsDuplicate(k, candidate));
+      if (!existing) {
+        if (!this.isBareFileName(candidate.path)) {
+          const persistentUrl = this.computeLocalStreamUrl(candidate.path);
+          if (persistentUrl) {
+            candidate.stream_url = persistentUrl;
+          }
+        }
+        kept.push(candidate);
+        continue;
+      }
+
+      // Merge `candidate` into `existing`, preferring full path and non-null metadata
+      if (this.isBareFileName(existing.path) && !this.isBareFileName(candidate.path)) {
+        existing.path = candidate.path;
+      }
+      if (!existing.source_folder_id && candidate.source_folder_id) {
+        existing.source_folder_id = candidate.source_folder_id;
+      }
+      if (existing.duration_ms == null && candidate.duration_ms != null) {
+        existing.duration_ms = candidate.duration_ms;
+      }
+      if (existing.file_size_bytes == null && candidate.file_size_bytes != null) {
+        existing.file_size_bytes = candidate.file_size_bytes;
+      }
+      existing.last_position_ms = Math.max(
+        existing.last_position_ms,
+        candidate.last_position_ms,
+      );
+      existing.completed = existing.completed || candidate.completed;
+      existing.last_opened_at = existing.last_opened_at ?? candidate.last_opened_at;
+      if (candidate.availability === "available") {
+        existing.availability = "available";
+      }
+      if (!this.isBareFileName(existing.path)) {
+        existing.stream_url =
+          this.computeLocalStreamUrl(existing.path) ??
+          existing.stream_url ??
+          candidate.stream_url;
+      } else {
+        existing.stream_url = existing.stream_url ?? candidate.stream_url;
+      }
+      idRemap.set(candidate.id, existing.id);
+    }
+
+    if (idRemap.size === 0) {
+      return false;
+    }
+
+    this.media = kept;
+    for (const note of this.notes) {
+      const targetId = idRemap.get(note.media_id);
+      if (targetId) {
+        note.media_id = targetId;
+      }
+    }
+    for (const pl of this.playlists) {
+      pl.item_ids = Array.from(
+        new Set(pl.item_ids.map((id) => idRemap.get(id) ?? id)),
+      );
+    }
+    for (const item of this.media) {
+      item.note_count = this.notes.filter((n) => n.media_id === item.id).length;
+    }
+    return true;
+  }
+
   private applyPersistedState(parsed: Partial<PersistedState>): boolean {
     let strippedLegacyMock = false;
     if (Array.isArray(parsed.media)) {
@@ -195,6 +353,9 @@ export class AudoraIpcClient {
       }));
     } else {
       this.playlists = [];
+    }
+    if (this.deduplicateMediaRecords()) {
+      strippedLegacyMock = true;
     }
     if (parsed.settings) {
       const persistedInstalled = parsed.settings.installed_version;
@@ -687,7 +848,8 @@ export class AudoraIpcClient {
       throw payload;
     }
 
-    let item = this.media.find((m) => m.path === trimmed);
+    const streamUrl = this.computeLocalStreamUrl(trimmed, options?.streamUrl);
+    let item = this.findMatchingMediaItem(trimmed, fileName, options?.size);
     if (!item) {
       item = {
         id: `med_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -704,13 +866,28 @@ export class AudoraIpcClient {
         last_opened_at: "Just now",
         last_seen_at: "Just now",
         note_count: 0,
-        stream_url: options?.streamUrl,
+        stream_url: streamUrl,
       };
       this.media.unshift(item);
-    } else if (options?.streamUrl) {
-      item.stream_url = options.streamUrl;
-      if (options.durationMs) {
+    } else {
+      if (!this.isBareFileName(trimmed) && this.isBareFileName(item.path)) {
+        item.path = trimmed;
+      }
+      if (options?.size != null && item.file_size_bytes == null) {
+        item.file_size_bytes = options.size;
+      }
+      if (options?.durationMs && !item.duration_ms) {
         item.duration_ms = options.durationMs;
+      }
+      item.availability = "available";
+      item.last_seen_at = "Just now";
+      if (!this.isBareFileName(item.path)) {
+        item.stream_url =
+          this.computeLocalStreamUrl(item.path) ??
+          options?.streamUrl ??
+          item.stream_url;
+      } else if (streamUrl) {
+        item.stream_url = streamUrl;
       }
     }
     this.persistToStorage();
@@ -1112,16 +1289,9 @@ export class AudoraIpcClient {
         continue;
       }
 
-      const streamUrl =
-        f.streamUrl ??
-        (isBrowserRuntime() &&
-        (window.location.hostname === "127.0.0.1" ||
-          window.location.hostname === "localhost") &&
-        (rawItemPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawItemPath))
-          ? `/__audora_media?path=${encodeURIComponent(rawItemPath)}`
-          : undefined);
+      const streamUrl = this.computeLocalStreamUrl(rawItemPath, f.streamUrl);
 
-      const existing = this.media.find((m) => m.path === rawItemPath);
+      const existing = this.findMatchingMediaItem(rawItemPath, fileName, f.size);
       if (!existing) {
         const created: MediaItem = {
           id: `med_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1147,12 +1317,19 @@ export class AudoraIpcClient {
         }
         importedCount += 1;
       } else {
+        existing.path = rawItemPath;
+        if (f.size != null && existing.file_size_bytes == null) {
+          existing.file_size_bytes = f.size;
+        }
+        if (f.durationMs != null && existing.duration_ms == null) {
+          existing.duration_ms = f.durationMs;
+        }
         if (!existing.source_folder_id) {
           existing.source_folder_id = folder.id;
         }
         existing.availability = "available";
         existing.last_seen_at = "Just now";
-        if (streamUrl && !existing.stream_url) {
+        if (streamUrl) {
           existing.stream_url = streamUrl;
         }
         if (!this.snapshot.queue.includes(existing.id)) {
@@ -1287,6 +1464,61 @@ export class AudoraIpcClient {
       folder: added.folder,
       importedCount: added.importedCount,
     };
+  }
+
+  public async pickAndOpenNativeMediaFiles(): Promise<{
+    supported: boolean;
+    cancelled: boolean;
+    items: MediaItem[];
+    selectedNames: string[];
+  }> {
+    if (
+      !isBrowserRuntime() ||
+      (window.location.hostname !== "127.0.0.1" &&
+        window.location.hostname !== "localhost")
+    ) {
+      return { supported: false, cancelled: false, items: [], selectedNames: [] };
+    }
+    let text = "";
+    try {
+      const res = await fetch("/__audora_pick_files");
+      if (!res.ok) {
+        return { supported: false, cancelled: false, items: [], selectedNames: [] };
+      }
+      text = await res.text();
+    } catch {
+      return { supported: false, cancelled: false, items: [], selectedNames: [] };
+    }
+    if (!text.trim().startsWith("{")) {
+      return { supported: false, cancelled: false, items: [], selectedNames: [] };
+    }
+    const payload = JSON.parse(text) as {
+      ok?: boolean;
+      cancelled?: boolean;
+      files?: Array<{ path: string; name: string; size: number }>;
+    };
+    if (!payload.ok) {
+      return { supported: false, cancelled: false, items: [], selectedNames: [] };
+    }
+    if (payload.cancelled || !payload.files || payload.files.length === 0) {
+      return { supported: true, cancelled: true, items: [], selectedNames: [] };
+    }
+    const selectedNames = payload.files.map((f) => f.name);
+    try {
+      const items = this.openLocalFiles(
+        payload.files.map((f) => ({
+          name: f.name,
+          path: f.path,
+          size: f.size,
+        })),
+      );
+      return { supported: true, cancelled: false, items, selectedNames };
+    } catch (err) {
+      if (err && typeof err === "object" && "code" in err) {
+        throw Object.assign(err, { firstFileName: selectedNames[0] });
+      }
+      throw err;
+    }
   }
 
   public async rescanSourceFolder(

@@ -75,7 +75,8 @@ function collectMediaInDir(
         try {
           const stat = fs.statSync(full);
           if (stat.size > 0) {
-            out.push({ path: full, name: entry.name, size: stat.size });
+            const canonical = fs.realpathSync(full);
+            out.push({ path: canonical, name: entry.name, size: stat.size });
           }
         } catch {
           // Skip unreadable files
@@ -93,13 +94,89 @@ function audoraLocalDevBridge(): Plugin {
         if (!req.url) return next();
         const urlObj = new URL(req.url, "http://localhost");
 
+        if (urlObj.pathname === "/__audora_pick_files") {
+          const sendPickedFiles = (rawStdout: string | null) => {
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            if (!rawStdout) {
+              res.end(JSON.stringify({ ok: true, cancelled: true, files: [] }));
+              return;
+            }
+            const files: Array<{ path: string; name: string; size: number }> = [];
+            for (const line of rawStdout.split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                const stat = fs.statSync(trimmed);
+                if (stat.isFile()) {
+                  const canonical = fs.realpathSync(trimmed);
+                  files.push({
+                    path: canonical,
+                    name: path.basename(canonical),
+                    size: stat.size,
+                  });
+                }
+              } catch {
+                // Skip invalid selection line
+              }
+            }
+            res.end(
+              JSON.stringify({
+                ok: true,
+                cancelled: files.length === 0,
+                files,
+              }),
+            );
+          };
+
+          if (process.platform === "darwin") {
+            const script = [
+              'set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed',
+              'set outText to ""',
+              "repeat with f in chosenFiles",
+              "  set outText to outText & (POSIX path of f) & linefeed",
+              "end repeat",
+              "return outText",
+            ].join("\n");
+            execFile("/usr/bin/osascript", ["-e", script], (err, stdout) => {
+              sendPickedFiles(err ? null : stdout);
+            });
+            return;
+          }
+
+          if (process.platform === "win32") {
+            execFile(
+              "powershell",
+              [
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = $true; if ($d.ShowDialog() -eq 'OK') { $d.FileNames | ForEach-Object { Write-Output $_ } }",
+              ],
+              (err, stdout) => {
+                sendPickedFiles(err ? null : stdout);
+              },
+            );
+            return;
+          }
+
+          execFile(
+            "zenity",
+            ["--file-selection", "--multiple", "--separator=\n"],
+            (err, stdout) => {
+              sendPickedFiles(err ? null : stdout);
+            },
+          );
+          return;
+        }
+
         if (urlObj.pathname === "/__audora_pick_folder") {
           const sendPicked = (rawPicked: string | null) => {
             const cleaned = rawPicked ? rawPicked.trim().replace(/[\\/]+$/, "") : "";
             res.statusCode = 200;
             res.setHeader("Content-Type", "application/json; charset=utf-8");
             if (cleaned && fs.existsSync(cleaned) && fs.statSync(cleaned).isDirectory()) {
-              res.end(JSON.stringify({ ok: true, cancelled: false, path: cleaned }));
+              const canonical = fs.realpathSync(cleaned);
+              res.end(JSON.stringify({ ok: true, cancelled: false, path: canonical }));
             } else {
               res.end(JSON.stringify({ ok: true, cancelled: true, path: null }));
             }

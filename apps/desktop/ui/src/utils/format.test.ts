@@ -391,4 +391,51 @@ describe("AudoraIpcClient workflows", () => {
     client.restorePlaylist(deleted!);
     expect(client.listPlaylists()).toHaveLength(2);
   });
+
+  it("deduplicates media when opening the same file manually after importing a source folder (and vice-versa)", () => {
+    const client = new AudoraIpcClient(false);
+
+    // Case 1: Import source folder first, then manually open the same file by full path and by bare File.name
+    client.addSourceFolderWithFiles("/tmp/AudioSource", [
+      { name: "Interview.wav", path: "/tmp/AudioSource/Interview.wav", size: 8_400_000 },
+    ]);
+    expect(client.searchLibrary("", "all").media_items).toHaveLength(1);
+
+    client.openMediaPath("/tmp/AudioSource/Interview.wav", { size: 8_400_000 });
+    expect(client.searchLibrary("", "all").media_items).toHaveLength(1);
+
+    // Simulate browser <input type="file"> or drag-and-drop where File only carries bare filename + byte size
+    client.openLocalFiles([{ name: "Interview.wav", size: 8_400_000 }]);
+    const afterManualOpen = client.searchLibrary("", "all").media_items;
+    expect(afterManualOpen).toHaveLength(1);
+    expect(afterManualOpen[0].path).toBe("/tmp/AudioSource/Interview.wav");
+
+    // Case 2: Open bare filename first, attach note + playlist, then import containing source folder
+    const [manualTrack] = client.openLocalFiles([
+      { name: "Session_Mix.mp3", size: 5_120_000, durationMs: 180_000 },
+    ]);
+    expect(manualTrack.path).toBe("Session_Mix.mp3");
+    client.createNote({
+      media_id: manualTrack.id,
+      position_ms: 25_000,
+      is_quick_marker: false,
+      body: "Check EQ balance here",
+    });
+    const pl = client.createPlaylist({
+      name: "Mix Review",
+      initial_item_ids: [manualTrack.id],
+    });
+
+    client.addSourceFolderWithFiles("/tmp/StudioExports", [
+      { name: "Session_Mix.mp3", path: "/tmp/StudioExports/Session_Mix.mp3", size: 5_120_000 },
+    ]);
+
+    const allItems = client.searchLibrary("", "all").media_items;
+    expect(allItems).toHaveLength(2);
+    const upgraded = allItems.find((m) => m.display_name === "Session_Mix.mp3")!;
+    expect(upgraded.id).toBe(manualTrack.id);
+    expect(upgraded.path).toBe("/tmp/StudioExports/Session_Mix.mp3");
+    expect(client.listNotes(upgraded.id)).toHaveLength(1);
+    expect(client.getPlaylist(pl.id)?.item_ids).toEqual([upgraded.id]);
+  });
 });

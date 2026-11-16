@@ -589,7 +589,32 @@ export function App(): React.ReactElement {
   };
 
   const triggerOpenMediaPicker = () => {
-    fileInputRef.current?.click();
+    void (async () => {
+      try {
+        const res = await ipcClient.pickAndOpenNativeMediaFiles();
+        if (!res.supported) {
+          fileInputRef.current?.click();
+          return;
+        }
+        if (res.cancelled || res.items.length === 0) {
+          return;
+        }
+        setUnsupportedError(null);
+        setMissingMediaTarget(null);
+        setSnapshot(ipcClient.getPlaybackSnapshot());
+        setLibraryVersion((v) => v + 1);
+        setSection("now_playing");
+      } catch (err) {
+        const payload = err as AppErrorPayload & { firstFileName?: string };
+        if (payload.code === "AV-104") {
+          setUnsupportedError({
+            fileName: payload.firstFileName ?? "Unknown file",
+            payload,
+          });
+          setSection("now_playing");
+        }
+      }
+    })();
   };
 
   const handleNativeFilesSelected = (fileList: FileList | null) => {
@@ -979,7 +1004,7 @@ export function App(): React.ReactElement {
               data-node-id="20:13"
               onClick={() => {
                 if (!activeMedia) {
-                  fileInputRef.current?.click();
+                  triggerOpenMediaPicker();
                   return;
                 }
                 setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));

@@ -427,6 +427,31 @@ fn handle_http_connection(
         return;
     }
 
+    if raw_path == "/__audora_pick_files" {
+        let picked = pick_native_media_files();
+        if picked.is_empty() {
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                br#"{"ok":true,"cancelled":true,"files":[]}"#,
+            );
+        } else {
+            let mut files_json = String::from("[");
+            for (idx, (p, name, sz)) in picked.iter().enumerate() {
+                if idx > 0 {
+                    files_json.push(',');
+                }
+                let ep = escape_json_str(p);
+                let en = escape_json_str(name);
+                files_json.push_str(&format!(r#"{{"path":"{ep}","name":"{en}","size":{sz}}}"#));
+            }
+            files_json.push(']');
+            let body = format!(r#"{{"ok":true,"cancelled":false,"files":{files_json}}}"#);
+            write_json_response(&mut stream, "200 OK", body.as_bytes());
+        }
+        return;
+    }
+
     if raw_path == "/__audora_pick_folder" {
         match pick_native_folder() {
             Some(selected) => {
@@ -921,6 +946,95 @@ fn normalize_folder_path(raw: &str) -> String {
     }
 }
 
+fn canonical_path_string(p: &Path) -> String {
+    fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn pick_native_media_files() -> Vec<(String, String, u64)> {
+    let raw_lines: Vec<String> = if cfg!(target_os = "macos") {
+        let script = r#"
+            set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed
+            set outText to ""
+            repeat with f in chosenFiles
+                set outText to outText & (POSIX path of f) & linefeed
+            end repeat
+            return outText
+        "#;
+        Command::new("/usr/bin/osascript")
+            .args(["-e", script])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else if cfg!(target_os = "windows") {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = $true; $d.Filter = 'Media Files|*.mp4;*.m4v;*.mov;*.webm;*.mkv;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac|All Files|*.*'; if ($d.ShowDialog() -eq 'OK') { $d.FileNames | ForEach-Object { Write-Output $_ } }",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--multiple",
+                "--separator=\n",
+                "--title=Select local audio or video files for Audora",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut out = Vec::new();
+    for line in raw_lines {
+        let pb = PathBuf::from(&line);
+        let Ok(meta) = fs::metadata(&pb) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = pb
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&line)
+            .to_owned();
+        let canonical = canonical_path_string(&pb);
+        out.push((canonical, name, meta.len()));
+    }
+    out
+}
+
 fn pick_native_folder() -> Option<String> {
     if cfg!(target_os = "macos") {
         let output = Command::new("/usr/bin/osascript")
@@ -1028,7 +1142,7 @@ fn collect_media_files_in_dir(
                 .to_ascii_lowercase();
             if is_supported_media_extension(&ext) {
                 out.push((
-                    path.to_string_lossy().into_owned(),
+                    canonical_path_string(&path),
                     name_str.to_owned(),
                     meta.len(),
                 ));

@@ -271,6 +271,27 @@ export function App(): React.ReactElement {
     [settings, snapshot, libraryVersion, deletedPlaylistToast],
   );
 
+  const showPlaylistsBar = settings.show_playlists_bar !== false;
+  const showSidePanel = settings.show_side_panel !== false;
+
+  const togglePlaylistsBar = () => {
+    setSettings((prev) =>
+      ipcClient.updateSettings({
+        ...prev,
+        show_playlists_bar: prev.show_playlists_bar === false,
+      }),
+    );
+  };
+
+  const toggleSidePanel = () => {
+    setSettings((prev) =>
+      ipcClient.updateSettings({
+        ...prev,
+        show_side_panel: prev.show_side_panel === false,
+      }),
+    );
+  };
+
   // Global keyboard shortcuts (Section 5 of `docs/UI_DESIGN.md`)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -360,6 +381,12 @@ export function App(): React.ReactElement {
         setSettings((prev) =>
           ipcClient.setWindowMode(prev.window_mode === "full" ? "minimum" : "full"),
         );
+      } else if (e.key === "[") {
+        e.preventDefault();
+        togglePlaylistsBar();
+      } else if (e.key === "]") {
+        e.preventDefault();
+        toggleSidePanel();
       }
     };
 
@@ -402,6 +429,9 @@ export function App(): React.ReactElement {
       body: "",
     });
     setSideTab("notes");
+    if (!showSidePanel) {
+      setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
+    }
     setSnapshot(ipcClient.getPlaybackSnapshot());
     setLibraryVersion((v) => v + 1);
   };
@@ -424,6 +454,9 @@ export function App(): React.ReactElement {
       }
       setIsNoteModalOpen(false);
       setSideTab("notes");
+      if (!showSidePanel) {
+        setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
+      }
       setSnapshot(ipcClient.getPlaybackSnapshot());
       setLibraryVersion((v) => v + 1);
     } catch (err) {
@@ -503,6 +536,9 @@ export function App(): React.ReactElement {
       setIsSaveQueueModalOpen(false);
       setSaveQueueNameDraft("");
       setSelectedPlaylistId(created.id);
+      if (!showPlaylistsBar) {
+        setSettings(ipcClient.updateSettings({ ...settings, show_playlists_bar: true }));
+      }
       setLibraryVersion((v) => v + 1);
       showTransientUpdateToast(
         `Saved queue as playlist "${created.name}" (${created.item_ids.length} items).`,
@@ -783,52 +819,74 @@ export function App(): React.ReactElement {
     );
   };
 
+  const persistentAudioElement =
+    activeMedia?.media_kind === "audio" && activeMedia.stream_url ? (
+      <audio
+        ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
+        src={activeMedia.stream_url}
+        onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
+        onTimeUpdate={(e) =>
+          setSnapshot(
+            ipcClient.syncMediaElementPosition(
+              e.currentTarget.currentTime * 1000,
+              Number.isFinite(e.currentTarget.duration)
+                ? e.currentTarget.duration * 1000
+                : undefined,
+            ),
+          )
+        }
+        onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
+      />
+    ) : null;
+
   // Minimum mode · 360×168 view (Figma Frame 2:103 / 20:2)
   if (settings.window_mode === "minimum") {
     const pct = progressPercent(snapshot.position_ms, snapshot.duration_ms);
     return (
-      <div
-        className="minimum-mode-shell"
-        data-testid="minimum-mode-shell"
-        data-node-id="2:103"
-        onDragOver={(e) => {
-          e.preventDefault();
-          setIsDraggingFiles(true);
-        }}
-        onDragLeave={() => setIsDraggingFiles(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setIsDraggingFiles(false);
-          handleNativeFilesSelected(e.dataTransfer?.files ?? null);
-        }}
-      >
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          accept="audio/*,video/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.flac,.ogg,.opus,.m4a,.aac"
-          style={{ display: "none" }}
-          onChange={(e) => handleNativeFilesSelected(e.target.files)}
-        />
-
-        {activeMedia?.stream_url && (
-          <audio
-            ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
-            src={activeMedia.stream_url}
-            onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-            onTimeUpdate={(e) =>
-              setSnapshot(
-                ipcClient.syncMediaElementPosition(
-                  e.currentTarget.currentTime * 1000,
-                  Number.isFinite(e.currentTarget.duration)
-                    ? e.currentTarget.duration * 1000
-                    : undefined,
-                ),
-              )
-            }
-            onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
+      <>
+        {persistentAudioElement}
+        <div
+          className="minimum-mode-shell"
+          data-testid="minimum-mode-shell"
+          data-node-id="2:103"
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDraggingFiles(true);
+          }}
+          onDragLeave={() => setIsDraggingFiles(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setIsDraggingFiles(false);
+            handleNativeFilesSelected(e.dataTransfer?.files ?? null);
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept="audio/*,video/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.flac,.ogg,.opus,.m4a,.aac"
+            style={{ display: "none" }}
+            onChange={(e) => handleNativeFilesSelected(e.target.files)}
           />
-        )}
+
+          {activeMedia?.media_kind === "video" && activeMedia.stream_url && (
+            <audio
+              ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
+              src={activeMedia.stream_url}
+              onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
+              onTimeUpdate={(e) =>
+                setSnapshot(
+                  ipcClient.syncMediaElementPosition(
+                    e.currentTarget.currentTime * 1000,
+                    Number.isFinite(e.currentTarget.duration)
+                      ? e.currentTarget.duration * 1000
+                      : undefined,
+                  ),
+                )
+              }
+              onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
+            />
+          )}
 
         <div className="minimum-player-card" data-node-id="20:2">
           <header
@@ -963,15 +1021,18 @@ export function App(): React.ReactElement {
                 />
               </div>
             </div>
+            </div>
           </div>
         </div>
-      </div>
+      </>
     );
   }
 
   return (
-    <div
-      className="audora-shell"
+    <>
+      {persistentAudioElement}
+      <div
+        className="audora-shell"
       onDragOver={(e) => {
         e.preventDefault();
         setIsDraggingFiles(true);
@@ -1062,21 +1123,6 @@ export function App(): React.ReactElement {
             <button
               type="button"
               className="nav-rail-btn"
-              data-testid="nav-rail-playlists-btn"
-              aria-current={section === "playlists" ? "page" : undefined}
-              onClick={() => {
-                setMissingMediaTarget(null);
-                setSection("playlists");
-              }}
-            >
-              <span className="nav-rail-icon" aria-hidden="true">
-                ☰
-              </span>
-              <span>Playlists</span>
-            </button>
-            <button
-              type="button"
-              className="nav-rail-btn"
               aria-current={section === "now_playing" ? "page" : undefined}
               onClick={() => setSection("now_playing")}
             >
@@ -1127,8 +1173,42 @@ export function App(): React.ReactElement {
 
         {/* Main Workspace Stage */}
         <main className="audora-stage">
-          {section === "now_playing" && (
-            <>
+          <div
+            data-testid="now-playing-workspace"
+            aria-hidden={section !== "now_playing"}
+            style={{
+              display: section === "now_playing" ? "flex" : "none",
+              flex: 1,
+              minWidth: 0,
+              minHeight: 0,
+            }}
+          >
+            {showPlaylistsBar && (
+              <PlaylistsView
+                playlists={playlists}
+                allMedia={allMedia}
+                activeMediaId={snapshot.media_id}
+                selectedPlaylistId={selectedPlaylistId}
+                onSelectPlaylist={setSelectedPlaylistId}
+                onPlayPlaylist={handlePlayPlaylist}
+                onRelinkMissingMedia={(item) => {
+                  setMissingMediaTarget(item);
+                  setRelinkPathDraft(item.path);
+                  setRelinkError(null);
+                  setSection("library");
+                }}
+                onOpenLocalFiles={() => fileInputRef.current?.click()}
+                onPlaylistsMutated={(msg) => {
+                  setLibraryVersion((v) => v + 1);
+                  if (msg) {
+                    showTransientUpdateToast(msg);
+                  }
+                }}
+                onPlaylistDeleted={handlePlaylistDeleted}
+                onCollapse={togglePlaylistsBar}
+              />
+            )}
+
               <div className="player-column">
                 {unsupportedError ? (
                   /* Unsupported Format Error Card (Frame 4:399) */
@@ -1216,24 +1296,6 @@ export function App(): React.ReactElement {
                 ) : activeMedia?.media_kind === "audio" ? (
                   /* Dedicated Audio-Only Canvas (Frame 4:3) */
                   <div className="audio-canvas" data-testid="audio-only-canvas">
-                    {activeMedia.stream_url && (
-                      <audio
-                        ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
-                        src={activeMedia.stream_url}
-                        onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-                        onTimeUpdate={(e) =>
-                          setSnapshot(
-                            ipcClient.syncMediaElementPosition(
-                              e.currentTarget.currentTime * 1000,
-                              Number.isFinite(e.currentTarget.duration)
-                                ? e.currentTarget.duration * 1000
-                                : undefined,
-                            ),
-                          )
-                        }
-                        onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
-                      />
-                    )}
                     <div className="audio-ring-outer" aria-hidden="true" />
                     <div className="audio-ring-inner" aria-hidden="true" />
                     <div className="audio-artwork-card">
@@ -1391,6 +1453,17 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary"
+                        data-testid="toggle-playlists-bar-btn"
+                        aria-pressed={showPlaylistsBar}
+                        aria-label={showPlaylistsBar ? "Hide playlists bar" : "Show playlists bar"}
+                        title={showPlaylistsBar ? "Hide playlists bar ([)" : "Show playlists bar ([)"}
+                        onClick={togglePlaylistsBar}
+                      >
+                        ☰ Playlists
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
                         aria-label={snapshot.muted ? "Unmute" : "Mute"}
                         onClick={() =>
                           setSnapshot(
@@ -1465,7 +1538,7 @@ export function App(): React.ReactElement {
                       </button>
                     </div>
 
-                    <div style={{ display: "flex", gap: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <button
                         type="button"
                         className="btn-secondary"
@@ -1490,9 +1563,21 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary"
+                        title={`Add note at ${formatDurationMs(snapshot.position_ms)} (N)`}
                         onClick={openAddNoteModal}
                       >
-                        ＋ Add note at {formatDurationMs(snapshot.position_ms)}
+                        ＋ Note
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        data-testid="toggle-side-panel-btn"
+                        aria-pressed={showSidePanel}
+                        aria-label={showSidePanel ? "Hide notes and queue bar" : "Show notes and queue bar"}
+                        title={showSidePanel ? "Hide Notes & Queue bar (])" : "Show Notes & Queue bar (])"}
+                        onClick={toggleSidePanel}
+                      >
+                        ▤ Notes &amp; Queue
                       </button>
                     </div>
                   </div>
@@ -1500,27 +1585,38 @@ export function App(): React.ReactElement {
               </div>
 
               {/* 365px Right Side Panel: Queue | Notes (Frames 2:63 & 4:609) */}
-              <aside className="side-panel" aria-label="Queue and notes">
-                <div className="panel-tabs" role="tablist">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={sideTab === "queue"}
-                    className="panel-tab-btn"
-                    onClick={() => setSideTab("queue")}
-                  >
-                    Queue ({snapshot.queue.length})
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={sideTab === "notes"}
-                    className="panel-tab-btn"
-                    onClick={() => setSideTab("notes")}
-                  >
-                    Notes ({activeNotes.length})
-                  </button>
-                </div>
+              {showSidePanel && (
+                <aside className="side-panel" aria-label="Queue and notes" data-testid="side-panel">
+                  <div className="panel-tabs" role="tablist">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={sideTab === "queue"}
+                      className="panel-tab-btn"
+                      onClick={() => setSideTab("queue")}
+                    >
+                      Queue ({snapshot.queue.length})
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={sideTab === "notes"}
+                      className="panel-tab-btn"
+                      onClick={() => setSideTab("notes")}
+                    >
+                      Notes ({activeNotes.length})
+                    </button>
+                    <button
+                      type="button"
+                      className="panel-icon-btn"
+                      style={{ alignSelf: "center", margin: "0 8px" }}
+                      aria-label="Hide notes and queue bar"
+                      title="Hide Notes & Queue bar (])"
+                      onClick={toggleSidePanel}
+                    >
+                      ⇥
+                    </button>
+                  </div>
 
                 {sideTab === "notes" ? (
                   <>
@@ -1802,38 +1898,9 @@ export function App(): React.ReactElement {
                     </div>
                   </>
                 )}
-              </aside>
-            </>
-          )}
-
-          {section === "playlists" && (
-            <PlaylistsView
-              playlists={playlists}
-              allMedia={allMedia}
-              activeMediaId={snapshot.media_id}
-              selectedPlaylistId={selectedPlaylistId}
-              onSelectPlaylist={setSelectedPlaylistId}
-              onPlayPlaylist={handlePlayPlaylist}
-              onAddToQueue={(mediaId) => {
-                setSnapshot(ipcClient.addToQueue(mediaId));
-                showTransientUpdateToast("Added item to playback queue.");
-              }}
-              onRelinkMissingMedia={(item) => {
-                setMissingMediaTarget(item);
-                setRelinkPathDraft(item.path);
-                setRelinkError(null);
-                setSection("library");
-              }}
-              onOpenLocalFiles={() => fileInputRef.current?.click()}
-              onPlaylistsMutated={(msg) => {
-                setLibraryVersion((v) => v + 1);
-                if (msg) {
-                  showTransientUpdateToast(msg);
-                }
-              }}
-              onPlaylistDeleted={handlePlaylistDeleted}
-            />
-          )}
+                </aside>
+              )}
+          </div>
 
           {section === "library" && (
             <div className="content-page">
@@ -2851,6 +2918,8 @@ export function App(): React.ReactElement {
                           ["Save note in composer", "⌘/Ctrl + Enter"],
                           ["Search library & notes", "⌘/Ctrl + K"],
                           ["Open media file", "⌘/Ctrl + O"],
+                          ["Toggle Playlists bar", "["],
+                          ["Toggle Notes & Queue bar", "]"],
                           ["Toggle Minimum / Full mode", "M"],
                         ].map(([actionLabel, shortcut]) => (
                           <div
@@ -3388,6 +3457,7 @@ export function App(): React.ReactElement {
             )}`
           : "No media loaded"}
       </div>
-    </div>
+      </div>
+    </>
   );
 }

@@ -159,6 +159,8 @@ export interface AppSettings {
   installed_version?: string | null;
   dismissed_update_version?: string | null;
   source_folders?: TrustedSourceFolder[];
+  show_playlists_bar?: boolean;
+  show_side_panel?: boolean;
 }
 
 export interface ReleaseManifestDto {
@@ -212,7 +214,7 @@ export interface UpdatePlaylistInput {
   description: string;
 }
 
-export type PrimarySection = "library" | "playlists" | "now_playing" | "settings";
+export type PrimarySection = "library" | "now_playing" | "settings";
 
 export type SidePanelTab = "queue" | "notes";
 

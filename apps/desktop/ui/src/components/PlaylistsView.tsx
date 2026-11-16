@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type {
   AppErrorPayload,
@@ -6,7 +6,7 @@ import type {
   MediaItem,
   Playlist,
 } from "../types/domain";
-import { formatDurationMs, progressPercent } from "../utils/format";
+import { formatDurationMs } from "../utils/format";
 
 interface PlaylistsViewProps {
   playlists: Playlist[];
@@ -18,11 +18,11 @@ interface PlaylistsViewProps {
     playlistId: string,
     options?: { startMediaId?: string; shuffle?: boolean },
   ) => void;
-  onAddToQueue: (mediaId: string) => void;
   onRelinkMissingMedia: (item: MediaItem) => void;
   onOpenLocalFiles: () => void;
   onPlaylistsMutated: (toastMessage?: string) => void;
   onPlaylistDeleted: (deleted: Playlist) => void;
+  onCollapse: () => void;
 }
 
 export function PlaylistsView({
@@ -32,11 +32,11 @@ export function PlaylistsView({
   selectedPlaylistId,
   onSelectPlaylist,
   onPlayPlaylist,
-  onAddToQueue,
   onRelinkMissingMedia,
   onOpenLocalFiles,
   onPlaylistsMutated,
   onPlaylistDeleted,
+  onCollapse,
 }: PlaylistsViewProps): React.ReactElement {
   const [sidebarFilter, setSidebarFilter] = useState<string>("");
 
@@ -51,18 +51,6 @@ export function PlaylistsView({
   const [pickerSearch, setPickerSearch] = useState<string>("");
   const [pickerFilter, setPickerFilter] = useState<LibraryFilter>("all");
   const [selectedMediaIds, setSelectedMediaIds] = useState<string[]>([]);
-
-  useEffect(() => {
-    if (playlists.length === 0) {
-      if (selectedPlaylistId !== null) {
-        onSelectPlaylist(null);
-      }
-      return;
-    }
-    if (!selectedPlaylistId || !playlists.some((p) => p.id === selectedPlaylistId)) {
-      onSelectPlaylist(playlists[0]!.id);
-    }
-  }, [playlists, selectedPlaylistId, onSelectPlaylist]);
 
   const mediaMap = useMemo(() => {
     const map = new Map<string, MediaItem>();
@@ -84,9 +72,9 @@ export function PlaylistsView({
 
   const activePlaylist = useMemo(
     () =>
-      playlists.find((p) => p.id === selectedPlaylistId) ??
-      playlists[0] ??
-      null,
+      selectedPlaylistId
+        ? (playlists.find((p) => p.id === selectedPlaylistId) ?? null)
+        : null,
     [playlists, selectedPlaylistId],
   );
 
@@ -152,6 +140,7 @@ export function PlaylistsView({
     if (!activePlaylist) return;
     const removed = ipcClient.deletePlaylist(activePlaylist.id);
     if (removed) {
+      onSelectPlaylist(null);
       onPlaylistDeleted(removed);
     }
   };
@@ -209,135 +198,167 @@ export function PlaylistsView({
   };
 
   return (
-    <div className="playlists-workspace" data-testid="playlists-workspace">
-      {/* Left Sidebar: Playlists List */}
-      <aside className="playlists-sidebar" aria-label="Playlists list">
-        <div className="playlists-sidebar-header">
-          <div>
-            <h1 style={{ margin: 0, fontSize: 18 }}>Playlists</h1>
-            <span style={{ fontSize: 11.5, color: "var(--text-tertiary)" }}>
-              {playlists.length} {playlists.length === 1 ? "playlist" : "playlists"}
-            </span>
-          </div>
-          <button
-            type="button"
-            className="btn-primary"
-            data-testid="new-playlist-btn"
-            onClick={openCreateModal}
-          >
-            ＋ New
-          </button>
-        </div>
-
-        {playlists.length > 3 && (
-          <div style={{ padding: "0 14px 10px" }}>
-            <input
-              type="search"
-              aria-label="Filter playlists"
-              placeholder="Filter playlists…"
-              value={sidebarFilter}
-              onChange={(e) => setSidebarFilter(e.target.value)}
-              className="source-picker-filter"
-            />
-          </div>
-        )}
-
-        <div className="playlists-sidebar-list" role="listbox" aria-label="Saved playlists">
-          {filteredPlaylists.length === 0 ? (
-            <div
-              style={{
-                padding: "28px 14px",
-                textAlign: "center",
-                fontSize: 12.5,
-                color: "var(--text-tertiary)",
-              }}
+    <>
+      <aside
+        className="playlists-drawer"
+        aria-label="Playlists sidebar"
+        data-testid="playlists-drawer"
+      >
+        {/* 49px Top Bar aligned with Right Queue/Notes Bar */}
+        <div className="playlists-drawer-topbar">
+          {activePlaylist ? (
+            <button
+              type="button"
+              className="jump-link-btn"
+              style={{ fontSize: 12 }}
+              onClick={() => onSelectPlaylist(null)}
             >
-              {playlists.length === 0
-                ? "No playlists yet."
-                : "No playlists match your filter."}
-            </div>
+              ‹ All playlists
+            </button>
           ) : (
-            filteredPlaylists.map((pl) => {
-              const isSelected = activePlaylist?.id === pl.id;
-              const plDuration = pl.item_ids.reduce(
-                (sum, id) => sum + (mediaMap.get(id)?.duration_ms ?? 0),
-                0,
-              );
-              return (
-                <button
-                  key={pl.id}
-                  type="button"
-                  role="option"
-                  aria-selected={isSelected}
-                  className="playlist-nav-card"
-                  onClick={() => onSelectPlaylist(pl.id)}
-                >
-                  <div className="playlist-nav-glyph" aria-hidden="true">
-                    ☰
-                  </div>
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <div className="playlist-nav-title">{pl.name}</div>
-                    <div className="playlist-nav-meta tabular-nums">
-                      {pl.item_ids.length} {pl.item_ids.length === 1 ? "item" : "items"}
-                      {plDuration > 0 ? ` · ${formatDurationMs(plDuration)}` : ""}
-                    </div>
-                  </div>
-                </button>
-              );
-            })
+            <span className="playlists-drawer-heading">
+              ☰ Playlists ({playlists.length})
+            </span>
           )}
-        </div>
-      </aside>
 
-      {/* Right Stage: Selected Playlist Detail or Empty State */}
-      <div className="playlists-detail">
-        {!activePlaylist ? (
-          <div className="library-empty-box" data-testid="playlists-empty-state">
-            <div style={{ fontSize: 32 }}>☰</div>
-            <h2 style={{ margin: 0, fontSize: 20 }}>Create your first playlist</h2>
-            <p
-              style={{
-                margin: 0,
-                maxWidth: 440,
-                color: "var(--text-secondary)",
-                fontSize: 13,
-              }}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {!activePlaylist && (
+              <button
+                type="button"
+                className="panel-icon-btn"
+                data-testid="new-playlist-btn"
+                aria-label="Create new playlist"
+                title="Create new playlist"
+                onClick={openCreateModal}
+              >
+                ＋
+              </button>
+            )}
+            <button
+              type="button"
+              className="panel-icon-btn"
+              aria-label="Hide playlists bar"
+              title="Hide playlists bar ([)"
+              onClick={onCollapse}
             >
-              Organize lectures, interviews, sound reels, or music into as many local playlists
-              as you like. Deleting a playlist never touches your library or notes.
-            </p>
-            <button type="button" className="btn-primary" onClick={openCreateModal}>
-              ＋ Create playlist
+              ⇤
             </button>
           </div>
-        ) : (
+        </div>
+
+        {!activePlaylist ? (
+          /* Mode 1: All Playlists List */
           <>
-            <header className="playlist-hero">
-              <div className="playlist-hero-left">
-                <div className="playlist-hero-artwork" aria-hidden="true">
-                  ☰
-                </div>
-                <div style={{ minWidth: 0 }}>
-                  <span className="canvas-eyebrow" style={{ display: "block", marginBottom: 4 }}>
-                    LOCAL PLAYLIST
-                  </span>
-                  <h2 className="playlist-hero-title">{activePlaylist.name}</h2>
-                  {activePlaylist.description && (
-                    <p className="playlist-hero-desc">{activePlaylist.description}</p>
-                  )}
-                  <div className="playlist-hero-stats tabular-nums">
-                    {activePlaylistItems.length}{" "}
-                    {activePlaylistItems.length === 1 ? "item" : "items"}
-                    {totalDurationMs > 0 ? ` · ${formatDurationMs(totalDurationMs)}` : ""}
+            {playlists.length > 3 && (
+              <div style={{ padding: "10px 10px 4px" }}>
+                <input
+                  type="search"
+                  aria-label="Filter playlists"
+                  placeholder="Filter playlists…"
+                  value={sidebarFilter}
+                  onChange={(e) => setSidebarFilter(e.target.value)}
+                  className="source-picker-filter"
+                  style={{ padding: "6px 10px", fontSize: 12 }}
+                />
+              </div>
+            )}
+
+            <div className="panel-scroll-list" style={{ paddingTop: 10 }}>
+              {filteredPlaylists.length === 0 ? (
+                <div className="playlists-drawer-empty">
+                  <div style={{ fontSize: 22, color: "var(--accent-primary)" }}>☰</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
+                    {playlists.length === 0 ? "No playlists yet" : "No matches"}
                   </div>
+                  <p style={{ margin: 0, fontSize: 12, color: "var(--text-tertiary)" }}>
+                    {playlists.length === 0
+                      ? "Create playlists to organize your audio and video files."
+                      : "Try a different filter."}
+                  </p>
+                  {playlists.length === 0 && (
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      style={{ height: 30, fontSize: 12, marginTop: 4 }}
+                      onClick={openCreateModal}
+                    >
+                      ＋ New playlist
+                    </button>
+                  )}
                 </div>
+              ) : (
+                filteredPlaylists.map((pl) => {
+                  const plDuration = pl.item_ids.reduce(
+                    (sum, id) => sum + (mediaMap.get(id)?.duration_ms ?? 0),
+                    0,
+                  );
+                  const hasPlayable = pl.item_ids.some(
+                    (id) => mediaMap.get(id)?.availability === "available",
+                  );
+                  const containsActive =
+                    Boolean(activeMediaId) && pl.item_ids.includes(activeMediaId!);
+                  return (
+                    <div
+                      key={pl.id}
+                      className={`playlist-nav-card ${containsActive ? "active-context" : ""}`}
+                    >
+                      <button
+                        type="button"
+                        className="playlist-nav-main-btn"
+                        onClick={() => onSelectPlaylist(pl.id)}
+                      >
+                        <div className="playlist-nav-glyph" aria-hidden="true">
+                          ☰
+                        </div>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div className="playlist-nav-title">{pl.name}</div>
+                          <div className="playlist-nav-meta tabular-nums">
+                            {pl.item_ids.length}{" "}
+                            {pl.item_ids.length === 1 ? "item" : "items"}
+                            {plDuration > 0 ? ` · ${formatDurationMs(plDuration)}` : ""}
+                          </div>
+                        </div>
+                      </button>
+
+                      {hasPlayable && (
+                        <button
+                          type="button"
+                          className="playlist-quick-play-btn"
+                          aria-label={`Play ${pl.name}`}
+                          title={`Play ${pl.name}`}
+                          onClick={() => onPlayPlaylist(pl.id, { shuffle: false })}
+                        >
+                          ▶
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </>
+        ) : (
+          /* Mode 2: Selected Playlist Detail & Track List */
+          <>
+            <div className="playlist-drawer-hero">
+              <div className="playlist-drawer-title">{activePlaylist.name}</div>
+              {activePlaylist.description && (
+                <p className="playlist-drawer-desc">{activePlaylist.description}</p>
+              )}
+              <div className="playlist-nav-meta tabular-nums">
+                {activePlaylistItems.length}{" "}
+                {activePlaylistItems.length === 1 ? "item" : "items"}
+                {totalDurationMs > 0 ? ` · ${formatDurationMs(totalDurationMs)}` : ""}
               </div>
 
-              <div className="playlist-hero-actions">
+              <div className="playlist-drawer-actions">
                 <button
                   type="button"
                   className="btn-primary"
-                  disabled={activePlaylistItems.every((m) => m.availability !== "available")}
+                  style={{ height: 30, padding: "0 11px", fontSize: 12 }}
+                  disabled={activePlaylistItems.every(
+                    (m) => m.availability !== "available",
+                  )}
                   onClick={() => onPlayPlaylist(activePlaylist.id, { shuffle: false })}
                 >
                   ▶ Play
@@ -345,7 +366,10 @@ export function PlaylistsView({
                 <button
                   type="button"
                   className="btn-secondary"
-                  disabled={activePlaylistItems.every((m) => m.availability !== "available")}
+                  style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
+                  disabled={activePlaylistItems.every(
+                    (m) => m.availability !== "available",
+                  )}
                   onClick={() => onPlayPlaylist(activePlaylist.id, { shuffle: true })}
                 >
                   ⇄ Shuffle
@@ -353,13 +377,15 @@ export function PlaylistsView({
                 <button
                   type="button"
                   className="btn-secondary"
+                  style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
                   onClick={openAddMediaModal}
                 >
-                  ＋ Add media
+                  ＋ Add
                 </button>
                 <button
                   type="button"
                   className="btn-secondary"
+                  style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
                   onClick={openEditModal}
                 >
                   Edit
@@ -367,32 +393,24 @@ export function PlaylistsView({
                 <button
                   type="button"
                   className="btn-danger-subtle"
-                  style={{ height: 34 }}
+                  style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
                   onClick={handleDeleteActivePlaylist}
                 >
                   Delete
                 </button>
               </div>
-            </header>
+            </div>
 
-            {activePlaylistItems.length === 0 ? (
-              <div className="library-empty-box" style={{ height: 320 }}>
-                <div style={{ fontSize: 26 }}>▣</div>
-                <h3 style={{ margin: 0, fontSize: 17 }}>This playlist is empty</h3>
-                <p
-                  style={{
-                    margin: 0,
-                    maxWidth: 400,
-                    color: "var(--text-secondary)",
-                    fontSize: 13,
-                  }}
-                >
-                  Add audio or video files from your library, or open local files from disk.
-                </p>
-                <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+            <div className="panel-scroll-list">
+              {activePlaylistItems.length === 0 ? (
+                <div className="playlists-drawer-empty">
+                  <div style={{ fontSize: 12.5, color: "var(--text-tertiary)" }}>
+                    This playlist is empty.
+                  </div>
                   <button
                     type="button"
                     className="btn-primary"
+                    style={{ height: 30, fontSize: 12 }}
                     onClick={openAddMediaModal}
                   >
                     ＋ Add from library
@@ -401,38 +419,42 @@ export function PlaylistsView({
                     <button
                       type="button"
                       className="btn-secondary"
+                      style={{ height: 28, fontSize: 11.5 }}
                       onClick={onOpenLocalFiles}
                     >
                       Choose local files…
                     </button>
                   )}
                 </div>
-              </div>
-            ) : (
-              <table className="library-table">
-                <thead>
-                  <tr>
-                    <th style={{ width: 44 }}>#</th>
-                    <th>Title</th>
-                    <th>Progress</th>
-                    <th>Duration</th>
-                    <th style={{ textAlign: "right" }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {activePlaylistItems.map((item, idx) => {
-                    const isMissing = item.availability === "missing";
-                    const isPlayingItem = item.id === activeMediaId;
-                    const pct = progressPercent(
-                      item.last_position_ms,
-                      item.duration_ms,
-                    );
-                    return (
-                      <tr key={item.id} className="library-row">
-                        <td className="tabular-nums" style={{ color: "var(--text-muted)" }}>
-                          {isPlayingItem ? "▶" : idx + 1}
-                        </td>
-                        <td
+              ) : (
+                activePlaylistItems.map((item, idx) => {
+                  const isMissing = item.availability === "missing";
+                  const isPlayingItem = item.id === activeMediaId;
+                  return (
+                    <div
+                      key={item.id}
+                      className="note-card"
+                      style={{
+                        padding: "9px 10px",
+                        gap: 6,
+                        borderColor: isPlayingItem
+                          ? "var(--accent-primary)"
+                          : "var(--border-control)",
+                        background: isPlayingItem
+                          ? "var(--accent-surface)"
+                          : "var(--bg-surface-2)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                        }}
+                      >
+                        <button
+                          type="button"
                           onClick={() => {
                             if (isMissing) {
                               onRelinkMissingMedia(item);
@@ -443,108 +465,84 @@ export function PlaylistsView({
                               });
                             }
                           }}
+                          style={{
+                            border: "none",
+                            background: "transparent",
+                            color: "inherit",
+                            textAlign: "left",
+                            padding: 0,
+                            cursor: "pointer",
+                            minWidth: 0,
+                            flex: 1,
+                          }}
                         >
-                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            <span style={{ fontWeight: 600 }}>{item.display_name}</span>
-                            <span
-                              style={{
-                                fontSize: 11,
-                                color: "var(--text-tertiary)",
-                                textTransform: "uppercase",
-                              }}
-                            >
-                              {item.media_kind}
-                            </span>
-                            {item.note_count > 0 && (
-                              <span className="timestamp-pill tabular-nums">
-                                {item.note_count} {item.note_count === 1 ? "note" : "notes"}
-                              </span>
-                            )}
-                            {isMissing && (
-                              <span
-                                style={{
-                                  padding: "2px 8px",
-                                  borderRadius: 999,
-                                  background: "var(--status-error-bg)",
-                                  color: "var(--status-error-text)",
-                                  fontSize: 11,
-                                  fontWeight: 600,
-                                }}
-                              >
-                                Missing
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="tabular-nums">
-                          {item.completed ? "Completed" : pct > 0 ? `${pct}%` : "Not started"}
-                        </td>
-                        <td
-                          className="tabular-nums"
-                          style={{ color: "var(--text-tertiary)" }}
-                        >
-                          {formatDurationMs(item.duration_ms)}
-                        </td>
-                        <td style={{ textAlign: "right" }}>
                           <div
                             style={{
-                              display: "inline-flex",
-                              alignItems: "center",
-                              gap: 6,
+                              fontSize: 12.5,
+                              fontWeight: 600,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
                             }}
                           >
-                            <button
-                              type="button"
-                              className="btn-secondary"
-                              style={{ height: 28, padding: "0 8px", fontSize: 11 }}
-                              disabled={idx === 0}
-                              aria-label={`Move ${item.display_name} up`}
-                              title="Move up"
-                              onClick={() => handleMoveItem(item.id, idx - 1)}
-                            >
-                              ↑
-                            </button>
-                            <button
-                              type="button"
-                              className="btn-secondary"
-                              style={{ height: 28, padding: "0 8px", fontSize: 11 }}
-                              disabled={idx === activePlaylistItems.length - 1}
-                              aria-label={`Move ${item.display_name} down`}
-                              title="Move down"
-                              onClick={() => handleMoveItem(item.id, idx + 1)}
-                            >
-                              ↓
-                            </button>
-                            {!isMissing && (
-                              <button
-                                type="button"
-                                className="btn-secondary"
-                                style={{ height: 28, padding: "0 9px", fontSize: 11 }}
-                                onClick={() => onAddToQueue(item.id)}
-                              >
-                                + Queue
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className="btn-danger-subtle"
-                              style={{ height: 28, padding: "0 9px", fontSize: 11 }}
-                              aria-label={`Remove ${item.display_name} from playlist`}
-                              onClick={() => handleRemoveTrack(item.id, item.display_name)}
-                            >
-                              Remove
-                            </button>
+                            {isPlayingItem ? "▶ " : `${idx + 1}. `}
+                            {item.display_name}
                           </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
+                          <div
+                            className="tabular-nums"
+                            style={{ fontSize: 11, color: "var(--text-tertiary)" }}
+                          >
+                            {item.media_kind === "video" ? "Video" : "Audio"} ·{" "}
+                            {formatDurationMs(item.duration_ms)}
+                            {isMissing ? " · Missing" : ""}
+                          </div>
+                        </button>
+
+                        <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                          <button
+                            type="button"
+                            className="panel-icon-btn"
+                            style={{ width: 22, height: 22, fontSize: 11 }}
+                            disabled={idx === 0}
+                            aria-label={`Move ${item.display_name} up`}
+                            title="Move up"
+                            onClick={() => handleMoveItem(item.id, idx - 1)}
+                          >
+                            ↑
+                          </button>
+                          <button
+                            type="button"
+                            className="panel-icon-btn"
+                            style={{ width: 22, height: 22, fontSize: 11 }}
+                            disabled={idx === activePlaylistItems.length - 1}
+                            aria-label={`Move ${item.display_name} down`}
+                            title="Move down"
+                            onClick={() => handleMoveItem(item.id, idx + 1)}
+                          >
+                            ↓
+                          </button>
+                          <button
+                            type="button"
+                            className="panel-icon-btn"
+                            style={{ width: 22, height: 22, fontSize: 12 }}
+                            aria-label={`Remove ${item.display_name} from playlist`}
+                            title="Remove from playlist"
+                            onClick={() =>
+                              handleRemoveTrack(item.id, item.display_name)
+                            }
+                          >
+                            ×
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </>
         )}
-      </div>
+      </aside>
 
       {/* Create / Edit Playlist Modal */}
       {composerMode && (
@@ -769,6 +767,6 @@ export function PlaylistsView({
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }

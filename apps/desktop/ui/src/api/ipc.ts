@@ -109,6 +109,8 @@ const INITIAL_SETTINGS: AppSettings = {
   installed_version: BASE_APP_VERSION,
   dismissed_update_version: null,
   source_folders: [],
+  show_playlists_bar: true,
+  show_side_panel: true,
 };
 
 function createIdleSnapshot(rate = 1.0): PlaybackSnapshot {

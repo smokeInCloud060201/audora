@@ -19,10 +19,10 @@ use audora_desktop::{
     build_production_dispatcher, default_app_data_dir, default_database_path,
     domain::DEFAULT_GITHUB_RELEASE_REPO, services::cleanup_all_app_artifacts,
 };
-use tao::dpi::LogicalSize;
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tao::window::WindowBuilder;
+use tao::window::{Window, WindowBuilder};
 use tracing::{error, info, warn};
 use wry::{BackgroundThrottlingPolicy, WebViewBuilder};
 
@@ -34,6 +34,12 @@ enum DesktopUserEvent {
 }
 
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_FULL_WIDTH: f64 = 1440.0;
+const DEFAULT_FULL_HEIGHT: f64 = 900.0;
+const MIN_FULL_WIDTH: f64 = 1040.0;
+const MIN_FULL_HEIGHT: f64 = 640.0;
+const MINIMUM_WIDGET_WIDTH: f64 = 360.0;
+const MINIMUM_WIDGET_HEIGHT: f64 = 168.0;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -133,8 +139,8 @@ fn main() {
 
     let window = match WindowBuilder::new()
         .with_title("Audora")
-        .with_inner_size(LogicalSize::new(1440.0, 900.0))
-        .with_min_inner_size(LogicalSize::new(420.0, 320.0))
+        .with_inner_size(LogicalSize::new(DEFAULT_FULL_WIDTH, DEFAULT_FULL_HEIGHT))
+        .with_min_inner_size(LogicalSize::new(MIN_FULL_WIDTH, MIN_FULL_HEIGHT))
         .build(&event_loop)
     {
         Ok(win) => win,
@@ -143,6 +149,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    apply_full_window_bounds_and_center(
+        &window,
+        LogicalSize::new(DEFAULT_FULL_WIDTH, DEFAULT_FULL_HEIGHT),
+    );
 
     let init_script = r#"
       window.close = function() {
@@ -200,7 +210,7 @@ fn main() {
 
     let mut webview = Some(webview);
     let mut window = Some(window);
-    let mut saved_full_size = LogicalSize::new(1440.0_f64, 900.0_f64);
+    let mut saved_full_size = LogicalSize::new(DEFAULT_FULL_WIDTH, DEFAULT_FULL_HEIGHT);
     let mut is_minimum_mode = false;
 
     event_loop.run(move |event, _, control_flow| {
@@ -222,20 +232,25 @@ fn main() {
                 if let Some(win) = window.as_ref() {
                     if minimum && !is_minimum_mode {
                         let curr = win.inner_size().to_logical::<f64>(win.scale_factor());
-                        if curr.width >= 600.0 && curr.height >= 400.0 {
+                        if curr.width >= MIN_FULL_WIDTH && curr.height >= MIN_FULL_HEIGHT {
                             saved_full_size = curr;
                         }
                         is_minimum_mode = true;
-                        win.set_min_inner_size(Some(LogicalSize::new(360.0, 168.0)));
+                        let min_sz = LogicalSize::new(MINIMUM_WIDGET_WIDTH, MINIMUM_WIDGET_HEIGHT);
+                        win.set_min_inner_size(Some(min_sz));
+                        win.set_max_inner_size(Some(min_sz));
+                        win.set_resizable(false);
                         win.set_decorations(false);
                         win.set_always_on_top(true);
-                        win.set_inner_size(LogicalSize::new(360.0, 168.0));
+                        win.set_inner_size(min_sz);
+                        position_minimum_widget_bottom_right(win);
                     } else if !minimum && is_minimum_mode {
                         is_minimum_mode = false;
                         win.set_always_on_top(false);
                         win.set_decorations(true);
-                        win.set_inner_size(saved_full_size);
-                        win.set_min_inner_size(Some(LogicalSize::new(420.0, 320.0)));
+                        win.set_resizable(true);
+                        win.set_max_inner_size(None::<LogicalSize<f64>>);
+                        apply_full_window_bounds_and_center(win, saved_full_size);
                     }
                 }
             }
@@ -247,6 +262,65 @@ fn main() {
             _ => {}
         }
     });
+}
+
+fn apply_full_window_bounds_and_center(win: &Window, desired_logical: LogicalSize<f64>) {
+    let Some(monitor) = win.current_monitor().or_else(|| win.primary_monitor()) else {
+        win.set_min_inner_size(Some(LogicalSize::new(MIN_FULL_WIDTH, MIN_FULL_HEIGHT)));
+        win.set_inner_size(desired_logical);
+        return;
+    };
+
+    let scale = monitor.scale_factor().max(1.0);
+    let mon_pos = monitor.position();
+    let mon_phys = monitor.size();
+    let mon_logical_w = f64::from(mon_phys.width) / scale;
+    let mon_logical_h = f64::from(mon_phys.height) / scale;
+
+    let max_fit_w = (mon_logical_w - 32.0).max(640.0);
+    let max_fit_h = (mon_logical_h - 84.0).max(480.0);
+    let min_w = MIN_FULL_WIDTH.min(max_fit_w);
+    let min_h = MIN_FULL_HEIGHT.min(max_fit_h);
+
+    let target_w = desired_logical.width.clamp(min_w, max_fit_w);
+    let target_h = desired_logical.height.clamp(min_h, max_fit_h);
+
+    win.set_min_inner_size(Some(LogicalSize::new(min_w, min_h)));
+    win.set_inner_size(LogicalSize::new(target_w, target_h));
+
+    let outer_w_phys = (target_w * scale).round() as i64;
+    let outer_h_phys = ((target_h + 28.0) * scale).round() as i64;
+    let mon_w_phys = i64::from(mon_phys.width);
+    let mon_h_phys = i64::from(mon_phys.height);
+
+    let x = i64::from(mon_pos.x) + ((mon_w_phys - outer_w_phys).max(0) / 2);
+    let y = i64::from(mon_pos.y) + (((mon_h_phys - outer_h_phys).max(0) * 45) / 100);
+    if let (Ok(px), Ok(py)) = (i32::try_from(x), i32::try_from(y)) {
+        win.set_outer_position(PhysicalPosition::new(px, py));
+    }
+}
+
+fn position_minimum_widget_bottom_right(win: &Window) {
+    let Some(monitor) = win.current_monitor().or_else(|| win.primary_monitor()) else {
+        return;
+    };
+    let scale = monitor.scale_factor().max(1.0);
+    let mon_pos = monitor.position();
+    let mon_phys = monitor.size();
+
+    let widget_w = (MINIMUM_WIDGET_WIDTH * scale).round() as i64;
+    let widget_h = (MINIMUM_WIDGET_HEIGHT * scale).round() as i64;
+    let margin_right = (24.0 * scale).round() as i64;
+    let margin_bottom = (64.0 * scale).round() as i64;
+
+    let right_edge = i64::from(mon_pos.x) + i64::from(mon_phys.width);
+    let bottom_edge = i64::from(mon_pos.y) + i64::from(mon_phys.height);
+
+    let x = (right_edge - widget_w - margin_right).max(i64::from(mon_pos.x));
+    let y = (bottom_edge - widget_h - margin_bottom).max(i64::from(mon_pos.y));
+    if let (Ok(px), Ok(py)) = (i32::try_from(x), i32::try_from(y)) {
+        win.set_outer_position(PhysicalPosition::new(px, py));
+    }
 }
 
 fn resolve_ui_dist_dir() -> Option<PathBuf> {

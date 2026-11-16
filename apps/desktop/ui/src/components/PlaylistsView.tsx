@@ -14,10 +14,12 @@ import {
   IconChevronLeft,
   IconClose,
   IconCollapseLeft,
+  IconEdit,
   IconPlay,
   IconPlaylists,
   IconPlus,
   IconShuffle,
+  IconTrash,
 } from "./Icons";
 
 interface PlaylistsViewProps {
@@ -361,7 +363,31 @@ export function PlaylistsView({
           /* Mode 2: Selected Playlist Detail & Track List */
           <>
             <div className="playlist-drawer-hero">
-              <div className="playlist-drawer-title">{activePlaylist.name}</div>
+              <div className="playlist-drawer-title-row">
+                <div className="playlist-drawer-title" title={activePlaylist.name}>
+                  {activePlaylist.name}
+                </div>
+                <div className="playlist-drawer-title-actions">
+                  <button
+                    type="button"
+                    className="panel-icon-btn"
+                    aria-label="Edit playlist"
+                    title="Edit playlist"
+                    onClick={openEditModal}
+                  >
+                    <IconEdit size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="panel-icon-btn danger"
+                    aria-label="Delete playlist"
+                    title="Delete playlist"
+                    onClick={handleDeleteActivePlaylist}
+                  >
+                    <IconTrash size={14} />
+                  </button>
+                </div>
+              </div>
               {activePlaylist.description && (
                 <p className="playlist-drawer-desc">{activePlaylist.description}</p>
               )}
@@ -404,22 +430,6 @@ export function PlaylistsView({
                 >
                   <IconPlus size={13} />
                   <span>Add</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
-                  onClick={openEditModal}
-                >
-                  Edit
-                </button>
-                <button
-                  type="button"
-                  className="btn-danger-subtle"
-                  style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
-                  onClick={handleDeleteActivePlaylist}
-                >
-                  Delete
                 </button>
               </div>
             </div>

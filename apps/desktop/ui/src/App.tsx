@@ -148,6 +148,7 @@ export function App(): React.ReactElement {
       const loadedSettings = ipcClient.getSettings();
       const loadedSnapshot = ipcClient.getPlaybackSnapshot();
       setSettings(loadedSettings);
+      ipcClient.syncNativeWindowMode(loadedSettings.window_mode);
       setSnapshot(loadedSnapshot);
       if (loadedSnapshot.media_id) {
         setSection("now_playing");
@@ -1568,7 +1569,7 @@ export function App(): React.ReactElement {
                     <div className="transport-side-left">
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-collapsible-btn"
                         data-testid="toggle-playlists-bar-btn"
                         aria-pressed={showPlaylistsBar}
                         aria-label={showPlaylistsBar ? "Hide playlists bar" : "Show playlists bar"}
@@ -1576,7 +1577,7 @@ export function App(): React.ReactElement {
                         onClick={togglePlaylistsBar}
                       >
                         <IconPlaylists size={14} />
-                        <span>Playlists</span>
+                        <span className="transport-btn-label">Playlists</span>
                       </button>
                       <button
                         type="button"
@@ -1666,8 +1667,9 @@ export function App(): React.ReactElement {
                     <div className="transport-side-right">
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-collapsible-btn"
                         disabled={!activeMedia}
+                        aria-label="Add current media to a playlist"
                         title="Add current media to a playlist"
                         onClick={() => {
                           if (activeMedia) {
@@ -1676,29 +1678,31 @@ export function App(): React.ReactElement {
                         }}
                       >
                         <IconPlus size={13} />
-                        <span>Playlist</span>
+                        <span className="transport-btn-label">Playlist</span>
                       </button>
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-collapsible-btn"
+                        aria-label="Add quick marker"
                         title="Add quick marker at current timestamp (Shift+N)"
                         onClick={handleCreateQuickMarker}
                       >
                         <IconFlag size={13} />
-                        <span>Marker</span>
+                        <span className="transport-btn-label">Marker</span>
                       </button>
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-collapsible-btn"
+                        aria-label="Add timestamped note"
                         title={`Add note at ${formatDurationMs(snapshot.position_ms)} (N)`}
                         onClick={openAddNoteModal}
                       >
                         <IconPlus size={13} />
-                        <span>Note</span>
+                        <span className="transport-btn-label">Note</span>
                       </button>
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-collapsible-btn"
                         data-testid="toggle-side-panel-btn"
                         aria-pressed={showSidePanel}
                         aria-label={showSidePanel ? "Hide notes and queue bar" : "Show notes and queue bar"}
@@ -1706,7 +1710,7 @@ export function App(): React.ReactElement {
                         onClick={toggleSidePanel}
                       >
                         <IconPanelRight size={14} />
-                        <span>Notes &amp; Queue</span>
+                        <span className="transport-btn-label">Notes &amp; Queue</span>
                       </button>
                     </div>
                   </div>
@@ -2318,7 +2322,9 @@ export function App(): React.ReactElement {
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
                       style={{
-                        width: 420,
+                        flex: "1 1 240px",
+                        maxWidth: 420,
+                        minWidth: 180,
                         height: 38,
                         padding: "0 14px",
                         borderRadius: 8,

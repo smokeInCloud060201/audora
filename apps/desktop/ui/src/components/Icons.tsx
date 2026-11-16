@@ -326,3 +326,24 @@ export function IconAlertCircle({ size = 14, className, style }: IconProps): Rea
     </svg>
   );
 }
+
+export function IconEdit({ size = 14, className, style }: IconProps): React.ReactElement {
+  return (
+    <svg {...baseSvgProps(size, className, style)}>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5Z" />
+    </svg>
+  );
+}
+
+export function IconTrash({ size = 14, className, style }: IconProps): React.ReactElement {
+  return (
+    <svg {...baseSvgProps(size, className, style)}>
+      <path d="M3 6h18" />
+      <path d="M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6" />
+      <path d="M19 6l-1 13.5a2 2 0 0 1-2 1.8H8a2 2 0 0 1-2-1.8L5 6" />
+      <path d="M10 11v5.5" />
+      <path d="M14 11v5.5" />
+    </svg>
+  );
+}

@@ -668,15 +668,31 @@ export class AudoraIpcClient {
    * Syncs position and optional probed duration from an active HTML5 `<video>` or `<audio>` element.
    */
   public syncMediaElementPosition(positionMs: number, durationMs?: number): PlaybackSnapshot {
-    if (durationMs && durationMs > 0) {
+    const active = this.media.find((m) => m.id === this.snapshot.media_id);
+    const hasAuthoritativeDuration = Boolean(
+      active?.duration_probed && active.duration_ms && active.duration_ms > 0,
+    );
+    if (!hasAuthoritativeDuration && durationMs && durationMs > 0) {
       this.snapshot.duration_ms = Math.round(durationMs);
-      const active = this.media.find((m) => m.id === this.snapshot.media_id);
       if (active) {
         active.duration_ms = this.snapshot.duration_ms;
       }
     }
-    this.snapshot.position_ms = Math.max(0, Math.round(positionMs));
-    const active = this.media.find((m) => m.id === this.snapshot.media_id);
+    const effectiveDuration = this.snapshot.duration_ms;
+    const roundedPos = Math.max(0, Math.round(positionMs));
+    if (
+      hasAuthoritativeDuration &&
+      effectiveDuration !== null &&
+      effectiveDuration > 0 &&
+      roundedPos >= effectiveDuration &&
+      this.snapshot.state === "playing"
+    ) {
+      return this.handleMediaEnded();
+    }
+    this.snapshot.position_ms =
+      effectiveDuration !== null && effectiveDuration > 0
+        ? Math.min(roundedPos, effectiveDuration)
+        : roundedPos;
     if (active) {
       active.last_position_ms = this.snapshot.position_ms;
     }
@@ -849,6 +865,10 @@ export class AudoraIpcClient {
     }
 
     const streamUrl = this.computeLocalStreamUrl(trimmed, options?.streamUrl);
+    const probedDur =
+      options?.durationMs && options.durationMs > 0
+        ? Math.round(options.durationMs)
+        : null;
     let item = this.findMatchingMediaItem(trimmed, fileName, options?.size);
     if (!item) {
       item = {
@@ -856,7 +876,8 @@ export class AudoraIpcClient {
         path: trimmed,
         display_name: fileName,
         media_kind: supportedVideo.includes(ext) ? "video" : "audio",
-        duration_ms: options?.durationMs ?? null,
+        duration_ms: probedDur,
+        duration_probed: probedDur !== null,
         last_position_ms: 0,
         completed: false,
         file_size_bytes: options?.size ?? null,
@@ -876,8 +897,12 @@ export class AudoraIpcClient {
       if (options?.size != null && item.file_size_bytes == null) {
         item.file_size_bytes = options.size;
       }
-      if (options?.durationMs && !item.duration_ms) {
-        item.duration_ms = options.durationMs;
+      if (probedDur !== null) {
+        item.duration_ms = probedDur;
+        item.duration_probed = true;
+        if (item.last_position_ms > probedDur) {
+          item.last_position_ms = 0;
+        }
       }
       item.availability = "available";
       item.last_seen_at = "Just now";
@@ -1290,6 +1315,8 @@ export class AudoraIpcClient {
       }
 
       const streamUrl = this.computeLocalStreamUrl(rawItemPath, f.streamUrl);
+      const probedDur =
+        f.durationMs && f.durationMs > 0 ? Math.round(f.durationMs) : null;
 
       const existing = this.findMatchingMediaItem(rawItemPath, fileName, f.size);
       if (!existing) {
@@ -1298,7 +1325,8 @@ export class AudoraIpcClient {
           path: rawItemPath,
           display_name: fileName,
           media_kind: supportedVideo.includes(ext) ? "video" : "audio",
-          duration_ms: f.durationMs ?? null,
+          duration_ms: probedDur,
+          duration_probed: probedDur !== null,
           last_position_ms: 0,
           completed: false,
           file_size_bytes: f.size ?? null,
@@ -1321,8 +1349,18 @@ export class AudoraIpcClient {
         if (f.size != null && existing.file_size_bytes == null) {
           existing.file_size_bytes = f.size;
         }
-        if (f.durationMs != null && existing.duration_ms == null) {
-          existing.duration_ms = f.durationMs;
+        if (probedDur !== null) {
+          existing.duration_ms = probedDur;
+          existing.duration_probed = true;
+          if (existing.last_position_ms > probedDur) {
+            existing.last_position_ms = 0;
+          }
+          if (this.snapshot.media_id === existing.id) {
+            this.snapshot.duration_ms = probedDur;
+            if (this.snapshot.position_ms > probedDur) {
+              this.snapshot.position_ms = 0;
+            }
+          }
         }
         if (!existing.source_folder_id) {
           existing.source_folder_id = folder.id;
@@ -1389,7 +1427,12 @@ export class AudoraIpcClient {
             message?: string;
             folder_path?: string;
             folder_name?: string;
-            files?: Array<{ path: string; name: string; size: number }>;
+            files?: Array<{
+              path: string;
+              name: string;
+              size: number;
+              duration_ms?: number | null;
+            }>;
           };
           if (!payload.ok) {
             throw this.makeError(
@@ -1405,6 +1448,7 @@ export class AudoraIpcClient {
               name: f.name,
               path: f.path,
               size: f.size,
+              durationMs: f.duration_ms ?? undefined,
             }),
           );
           return this.addSourceFolderWithFiles(
@@ -1495,7 +1539,12 @@ export class AudoraIpcClient {
     const payload = JSON.parse(text) as {
       ok?: boolean;
       cancelled?: boolean;
-      files?: Array<{ path: string; name: string; size: number }>;
+      files?: Array<{
+        path: string;
+        name: string;
+        size: number;
+        duration_ms?: number | null;
+      }>;
     };
     if (!payload.ok) {
       return { supported: false, cancelled: false, items: [], selectedNames: [] };
@@ -1510,6 +1559,7 @@ export class AudoraIpcClient {
           name: f.name,
           path: f.path,
           size: f.size,
+          durationMs: f.duration_ms ?? undefined,
         })),
       );
       return { supported: true, cancelled: false, items, selectedNames };
@@ -1519,6 +1569,57 @@ export class AudoraIpcClient {
       }
       throw err;
     }
+  }
+
+  public async refreshMediaContainerDurations(): Promise<boolean> {
+    if (
+      !isBrowserRuntime() ||
+      (window.location.hostname !== "127.0.0.1" &&
+        window.location.hostname !== "localhost")
+    ) {
+      return false;
+    }
+    let mutated = false;
+    for (const item of this.media) {
+      if (item.duration_probed || this.isBareFileName(item.path)) {
+        continue;
+      }
+      try {
+        const res = await fetch(
+          `/__audora_probe_media?path=${encodeURIComponent(item.path)}`,
+        );
+        if (!res.ok) continue;
+        const text = await res.text();
+        if (!text.trim().startsWith("{")) continue;
+        const parsed = JSON.parse(text) as {
+          ok?: boolean;
+          duration_ms?: number | null;
+        };
+        if (parsed.ok && parsed.duration_ms && parsed.duration_ms > 0) {
+          const dur = Math.round(parsed.duration_ms);
+          if (item.duration_ms !== dur || !item.duration_probed) {
+            item.duration_ms = dur;
+            item.duration_probed = true;
+            if (item.last_position_ms > dur) {
+              item.last_position_ms = 0;
+            }
+            if (this.snapshot.media_id === item.id) {
+              this.snapshot.duration_ms = dur;
+              if (this.snapshot.position_ms > dur) {
+                this.snapshot.position_ms = 0;
+              }
+            }
+            mutated = true;
+          }
+        }
+      } catch {
+        // Ignore probe failures when running without native bridge
+      }
+    }
+    if (mutated) {
+      this.persistToStorage();
+    }
+    return mutated;
   }
 
   public async rescanSourceFolder(

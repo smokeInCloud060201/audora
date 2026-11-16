@@ -438,4 +438,41 @@ describe("AudoraIpcClient workflows", () => {
     expect(client.listNotes(upgraded.id)).toHaveLength(1);
     expect(client.getPlaylist(pl.id)?.item_ids).toEqual([upgraded.id]);
   });
+
+  it("preserves authoritative MP4/M4A container duration (e.g. 81h fragmented M4A) when browser media element reports 2x duration", () => {
+    const client = new AudoraIpcClient(false);
+    const true81HoursMs = 292_981_260; // 81h 23m 01s (from mvhd)
+    const buggyDoubledElementMs = true81HoursMs * 2; // 162h 46m 02s (Chromium fMP4 mdhd+sidx sum bug)
+
+    client.addSourceFolderWithFiles("/Users/demo/Documents/Spotify", [
+      {
+        name: "Audiobook_81h.m4a",
+        path: "/Users/demo/Documents/Spotify/Audiobook_81h.m4a",
+        size: 4_741_653_823,
+        durationMs: true81HoursMs,
+      },
+    ]);
+
+    const item = client.searchLibrary("", "all").media_items[0];
+    expect(item.duration_ms).toBe(true81HoursMs);
+    expect(formatTimestamp(item.duration_ms)).toBe("81:23:01");
+
+    // Browser <audio> fires timeupdate with doubled duration -> authoritative mvhd duration MUST win
+    client.playbackCommand({ action: "play" });
+    const synced = client.syncMediaElementPosition(3_600_000, buggyDoubledElementMs);
+    expect(synced.duration_ms).toBe(true81HoursMs);
+    expect(client.getMediaById(item.id)?.duration_ms).toBe(true81HoursMs);
+
+    // Seeking to 100 hours clamps to the real 81h 23m 01s end
+    const clampedSeek = client.playbackCommand({
+      action: "seek",
+      position_ms: 100 * 3_600_000,
+    });
+    expect(clampedSeek.position_ms).toBe(true81HoursMs);
+
+    // Reaching 81h 23m 01s during playback ends cleanly instead of playing silent dead air
+    const ended = client.syncMediaElementPosition(true81HoursMs, buggyDoubledElementMs);
+    expect(ended.state).toBe("ended");
+    expect(ended.position_ms).toBe(true81HoursMs);
+  });
 });

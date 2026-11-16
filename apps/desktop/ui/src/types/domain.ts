@@ -43,6 +43,7 @@ export interface MediaItem {
   note_count: number;
   source_folder_id?: string | null;
   stream_url?: string;
+  duration_probed?: boolean;
 }
 
 export type PlaybackState =

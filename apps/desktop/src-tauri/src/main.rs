@@ -427,6 +427,31 @@ fn handle_http_connection(
         return;
     }
 
+    if raw_path == "/__audora_probe_media" {
+        let mut media_path_str = String::new();
+        for pair in raw_query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "path" {
+                    media_path_str = percent_decode(v);
+                }
+            }
+        }
+        let candidate = Path::new(media_path_str.trim());
+        if !candidate.is_absolute() || !candidate.is_file() {
+            write_json_response(
+                &mut stream,
+                "404 Not Found",
+                br#"{"ok":false,"duration_ms":null}"#,
+            );
+            return;
+        }
+        let dur_json =
+            probe_media_duration_ms(candidate).map_or_else(|| "null".to_owned(), |d| d.to_string());
+        let body = format!(r#"{{"ok":true,"duration_ms":{dur_json}}}"#);
+        write_json_response(&mut stream, "200 OK", body.as_bytes());
+        return;
+    }
+
     if raw_path == "/__audora_pick_files" {
         let picked = pick_native_media_files();
         if picked.is_empty() {
@@ -437,13 +462,16 @@ fn handle_http_connection(
             );
         } else {
             let mut files_json = String::from("[");
-            for (idx, (p, name, sz)) in picked.iter().enumerate() {
+            for (idx, (p, name, sz, dur)) in picked.iter().enumerate() {
                 if idx > 0 {
                     files_json.push(',');
                 }
                 let ep = escape_json_str(p);
                 let en = escape_json_str(name);
-                files_json.push_str(&format!(r#"{{"path":"{ep}","name":"{en}","size":{sz}}}"#));
+                let dur_json = dur.map_or_else(|| "null".to_owned(), |d| d.to_string());
+                files_json.push_str(&format!(
+                    r#"{{"path":"{ep}","name":"{en}","size":{sz},"duration_ms":{dur_json}}}"#
+                ));
             }
             files_json.push(']');
             let body = format!(r#"{{"ok":true,"cancelled":false,"files":{files_json}}}"#);
@@ -958,7 +986,234 @@ fn canonical_path_string(p: &Path) -> String {
     }
 }
 
-fn pick_native_media_files() -> Vec<(String, String, u64)> {
+fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> bool {
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    file.read_exact(buf).is_ok()
+}
+
+fn read_mp4_box_header(file: &mut File, pos: u64, limit: u64) -> Option<([u8; 4], u64, u64)> {
+    if pos.checked_add(8)? > limit {
+        return None;
+    }
+    let mut hdr = [0_u8; 16];
+    if !read_exact_at(file, pos, &mut hdr[..8]) {
+        return None;
+    }
+    let sz32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let box_type = [hdr[4], hdr[5], hdr[6], hdr[7]];
+    let (box_size, header_len) = if sz32 == 1 {
+        if pos.checked_add(16)? > limit
+            || !read_exact_at(file, pos.saturating_add(8), &mut hdr[8..16])
+        {
+            return None;
+        }
+        let sz64 = u64::from_be_bytes([
+            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+        ]);
+        (sz64, 16_u64)
+    } else if sz32 == 0 {
+        (limit.saturating_sub(pos), 8_u64)
+    } else {
+        (u64::from(sz32), 8_u64)
+    };
+    if box_size < header_len || pos.checked_add(box_size)? > limit {
+        return None;
+    }
+    Some((box_type, box_size, header_len))
+}
+
+fn probe_isobmff_duration_ms(file: &mut File, file_len: u64) -> Option<u64> {
+    let mut pos = 0_u64;
+    let mut sidx_fallback_ms: Option<u64> = None;
+    let mut max_boxes = 0_usize;
+
+    while pos < file_len && max_boxes < 256 {
+        max_boxes = max_boxes.saturating_add(1);
+        let Some((box_type, box_size, hdr_len)) = read_mp4_box_header(file, pos, file_len) else {
+            break;
+        };
+        if &box_type == b"moov" {
+            let moov_end = pos.saturating_add(box_size);
+            let mut cpos = pos.saturating_add(hdr_len);
+            let mut child_guard = 0_usize;
+            while cpos < moov_end && child_guard < 128 {
+                child_guard = child_guard.saturating_add(1);
+                let Some((ctype, csize, chdr)) = read_mp4_box_header(file, cpos, moov_end) else {
+                    break;
+                };
+                if &ctype == b"mvhd" {
+                    let payload_pos = cpos.saturating_add(chdr);
+                    let payload_len = csize.saturating_sub(chdr);
+                    if payload_len >= 20 {
+                        let mut mvhd = [0_u8; 32];
+                        let want = (payload_len as usize).min(32);
+                        if read_exact_at(file, payload_pos, &mut mvhd[..want]) {
+                            let version = mvhd[0];
+                            let (timescale, duration) = if version == 1 && want >= 32 {
+                                let ts =
+                                    u32::from_be_bytes([mvhd[20], mvhd[21], mvhd[22], mvhd[23]]);
+                                let dur = u64::from_be_bytes([
+                                    mvhd[24], mvhd[25], mvhd[26], mvhd[27], mvhd[28], mvhd[29],
+                                    mvhd[30], mvhd[31],
+                                ]);
+                                (ts, if dur == u64::MAX { 0 } else { dur })
+                            } else if version == 0 {
+                                let ts =
+                                    u32::from_be_bytes([mvhd[12], mvhd[13], mvhd[14], mvhd[15]]);
+                                let dur32 =
+                                    u32::from_be_bytes([mvhd[16], mvhd[17], mvhd[18], mvhd[19]]);
+                                (
+                                    ts,
+                                    if dur32 == u32::MAX {
+                                        0
+                                    } else {
+                                        u64::from(dur32)
+                                    },
+                                )
+                            } else {
+                                (0, 0)
+                            };
+                            if timescale > 0 && duration > 0 {
+                                let ms = (u128::from(duration) * 1_000) / u128::from(timescale);
+                                if let Ok(ms64) = u64::try_from(ms) {
+                                    if ms64 > 0 {
+                                        return Some(ms64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                cpos = cpos.saturating_add(csize);
+            }
+        } else if &box_type == b"sidx" && sidx_fallback_ms.is_none() {
+            let payload_pos = pos.saturating_add(hdr_len);
+            let payload_len = box_size.saturating_sub(hdr_len);
+            if (24..=2_097_152).contains(&payload_len) {
+                let mut buf = vec![0_u8; payload_len as usize];
+                if read_exact_at(file, payload_pos, &mut buf) {
+                    let version = buf[0];
+                    let timescale = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                    let entries_offset = if version == 0 { 20_usize } else { 28_usize };
+                    if timescale > 0 && buf.len() >= entries_offset + 4 {
+                        let ref_count =
+                            u16::from_be_bytes([buf[entries_offset + 2], buf[entries_offset + 3]])
+                                as usize;
+                        let table_start = entries_offset + 4;
+                        if buf.len() >= table_start.saturating_add(ref_count.saturating_mul(12)) {
+                            let mut total_dur = 0_u64;
+                            for idx in 0..ref_count {
+                                let off = table_start + idx * 12 + 4;
+                                let sub_dur = u32::from_be_bytes([
+                                    buf[off],
+                                    buf[off + 1],
+                                    buf[off + 2],
+                                    buf[off + 3],
+                                ]);
+                                total_dur = total_dur.saturating_add(u64::from(sub_dur));
+                            }
+                            if total_dur > 0 {
+                                let ms = (u128::from(total_dur) * 1_000) / u128::from(timescale);
+                                sidx_fallback_ms = u64::try_from(ms).ok().filter(|&v| v > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = pos.saturating_add(box_size);
+    }
+
+    sidx_fallback_ms
+}
+
+fn probe_wav_duration_ms(file: &mut File, file_len: u64) -> Option<u64> {
+    if file_len < 44 {
+        return None;
+    }
+    let mut riff = [0_u8; 12];
+    if !read_exact_at(file, 0, &mut riff) || &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12_u64;
+    let mut byte_rate = 0_u32;
+    let mut data_size = 0_u64;
+    let mut guard = 0_usize;
+    while pos.saturating_add(8) <= file_len && guard < 64 {
+        guard = guard.saturating_add(1);
+        let mut chdr = [0_u8; 8];
+        if !read_exact_at(file, pos, &mut chdr) {
+            break;
+        }
+        let cid = [chdr[0], chdr[1], chdr[2], chdr[3]];
+        let csz = u64::from(u32::from_le_bytes([chdr[4], chdr[5], chdr[6], chdr[7]]));
+        if &cid == b"fmt " && csz >= 16 {
+            let mut fmt_buf = [0_u8; 16];
+            if read_exact_at(file, pos.saturating_add(8), &mut fmt_buf) {
+                byte_rate = u32::from_le_bytes([fmt_buf[8], fmt_buf[9], fmt_buf[10], fmt_buf[11]]);
+            }
+        } else if &cid == b"data" {
+            data_size = csz.min(file_len.saturating_sub(pos.saturating_add(8)));
+            if byte_rate > 0 {
+                break;
+            }
+        }
+        let padded = csz.saturating_add(csz & 1);
+        pos = pos.saturating_add(8).saturating_add(padded);
+    }
+    if byte_rate > 0 && data_size > 0 {
+        let ms = (u128::from(data_size) * 1_000) / u128::from(byte_rate);
+        u64::try_from(ms).ok().filter(|&v| v > 0)
+    } else {
+        None
+    }
+}
+
+fn probe_flac_duration_ms(file: &mut File, file_len: u64) -> Option<u64> {
+    if file_len < 42 {
+        return None;
+    }
+    let mut hdr = [0_u8; 42];
+    if !read_exact_at(file, 0, &mut hdr) || &hdr[0..4] != b"fLaC" || (hdr[4] & 0x7F) != 0 {
+        return None;
+    }
+    let sample_rate =
+        (u32::from(hdr[18]) << 12) | (u32::from(hdr[19]) << 4) | (u32::from(hdr[20]) >> 4);
+    let total_samples = (u64::from(hdr[21] & 0x0F) << 32)
+        | (u64::from(hdr[22]) << 24)
+        | (u64::from(hdr[23]) << 16)
+        | (u64::from(hdr[24]) << 8)
+        | u64::from(hdr[25]);
+    if sample_rate > 0 && total_samples > 0 {
+        let ms = (u128::from(total_samples) * 1_000) / u128::from(sample_rate);
+        u64::try_from(ms).ok().filter(|&v| v > 0)
+    } else {
+        None
+    }
+}
+
+fn probe_media_duration_ms(path: &Path) -> Option<u64> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len == 0 {
+        return None;
+    }
+    match ext.as_str() {
+        "mp4" | "m4a" | "m4v" | "mov" => probe_isobmff_duration_ms(&mut file, file_len),
+        "wav" => probe_wav_duration_ms(&mut file, file_len),
+        "flac" => probe_flac_duration_ms(&mut file, file_len),
+        _ => None,
+    }
+}
+
+fn pick_native_media_files() -> Vec<(String, String, u64, Option<u64>)> {
     let raw_lines: Vec<String> = if cfg!(target_os = "macos") {
         let script = r#"
             set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed
@@ -1035,7 +1290,8 @@ fn pick_native_media_files() -> Vec<(String, String, u64)> {
             .unwrap_or(&line)
             .to_owned();
         let canonical = canonical_path_string(&pb);
-        out.push((canonical, name, meta.len()));
+        let dur = probe_media_duration_ms(&pb);
+        out.push((canonical, name, meta.len(), dur));
     }
     out
 }
@@ -1107,7 +1363,7 @@ fn collect_media_files_in_dir(
     depth: usize,
     max_depth: usize,
     max_files: usize,
-    out: &mut Vec<(String, String, u64)>,
+    out: &mut Vec<(String, String, u64, Option<u64>)>,
 ) {
     if depth > max_depth || out.len() >= max_files {
         return;
@@ -1146,10 +1402,12 @@ fn collect_media_files_in_dir(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if is_supported_media_extension(&ext) {
+                let dur = probe_media_duration_ms(&path);
                 out.push((
                     canonical_path_string(&path),
                     name_str.to_owned(),
                     meta.len(),
+                    dur,
                 ));
             }
         }
@@ -1174,18 +1432,19 @@ fn handle_scan_folder_request(stream: &mut TcpStream, raw_path: &str) {
         .filter(|s| !s.is_empty())
         .unwrap_or(&normalized);
 
-    let mut discovered: Vec<(String, String, u64)> = Vec::new();
+    let mut discovered: Vec<(String, String, u64, Option<u64>)> = Vec::new();
     collect_media_files_in_dir(candidate, 0, 4, 2_000, &mut discovered);
 
     let mut files_json = String::from("[");
-    for (idx, (file_path, file_name, size)) in discovered.iter().enumerate() {
+    for (idx, (file_path, file_name, size, dur)) in discovered.iter().enumerate() {
         if idx > 0 {
             files_json.push(',');
         }
         let escaped_path = escape_json_str(file_path);
         let escaped_name = escape_json_str(file_name);
+        let dur_json = dur.map_or_else(|| "null".to_owned(), |d| d.to_string());
         files_json.push_str(&format!(
-            r#"{{"path":"{escaped_path}","name":"{escaped_name}","size":{size}}}"#
+            r#"{{"path":"{escaped_path}","name":"{escaped_name}","size":{size},"duration_ms":{dur_json}}}"#
         ));
     }
     files_json.push(']');

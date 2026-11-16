@@ -143,6 +143,7 @@ export function App(): React.ReactElement {
     const init = async () => {
       await ipcClient.ensureHydratedFromNative();
       await ipcClient.syncEnabledSourceFolders();
+      await ipcClient.refreshMediaContainerDurations();
       if (cancelled) return;
       const loadedSettings = ipcClient.getSettings();
       const loadedSnapshot = ipcClient.getPlaybackSnapshot();
@@ -631,33 +632,117 @@ export function App(): React.ReactElement {
     })();
   };
 
+  const probeBlobIsoBmffDurationMs = async (file: File): Promise<number | undefined> => {
+    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+    if (!["mp4", "m4a", "m4v", "mov"].includes(ext) || typeof file.slice !== "function") {
+      return undefined;
+    }
+    try {
+      const sliceLen = Math.min(file.size, 131_072);
+      const buf = await file.slice(0, sliceLen).arrayBuffer();
+      const view = new DataView(buf);
+      const readAscii4 = (off: number) =>
+        String.fromCharCode(
+          view.getUint8(off),
+          view.getUint8(off + 1),
+          view.getUint8(off + 2),
+          view.getUint8(off + 3),
+        );
+      let pos = 0;
+      while (pos + 8 <= view.byteLength) {
+        const sz32 = view.getUint32(pos, false);
+        const btype = readAscii4(pos + 4);
+        let bsize = sz32;
+        let hdrLen = 8;
+        if (sz32 === 1) {
+          if (pos + 16 > view.byteLength) break;
+          bsize = Number(view.getBigUint64(pos + 8, false));
+          hdrLen = 16;
+        } else if (sz32 === 0) {
+          bsize = view.byteLength - pos;
+        }
+        if (bsize < hdrLen) break;
+        if (btype === "moov" && pos + bsize <= view.byteLength) {
+          const moovEnd = pos + bsize;
+          let cpos = pos + hdrLen;
+          while (cpos + 8 <= moovEnd) {
+            const csz32 = view.getUint32(cpos, false);
+            const ctype = readAscii4(cpos + 4);
+            let csize = csz32;
+            let chdr = 8;
+            if (csz32 === 1) {
+              if (cpos + 16 > moovEnd) break;
+              csize = Number(view.getBigUint64(cpos + 8, false));
+              chdr = 16;
+            }
+            if (csize < chdr || cpos + csize > moovEnd) break;
+            if (ctype === "mvhd") {
+              const pOff = cpos + chdr;
+              const pLen = csize - chdr;
+              if (pLen >= 20) {
+                const ver = view.getUint8(pOff);
+                let ts = 0n;
+                let dur = 0n;
+                if (ver === 1 && pLen >= 32) {
+                  ts = BigInt(view.getUint32(pOff + 20, false));
+                  const raw = view.getBigUint64(pOff + 24, false);
+                  dur = raw === 0xffffffffffffffffn ? 0n : raw;
+                } else if (ver === 0) {
+                  ts = BigInt(view.getUint32(pOff + 12, false));
+                  const raw = view.getUint32(pOff + 16, false);
+                  dur = raw === 0xffffffff ? 0n : BigInt(raw);
+                }
+                if (ts > 0n && dur > 0n) {
+                  const ms = Number((dur * 1000n) / ts);
+                  if (Number.isFinite(ms) && ms > 0) return ms;
+                }
+              }
+            }
+            cpos += csize;
+          }
+          break;
+        }
+        pos += bsize;
+      }
+    } catch {
+      // Fall back to media element metadata
+    }
+    return undefined;
+  };
+
   const handleNativeFilesSelected = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
-    const descriptors = Array.from(fileList).map((f) => ({
-      name: f.name,
-      size: f.size,
-      streamUrl:
-        typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
-          ? URL.createObjectURL(f)
-          : undefined,
-    }));
-    try {
-      ipcClient.openLocalFiles(descriptors);
-      setUnsupportedError(null);
-      setMissingMediaTarget(null);
-      setSnapshot(ipcClient.getPlaybackSnapshot());
-      setLibraryVersion((v) => v + 1);
-      setSection("now_playing");
-    } catch (err) {
-      const payload = err as AppErrorPayload;
-      if (payload.code === "AV-104") {
-        setUnsupportedError({
-          fileName: descriptors[0]?.name ?? "Unknown file",
-          payload,
-        });
+    const files = Array.from(fileList);
+    void (async () => {
+      const descriptors = await Promise.all(
+        files.map(async (f) => ({
+          name: f.name,
+          size: f.size,
+          durationMs: await probeBlobIsoBmffDurationMs(f),
+          streamUrl:
+            typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+              ? URL.createObjectURL(f)
+              : undefined,
+        })),
+      );
+      try {
+        ipcClient.openLocalFiles(descriptors);
+        setUnsupportedError(null);
+        setMissingMediaTarget(null);
+        setSnapshot(ipcClient.getPlaybackSnapshot());
+        setLibraryVersion((v) => v + 1);
         setSection("now_playing");
+      } catch (err) {
+        const payload = err as AppErrorPayload;
+        if (payload.code === "AV-104") {
+          setUnsupportedError({
+            fileName: descriptors[0]?.name ?? "Unknown file",
+            payload,
+          });
+          setSection("now_playing");
+        }
       }
-    }
+    })();
   };
 
   const handleAttemptRelink = (mediaId: string, newPath: string, confirmMismatch = false) => {
@@ -857,22 +942,24 @@ export function App(): React.ReactElement {
     );
   };
 
+  const handleMediaTimeUpdate = (el: HTMLVideoElement | HTMLAudioElement) => {
+    const nextSnap = ipcClient.syncMediaElementPosition(
+      el.currentTime * 1000,
+      Number.isFinite(el.duration) ? el.duration * 1000 : undefined,
+    );
+    if (nextSnap.state === "ended" && !el.paused) {
+      el.pause();
+    }
+    setSnapshot(nextSnap);
+  };
+
   const persistentAudioElement =
     activeMedia?.media_kind === "audio" && activeMedia.stream_url ? (
       <audio
         ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
         src={activeMedia.stream_url}
         onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-        onTimeUpdate={(e) =>
-          setSnapshot(
-            ipcClient.syncMediaElementPosition(
-              e.currentTarget.currentTime * 1000,
-              Number.isFinite(e.currentTarget.duration)
-                ? e.currentTarget.duration * 1000
-                : undefined,
-            ),
-          )
-        }
+        onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
         onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
       />
     ) : null;
@@ -912,16 +999,7 @@ export function App(): React.ReactElement {
               ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
               src={activeMedia.stream_url}
               onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-              onTimeUpdate={(e) =>
-                setSnapshot(
-                  ipcClient.syncMediaElementPosition(
-                    e.currentTarget.currentTime * 1000,
-                    Number.isFinite(e.currentTarget.duration)
-                      ? e.currentTarget.duration * 1000
-                      : undefined,
-                  ),
-                )
-              }
+              onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
               onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
             />
           )}
@@ -1399,16 +1477,7 @@ export function App(): React.ReactElement {
                           zIndex: 0,
                         }}
                         onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-                        onTimeUpdate={(e) =>
-                          setSnapshot(
-                            ipcClient.syncMediaElementPosition(
-                              e.currentTarget.currentTime * 1000,
-                              Number.isFinite(e.currentTarget.duration)
-                                ? e.currentTarget.duration * 1000
-                                : undefined,
-                            ),
-                          )
-                        }
+                        onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
                         onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
                       />
                     )}

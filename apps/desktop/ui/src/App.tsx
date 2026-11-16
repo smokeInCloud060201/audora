@@ -90,6 +90,7 @@ export function App(): React.ReactElement {
 
   // Library row action menu
   const [openLibraryMenuId, setOpenLibraryMenuId] = useState<string | null>(null);
+  const [libraryMenuPlacement, setLibraryMenuPlacement] = useState<"down" | "up">("down");
 
   // Missing Media / Relink screen & AV-202 Mismatch Confirmation state (Frame 4:339)
   const [missingMediaTarget, setMissingMediaTarget] = useState<MediaItem | null>(null);
@@ -409,6 +410,19 @@ export function App(): React.ReactElement {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   });
+
+  // Dismiss open row/note action menus when clicking outside
+  useEffect(() => {
+    if (!openLibraryMenuId && !openNoteMenuId) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest("[data-row-action-menu]")) return;
+      setOpenLibraryMenuId(null);
+      setOpenNoteMenuId(null);
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    return () => window.removeEventListener("mousedown", onPointerDown);
+  }, [openLibraryMenuId, openNoteMenuId]);
 
   const openAddNoteModal = () => {
     if (!activeMedia) return;
@@ -1368,7 +1382,10 @@ export function App(): React.ReactElement {
                   </div>
                 ) : (
                   /* Video Playback Canvas & Empty Player State (Frame 2:31) */
-                  <div className="media-canvas" data-testid="video-canvas">
+                  <div
+                    className={`media-canvas ${activeMedia?.stream_url ? "has-video-stream" : ""}`}
+                    data-testid="video-canvas"
+                  >
                     {activeMedia?.stream_url && (
                       <video
                         ref={mediaElementRef as React.RefObject<HTMLVideoElement>}
@@ -1479,7 +1496,7 @@ export function App(): React.ReactElement {
                   </div>
 
                   <div className="transport-controls-row">
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div className="transport-side-left">
                       <button
                         type="button"
                         className="btn-secondary"
@@ -1494,7 +1511,7 @@ export function App(): React.ReactElement {
                       </button>
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-icon-btn"
                         aria-label={snapshot.muted ? "Unmute" : "Mute"}
                         onClick={() =>
                           setSnapshot(
@@ -1530,7 +1547,7 @@ export function App(): React.ReactElement {
                       />
                       <button
                         type="button"
-                        className="btn-secondary tabular-nums"
+                        className="btn-secondary transport-speed-btn tabular-nums"
                         aria-label="Playback speed"
                         onClick={cyclePlaybackSpeed}
                       >
@@ -1541,7 +1558,7 @@ export function App(): React.ReactElement {
                     <div className="transport-center-buttons">
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-icon-btn"
                         aria-label="Previous item or restart"
                         onClick={() =>
                           setSnapshot(ipcClient.playbackCommand({ action: "previous" }))
@@ -1567,7 +1584,7 @@ export function App(): React.ReactElement {
                       </button>
                       <button
                         type="button"
-                        className="btn-secondary"
+                        className="btn-secondary transport-icon-btn"
                         aria-label="Next item"
                         onClick={() =>
                           setSnapshot(ipcClient.playbackCommand({ action: "next" }))
@@ -1577,7 +1594,7 @@ export function App(): React.ReactElement {
                       </button>
                     </div>
 
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div className="transport-side-right">
                       <button
                         type="button"
                         className="btn-secondary"
@@ -1703,6 +1720,11 @@ export function App(): React.ReactElement {
                             <article
                               key={note.id}
                               className="note-card clickable"
+                              style={
+                                openNoteMenuId === note.id
+                                  ? { position: "relative", zIndex: 30 }
+                                  : undefined
+                              }
                               onClick={(e) => {
                                 const target = e.target as HTMLElement | null;
                                 if (target?.closest("button")) return;
@@ -1740,7 +1762,10 @@ export function App(): React.ReactElement {
                                     </span>
                                   )}
                                 </div>
-                                <div style={{ position: "relative", display: "flex", gap: 6 }}>
+                                <div
+                                  data-row-action-menu
+                                  style={{ position: "relative", display: "flex", gap: 6 }}
+                                >
                                   <button
                                     type="button"
                                     className="jump-link-btn"
@@ -1762,11 +1787,12 @@ export function App(): React.ReactElement {
                                         background: "var(--bg-dialog)",
                                         border: "1px solid var(--border-control)",
                                         borderRadius: 8,
+                                        boxShadow: "var(--shadow-modal)",
                                         padding: 6,
                                         display: "flex",
                                         flexDirection: "column",
                                         gap: 4,
-                                        zIndex: 10,
+                                        zIndex: 50,
                                         minWidth: 110,
                                       }}
                                     >
@@ -1969,7 +1995,7 @@ export function App(): React.ReactElement {
           </div>
 
           {section === "library" && (
-            <div className="content-page">
+            <div className="content-page library-page">
               {missingMediaTarget ? (
                 /* Missing Media Recovery View with Preserved Notes & AV-202 Dialog (Frame 4:339) */
                 <div
@@ -2290,6 +2316,7 @@ export function App(): React.ReactElement {
                     </div>
                   ) : (
                     <>
+                      <div className="media-table-surface">
                       <table className="media-table">
                         <thead>
                           <tr>
@@ -2309,12 +2336,15 @@ export function App(): React.ReactElement {
                               item.duration_ms,
                             );
                             const isMissing = item.availability === "missing";
+                            const isMenuOpen = openLibraryMenuId === item.id;
                             return (
                               <tr
                                 key={item.id}
                                 onClick={() => handleSelectLibraryItem(item)}
                                 style={{
                                   cursor: "pointer",
+                                  position: isMenuOpen ? "relative" : undefined,
+                                  zIndex: isMenuOpen ? 60 : undefined,
                                   background: isMissing
                                     ? "var(--status-error-bg)"
                                     : "transparent",
@@ -2362,37 +2392,40 @@ export function App(): React.ReactElement {
                                   )}
                                 </td>
                                 <td
+                                  data-row-action-menu
                                   onClick={(e) => e.stopPropagation()}
-                                  style={{ position: "relative", textAlign: "right" }}
+                                  style={{
+                                    position: "relative",
+                                    textAlign: "right",
+                                    zIndex: isMenuOpen ? 60 : undefined,
+                                  }}
                                 >
                                   <button
                                     type="button"
                                     className="jump-link-btn"
                                     aria-label={`Actions for ${item.display_name}`}
-                                    onClick={() =>
+                                    aria-expanded={isMenuOpen}
+                                    onClick={(e) => {
+                                      const rect = e.currentTarget.getBoundingClientRect();
+                                      const shouldFlipUp =
+                                        typeof window !== "undefined" &&
+                                        window.innerHeight - rect.bottom < 235 &&
+                                        rect.top > 235;
+                                      setLibraryMenuPlacement(shouldFlipUp ? "up" : "down");
                                       setOpenLibraryMenuId((prev) =>
                                         prev === item.id ? null : item.id,
-                                      )
-                                    }
+                                      );
+                                    }}
                                   >
                                     <IconMoreHorizontal size={15} />
                                   </button>
-                                  {openLibraryMenuId === item.id && (
+                                  {isMenuOpen && (
                                     <div
-                                      style={{
-                                        position: "absolute",
-                                        right: 16,
-                                        top: 36,
-                                        background: "var(--bg-dialog)",
-                                        border: "1px solid var(--border-control)",
-                                        borderRadius: 8,
-                                        padding: 6,
-                                        display: "flex",
-                                        flexDirection: "column",
-                                        gap: 4,
-                                        zIndex: 20,
-                                        minWidth: 150,
-                                      }}
+                                      className={`media-row-menu ${
+                                        libraryMenuPlacement === "up"
+                                          ? "open-up"
+                                          : "open-down"
+                                      }`}
                                     >
                                       <button
                                         type="button"
@@ -2454,6 +2487,7 @@ export function App(): React.ReactElement {
                           })}
                         </tbody>
                       </table>
+                      </div>
 
                       {/* Matching Notes Search Results Section (Sprint 4.3) */}
                       {searchQuery.trim() && libraryResult.matching_notes.length > 0 && (

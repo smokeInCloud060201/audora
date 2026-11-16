@@ -1,5 +1,5 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
@@ -93,74 +93,53 @@ function audoraLocalDevBridge(): Plugin {
         if (!req.url) return next();
         const urlObj = new URL(req.url, "http://localhost");
 
-        if (urlObj.pathname === "/__audora_browse_dirs") {
-          const home = os.homedir();
-          const rawPath = urlObj.searchParams.get("path")?.trim() ?? "";
-          const target = rawPath ? path.resolve(rawPath) : home;
-          try {
-            if (!fs.statSync(target).isDirectory()) {
-              res.statusCode = 400;
-              res.setHeader("Content-Type", "application/json");
-              res.end(JSON.stringify({ ok: false, message: "Selected directory is unavailable." }));
-              return;
+        if (urlObj.pathname === "/__audora_pick_folder") {
+          const sendPicked = (rawPicked: string | null) => {
+            const cleaned = rawPicked ? rawPicked.trim().replace(/[\\/]+$/, "") : "";
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            if (cleaned && fs.existsSync(cleaned) && fs.statSync(cleaned).isDirectory()) {
+              res.end(JSON.stringify({ ok: true, cancelled: false, path: cleaned }));
+            } else {
+              res.end(JSON.stringify({ ok: true, cancelled: true, path: null }));
             }
-          } catch {
-            res.statusCode = 400;
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ ok: false, message: "Selected directory is unavailable." }));
+          };
+
+          if (process.platform === "darwin") {
+            execFile(
+              "/usr/bin/osascript",
+              [
+                "-e",
+                'POSIX path of (choose folder with prompt "Select a local media folder for Audora")',
+              ],
+              (err, stdout) => {
+                sendPicked(err ? null : stdout);
+              },
+            );
             return;
           }
 
-          const parentDir = path.dirname(target);
-          const parentPath = parentDir && parentDir !== target ? parentDir : null;
-          const roots = [
-            { label: "Home", path: home },
-            { label: "Music", path: path.join(home, "Music") },
-            { label: "Movies", path: path.join(home, "Movies") },
-            { label: "Videos", path: path.join(home, "Videos") },
-            { label: "Downloads", path: path.join(home, "Downloads") },
-            { label: "Desktop", path: path.join(home, "Desktop") },
-            { label: "Documents", path: path.join(home, "Documents") },
-          ].filter((r) => {
-            try {
-              return fs.statSync(r.path).isDirectory();
-            } catch {
-              return false;
-            }
-          });
-
-          const directories: Array<{ name: string; path: string }> = [];
-          let directMediaCount = 0;
-          try {
-            for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
-              if (entry.name.startsWith(".") || entry.isSymbolicLink()) continue;
-              const full = path.join(target, entry.name);
-              if (entry.isDirectory()) {
-                directories.push({ name: entry.name, path: full });
-              } else if (entry.isFile()) {
-                const ext = path.extname(entry.name).slice(1).toLowerCase();
-                if (SUPPORTED_EXTS.has(ext)) {
-                  directMediaCount += 1;
-                }
-              }
-            }
-          } catch {
-            // Ignore unreadable child entries
+          if (process.platform === "win32") {
+            execFile(
+              "powershell",
+              [
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
+              ],
+              (err, stdout) => {
+                sendPicked(err ? null : stdout);
+              },
+            );
+            return;
           }
-          directories.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "application/json; charset=utf-8");
-          res.end(
-            JSON.stringify({
-              ok: true,
-              current_path: target,
-              parent_path: parentPath,
-              folder_name: path.basename(target) || target,
-              direct_media_count: directMediaCount,
-              roots,
-              directories: directories.slice(0, 400),
-            }),
+          execFile(
+            "zenity",
+            ["--file-selection", "--directory", "--title=Select a local media folder for Audora"],
+            (err, stdout) => {
+              sendPicked(err ? null : stdout);
+            },
           );
           return;
         }

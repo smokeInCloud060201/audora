@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import type { AppUpdateStatusDto } from "../types/domain";
 import { AudoraLogo } from "./AudoraLogo";
+import { IconCheck, IconClose } from "./Icons";
 
 interface UpdateDialogProps {
   updateStatus: AppUpdateStatusDto;
@@ -99,7 +100,7 @@ export function UpdateDialog({
           onClick={onClose}
           aria-label="Close update dialog"
         >
-          ✕
+          <IconClose size={14} />
         </button>
 
         <div className="update-app-mark-well" aria-hidden="true">
@@ -152,7 +153,7 @@ export function UpdateDialog({
           </div>
           {updateStatus.verified && (
             <span className="update-verified-mark" aria-label="Verified">
-              ✓
+              <IconCheck size={13} />
             </span>
           )}
         </div>

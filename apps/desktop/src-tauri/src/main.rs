@@ -427,16 +427,21 @@ fn handle_http_connection(
         return;
     }
 
-    if raw_path == "/__audora_browse_dirs" {
-        let mut folder_path_str = String::new();
-        for pair in raw_query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "path" {
-                    folder_path_str = percent_decode(v);
-                }
+    if raw_path == "/__audora_pick_folder" {
+        match pick_native_folder() {
+            Some(selected) => {
+                let escaped = escape_json_str(&selected);
+                let body = format!(r#"{{"ok":true,"cancelled":false,"path":"{escaped}"}}"#);
+                write_json_response(&mut stream, "200 OK", body.as_bytes());
+            }
+            None => {
+                write_json_response(
+                    &mut stream,
+                    "200 OK",
+                    br#"{"ok":true,"cancelled":true,"path":null}"#,
+                );
             }
         }
-        handle_browse_dirs_request(&mut stream, &folder_path_str);
         return;
     }
 
@@ -916,126 +921,66 @@ fn normalize_folder_path(raw: &str) -> String {
     }
 }
 
-fn default_user_home_dir() -> PathBuf {
-    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
-        let pb = PathBuf::from(home);
-        if pb.is_dir() {
-            return pb;
+fn pick_native_folder() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let output = Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose folder with prompt "Select a local media folder for Audora")"#,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
         }
-    }
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-}
-
-fn handle_browse_dirs_request(stream: &mut TcpStream, raw_path: &str) {
-    let home = default_user_home_dir();
-    let target_buf = if raw_path.trim().is_empty() {
-        home.clone()
-    } else {
-        PathBuf::from(normalize_folder_path(raw_path))
-    };
-
-    if !target_buf.is_absolute() || !target_buf.is_dir() {
-        write_json_response(
-            stream,
-            "400 Bad Request",
-            br#"{"ok":false,"message":"Selected directory is unavailable."}"#,
-        );
-        return;
+        let chosen = normalize_folder_path(&String::from_utf8_lossy(&output.stdout));
+        if chosen.is_empty() || !Path::new(&chosen).is_dir() {
+            return None;
+        }
+        return Some(chosen);
     }
 
-    let current_path_str = normalize_folder_path(&target_buf.to_string_lossy());
-    let folder_name = target_buf
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&current_path_str);
-
-    let parent_json = match target_buf.parent() {
-        Some(p) if p != target_buf && !p.as_os_str().is_empty() => {
-            let p_str = escape_json_str(&normalize_folder_path(&p.to_string_lossy()));
-            format!(r#""{p_str}""#)
+    if cfg!(target_os = "windows") {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select a local media folder for Audora'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
         }
-        _ => "null".to_owned(),
-    };
-
-    let candidate_roots = [
-        ("Home", home.clone()),
-        ("Music", home.join("Music")),
-        ("Movies", home.join("Movies")),
-        ("Videos", home.join("Videos")),
-        ("Downloads", home.join("Downloads")),
-        ("Desktop", home.join("Desktop")),
-        ("Documents", home.join("Documents")),
-    ];
-    let mut roots_json = String::from("[");
-    let mut first_root = true;
-    for (label, pb) in candidate_roots {
-        if pb.is_dir() {
-            if !first_root {
-                roots_json.push(',');
-            }
-            first_root = false;
-            let escaped_p = escape_json_str(&normalize_folder_path(&pb.to_string_lossy()));
-            roots_json.push_str(&format!(r#"{{"label":"{label}","path":"{escaped_p}"}}"#));
+        let chosen = normalize_folder_path(&String::from_utf8_lossy(&output.stdout));
+        if chosen.is_empty() || !Path::new(&chosen).is_dir() {
+            return None;
         }
+        return Some(chosen);
     }
-    roots_json.push(']');
 
-    let mut subdirs: Vec<(String, String)> = Vec::new();
-    let mut direct_media_count = 0_usize;
-
-    if let Ok(entries) = fs::read_dir(&target_buf) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let Some(name) = entry_path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name.starts_with('.') {
-                continue;
-            }
-            let Ok(meta) = fs::symlink_metadata(&entry_path) else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            if meta.is_dir() {
-                subdirs.push((
-                    name.to_owned(),
-                    normalize_folder_path(&entry_path.to_string_lossy()),
-                ));
-            } else if meta.is_file() && meta.len() > 0 {
-                let ext = entry_path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if is_supported_media_extension(&ext) {
-                    direct_media_count = direct_media_count.saturating_add(1);
+    for (bin, args) in [
+        (
+            "zenity",
+            vec![
+                "--file-selection",
+                "--directory",
+                "--title=Select a local media folder for Audora",
+            ],
+        ),
+        ("kdialog", vec!["--getexistingdirectory"]),
+    ] {
+        if let Ok(output) = Command::new(bin).args(&args).output() {
+            if output.status.success() {
+                let chosen = normalize_folder_path(&String::from_utf8_lossy(&output.stdout));
+                if !chosen.is_empty() && Path::new(&chosen).is_dir() {
+                    return Some(chosen);
                 }
             }
         }
     }
 
-    subdirs.sort_by_key(|a| a.0.to_ascii_lowercase());
-
-    let mut dirs_json = String::from("[");
-    for (idx, (name, dir_path)) in subdirs.iter().take(400).enumerate() {
-        if idx > 0 {
-            dirs_json.push(',');
-        }
-        let esc_name = escape_json_str(name);
-        let esc_path = escape_json_str(dir_path);
-        dirs_json.push_str(&format!(r#"{{"name":"{esc_name}","path":"{esc_path}"}}"#));
-    }
-    dirs_json.push(']');
-
-    let esc_curr = escape_json_str(&current_path_str);
-    let esc_fname = escape_json_str(folder_name);
-    let body = format!(
-        r#"{{"ok":true,"current_path":"{esc_curr}","parent_path":{parent_json},"folder_name":"{esc_fname}","direct_media_count":{direct_media_count},"roots":{roots_json},"directories":{dirs_json}}}"#
-    );
-    write_json_response(stream, "200 OK", body.as_bytes());
+    None
 }
 
 fn collect_media_files_in_dir(

@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type { AppErrorPayload, MediaItem, Playlist } from "../types/domain";
+import { IconCheck, IconClose, IconPlus } from "./Icons";
 
 interface AddToPlaylistModalProps {
   mediaItem: MediaItem;
@@ -90,7 +91,7 @@ export function AddToPlaylistModal({
             aria-label="Close playlist modal"
             onClick={onClose}
           >
-            ✕
+            <IconClose size={14} />
           </button>
         </div>
 
@@ -112,7 +113,8 @@ export function AddToPlaylistModal({
             }}
           />
           <button type="submit" className="btn-primary">
-            ＋ Create &amp; add
+            <IconPlus size={14} />
+            <span>Create &amp; add</span>
           </button>
         </form>
 
@@ -160,7 +162,7 @@ export function AddToPlaylistModal({
                     className={`playlist-check-indicator ${checked ? "checked" : ""}`}
                     aria-hidden="true"
                   >
-                    {checked ? "✓" : "＋"}
+                    {checked ? <IconCheck size={13} /> : <IconPlus size={13} />}
                   </span>
                 </button>
               );

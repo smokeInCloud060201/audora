@@ -131,23 +131,6 @@ export interface TrustedSourceFolder {
   media_count: number;
 }
 
-export interface LocalDirectoryListing {
-  current_path: string;
-  parent_path: string | null;
-  folder_name: string;
-  direct_media_count: number;
-  roots: Array<{ label: string; path: string }>;
-  directories: Array<{ name: string; path: string }>;
-}
-
-export interface SourceFolderPreview {
-  folder_path: string;
-  folder_name: string;
-  files: Array<{ path: string; name: string; size: number }>;
-  video_count: number;
-  audio_count: number;
-}
-
 export interface AppSettings {
   theme: ThemeMode;
   resume_where_left_off: boolean;

@@ -8,14 +8,12 @@ import type {
   DiagnosticReport,
   LibraryFilter,
   LibrarySearchResult,
-  LocalDirectoryListing,
   MediaItem,
   Note,
   PlaybackCommand,
   PlaybackSnapshot,
   Playlist,
   ReleaseManifestDto,
-  SourceFolderPreview,
   TrustedSourceFolder,
   UpdateNoteInput,
   UpdatePlaylistInput,
@@ -1248,135 +1246,47 @@ export class AudoraIpcClient {
     return this.addSourceFolderWithFiles(normalizedPath, []);
   }
 
-  public async browseLocalDirectories(
-    targetPath?: string,
-  ): Promise<LocalDirectoryListing> {
+  public async pickAndImportSourceFolder(): Promise<{
+    cancelled: boolean;
+    folder?: TrustedSourceFolder;
+    importedCount: number;
+  }> {
     if (
-      isBrowserRuntime() &&
-      (window.location.hostname === "127.0.0.1" ||
-        window.location.hostname === "localhost")
+      !isBrowserRuntime() ||
+      (window.location.hostname !== "127.0.0.1" &&
+        window.location.hostname !== "localhost")
     ) {
-      const query = targetPath?.trim()
-        ? `?path=${encodeURIComponent(targetPath.trim())}`
-        : "";
-      const res = await fetch(`/__audora_browse_dirs${query}`);
-      const text = await res.text();
-      if (text.trim().startsWith("{")) {
-        const payload = JSON.parse(text) as {
-          ok?: boolean;
-          message?: string;
-          current_path?: string;
-          parent_path?: string | null;
-          folder_name?: string;
-          direct_media_count?: number;
-          roots?: Array<{ label: string; path: string }>;
-          directories?: Array<{ name: string; path: string }>;
-        };
-        if (!payload.ok || !payload.current_path) {
-          throw this.makeError(
-            "AV-101",
-            "MediaUnavailable",
-            "Directory unavailable",
-            payload.message ?? "Unable to read the selected local folder.",
-          );
-        }
-        return {
-          current_path: payload.current_path,
-          parent_path: payload.parent_path ?? null,
-          folder_name: payload.folder_name || payload.current_path,
-          direct_media_count: payload.direct_media_count ?? 0,
-          roots: payload.roots ?? [],
-          directories: payload.directories ?? [],
-        };
-      }
-    }
-    throw this.makeError(
-      "AV-101",
-      "MediaUnavailable",
-      "Local directory browser unavailable",
-      "Run Audora desktop or local dev server to browse local folders.",
-    );
-  }
-
-  public async previewSourceFolder(
-    rawFolderPath: string,
-  ): Promise<SourceFolderPreview> {
-    const normalizedPath = this.normalizeFolderPath(rawFolderPath);
-    const supportedVideo = new Set(["mp4", "m4v", "mov", "webm", "mkv"]);
-    if (
-      isBrowserRuntime() &&
-      (window.location.hostname === "127.0.0.1" ||
-        window.location.hostname === "localhost")
-    ) {
-      const res = await fetch(
-        `/__audora_scan_folder?path=${encodeURIComponent(normalizedPath)}`,
+      throw this.makeError(
+        "AV-101",
+        "MediaUnavailable",
+        "Native disk picker unavailable",
+        "Run Audora desktop or local dev server to select a local folder.",
       );
-      const text = await res.text();
-      if (text.trim().startsWith("{")) {
-        const payload = JSON.parse(text) as {
-          ok?: boolean;
-          message?: string;
-          folder_path?: string;
-          folder_name?: string;
-          files?: Array<{ path: string; name: string; size: number }>;
-        };
-        if (!payload.ok) {
-          throw this.makeError(
-            "AV-101",
-            "MediaUnavailable",
-            "Source folder not found",
-            payload.message ??
-              "The selected local folder does not exist or could not be read.",
-          );
-        }
-        const files = payload.files ?? [];
-        let videoCount = 0;
-        let audioCount = 0;
-        for (const f of files) {
-          const ext = f.name.includes(".")
-            ? (f.name.split(".").pop()?.toLowerCase() ?? "")
-            : "";
-          if (supportedVideo.has(ext)) {
-            videoCount += 1;
-          } else {
-            audioCount += 1;
-          }
-        }
-        return {
-          folder_path: payload.folder_path || normalizedPath,
-          folder_name:
-            payload.folder_name ||
-            normalizedPath.split(/[\\/]/).filter(Boolean).pop() ||
-            normalizedPath,
-          files,
-          video_count: videoCount,
-          audio_count: audioCount,
-        };
-      }
     }
-    return {
-      folder_path: normalizedPath,
-      folder_name:
-        normalizedPath.split(/[\\/]/).filter(Boolean).pop() || normalizedPath,
-      files: [],
-      video_count: 0,
-      audio_count: 0,
+    const res = await fetch("/__audora_pick_folder");
+    const text = await res.text();
+    if (!text.trim().startsWith("{")) {
+      throw this.makeError(
+        "AV-101",
+        "MediaUnavailable",
+        "Native disk picker unavailable",
+        "Restart dev server to enable the native local folder browser.",
+      );
+    }
+    const payload = JSON.parse(text) as {
+      ok?: boolean;
+      cancelled?: boolean;
+      path?: string | null;
     };
-  }
-
-  public confirmSourceFolderImport(
-    preview: SourceFolderPreview,
-  ): { folder: TrustedSourceFolder; importedCount: number } {
-    const descriptors: LocalFileDescriptor[] = preview.files.map((f) => ({
-      name: f.name,
-      path: f.path,
-      size: f.size,
-    }));
-    return this.addSourceFolderWithFiles(
-      preview.folder_path,
-      descriptors,
-      preview.folder_name,
-    );
+    if (payload.cancelled || !payload.path) {
+      return { cancelled: true, importedCount: 0 };
+    }
+    const added = await this.scanAndAddSourceFolderPath(payload.path);
+    return {
+      cancelled: false,
+      folder: added.folder,
+      importedCount: added.importedCount,
+    };
   }
 
   public async rescanSourceFolder(

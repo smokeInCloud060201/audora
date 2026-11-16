@@ -7,6 +7,18 @@ import type {
   Playlist,
 } from "../types/domain";
 import { formatDurationMs } from "../utils/format";
+import {
+  IconArrowDown,
+  IconArrowUp,
+  IconCheck,
+  IconChevronLeft,
+  IconClose,
+  IconCollapseLeft,
+  IconPlay,
+  IconPlaylists,
+  IconPlus,
+  IconShuffle,
+} from "./Icons";
 
 interface PlaylistsViewProps {
   playlists: Playlist[];
@@ -213,11 +225,16 @@ export function PlaylistsView({
               style={{ fontSize: 12 }}
               onClick={() => onSelectPlaylist(null)}
             >
-              ‹ All playlists
+              <IconChevronLeft size={14} />
+              <span>All playlists</span>
             </button>
           ) : (
-            <span className="playlists-drawer-heading">
-              ☰ Playlists ({playlists.length})
+            <span
+              className="playlists-drawer-heading"
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+            >
+              <IconPlaylists size={14} />
+              <span>Playlists ({playlists.length})</span>
             </span>
           )}
 
@@ -231,7 +248,7 @@ export function PlaylistsView({
                 title="Create new playlist"
                 onClick={openCreateModal}
               >
-                ＋
+                <IconPlus size={14} />
               </button>
             )}
             <button
@@ -241,7 +258,7 @@ export function PlaylistsView({
               title="Hide playlists bar ([)"
               onClick={onCollapse}
             >
-              ⇤
+              <IconCollapseLeft size={14} />
             </button>
           </div>
         </div>
@@ -266,7 +283,9 @@ export function PlaylistsView({
             <div className="panel-scroll-list" style={{ paddingTop: 10 }}>
               {filteredPlaylists.length === 0 ? (
                 <div className="playlists-drawer-empty">
-                  <div style={{ fontSize: 22, color: "var(--accent-primary)" }}>☰</div>
+                  <div style={{ color: "var(--accent-primary)" }}>
+                    <IconPlaylists size={24} />
+                  </div>
                   <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
                     {playlists.length === 0 ? "No playlists yet" : "No matches"}
                   </div>
@@ -282,7 +301,8 @@ export function PlaylistsView({
                       style={{ height: 30, fontSize: 12, marginTop: 4 }}
                       onClick={openCreateModal}
                     >
-                      ＋ New playlist
+                      <IconPlus size={13} />
+                      <span>New playlist</span>
                     </button>
                   )}
                 </div>
@@ -308,7 +328,7 @@ export function PlaylistsView({
                         onClick={() => onSelectPlaylist(pl.id)}
                       >
                         <div className="playlist-nav-glyph" aria-hidden="true">
-                          ☰
+                          <IconPlaylists size={16} />
                         </div>
                         <div style={{ minWidth: 0, flex: 1 }}>
                           <div className="playlist-nav-title">{pl.name}</div>
@@ -328,7 +348,7 @@ export function PlaylistsView({
                           title={`Play ${pl.name}`}
                           onClick={() => onPlayPlaylist(pl.id, { shuffle: false })}
                         >
-                          ▶
+                          <IconPlay size={13} />
                         </button>
                       )}
                     </div>
@@ -361,7 +381,8 @@ export function PlaylistsView({
                   )}
                   onClick={() => onPlayPlaylist(activePlaylist.id, { shuffle: false })}
                 >
-                  ▶ Play
+                  <IconPlay size={13} />
+                  <span>Play</span>
                 </button>
                 <button
                   type="button"
@@ -372,7 +393,8 @@ export function PlaylistsView({
                   )}
                   onClick={() => onPlayPlaylist(activePlaylist.id, { shuffle: true })}
                 >
-                  ⇄ Shuffle
+                  <IconShuffle size={13} />
+                  <span>Shuffle</span>
                 </button>
                 <button
                   type="button"
@@ -380,7 +402,8 @@ export function PlaylistsView({
                   style={{ height: 30, padding: "0 9px", fontSize: 11.5 }}
                   onClick={openAddMediaModal}
                 >
-                  ＋ Add
+                  <IconPlus size={13} />
+                  <span>Add</span>
                 </button>
                 <button
                   type="button"
@@ -413,7 +436,8 @@ export function PlaylistsView({
                     style={{ height: 30, fontSize: 12 }}
                     onClick={openAddMediaModal}
                   >
-                    ＋ Add from library
+                    <IconPlus size={13} />
+                    <span>Add from library</span>
                   </button>
                   {allMedia.length === 0 && (
                     <button
@@ -478,6 +502,9 @@ export function PlaylistsView({
                         >
                           <div
                             style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 5,
                               fontSize: 12.5,
                               fontWeight: 600,
                               overflow: "hidden",
@@ -485,8 +512,16 @@ export function PlaylistsView({
                               whiteSpace: "nowrap",
                             }}
                           >
-                            {isPlayingItem ? "▶ " : `${idx + 1}. `}
-                            {item.display_name}
+                            {isPlayingItem ? <IconPlay size={12} /> : <span>{idx + 1}.</span>}
+                            <span
+                              style={{
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {item.display_name}
+                            </span>
                           </div>
                           <div
                             className="tabular-nums"
@@ -502,36 +537,36 @@ export function PlaylistsView({
                           <button
                             type="button"
                             className="panel-icon-btn"
-                            style={{ width: 22, height: 22, fontSize: 11 }}
+                            style={{ width: 22, height: 22 }}
                             disabled={idx === 0}
                             aria-label={`Move ${item.display_name} up`}
                             title="Move up"
                             onClick={() => handleMoveItem(item.id, idx - 1)}
                           >
-                            ↑
+                            <IconArrowUp size={12} />
                           </button>
                           <button
                             type="button"
                             className="panel-icon-btn"
-                            style={{ width: 22, height: 22, fontSize: 11 }}
+                            style={{ width: 22, height: 22 }}
                             disabled={idx === activePlaylistItems.length - 1}
                             aria-label={`Move ${item.display_name} down`}
                             title="Move down"
                             onClick={() => handleMoveItem(item.id, idx + 1)}
                           >
-                            ↓
+                            <IconArrowDown size={12} />
                           </button>
                           <button
                             type="button"
                             className="panel-icon-btn"
-                            style={{ width: 22, height: 22, fontSize: 12 }}
+                            style={{ width: 22, height: 22 }}
                             aria-label={`Remove ${item.display_name} from playlist`}
                             title="Remove from playlist"
                             onClick={() =>
                               handleRemoveTrack(item.id, item.display_name)
                             }
                           >
-                            ×
+                            <IconClose size={12} />
                           </button>
                         </div>
                       </div>
@@ -562,9 +597,10 @@ export function PlaylistsView({
                 type="button"
                 className="btn-secondary"
                 style={{ width: 30, height: 30, padding: 0 }}
+                aria-label="Close modal"
                 onClick={() => setComposerMode(null)}
               >
-                ✕
+                <IconClose size={14} />
               </button>
             </div>
 
@@ -661,9 +697,10 @@ export function PlaylistsView({
                 type="button"
                 className="btn-secondary"
                 style={{ width: 30, height: 30, padding: 0 }}
+                aria-label="Close modal"
                 onClick={() => setIsAddMediaOpen(false)}
               >
-                ✕
+                <IconClose size={14} />
               </button>
             </div>
 
@@ -734,7 +771,7 @@ export function PlaylistsView({
                         className={`playlist-check-indicator ${checked ? "checked" : ""}`}
                         aria-hidden="true"
                       >
-                        {checked ? "✓" : "＋"}
+                        {checked ? <IconCheck size={13} /> : <IconPlus size={13} />}
                       </span>
                     </button>
                   );

@@ -2,8 +2,34 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ipcClient } from "./api/ipc";
 import { AddToPlaylistModal } from "./components/AddToPlaylistModal";
 import { AudoraLogo } from "./components/AudoraLogo";
+import {
+  IconAlertCircle,
+  IconArrowRight,
+  IconArrowUp,
+  IconCheck,
+  IconClose,
+  IconCollapseRight,
+  IconExpandMode,
+  IconFlag,
+  IconFolderOpen,
+  IconHelpCircle,
+  IconLibrary,
+  IconMinimizeMode,
+  IconMoreHorizontal,
+  IconPanelRight,
+  IconPause,
+  IconPlay,
+  IconPlaylists,
+  IconPlus,
+  IconRepeat,
+  IconSettings,
+  IconShuffle,
+  IconSkipNext,
+  IconSkipPrev,
+  IconVolume,
+  IconVolumeMuted,
+} from "./components/Icons";
 import { PlaylistsView } from "./components/PlaylistsView";
-import { SourceFolderDialog } from "./components/SourceFolderDialog";
 import { UpdateDialog } from "./components/UpdateDialog";
 import type {
   AppErrorPayload,
@@ -59,9 +85,7 @@ export function App(): React.ReactElement {
   const [noteModalError, setNoteModalError] = useState<string | null>(null);
   const [openNoteMenuId, setOpenNoteMenuId] = useState<string | null>(null);
 
-  // Open Media dialog & drag-and-drop state
-  const [isOpenMediaModalOpen, setIsOpenMediaModalOpen] = useState<boolean>(false);
-  const [openPathDraft, setOpenPathDraft] = useState<string>("");
+  // Drag-and-drop state
   const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
 
   // Library row action menu
@@ -103,7 +127,7 @@ export function App(): React.ReactElement {
   const [saveQueueError, setSaveQueueError] = useState<string | null>(null);
 
   // Trusted Local Source Folders state (Spotify Local Files workflow in Settings)
-  const [isSourceDialogOpen, setIsSourceDialogOpen] = useState<boolean>(false);
+  const [isPickingSourceFolder, setIsPickingSourceFolder] = useState<boolean>(false);
   const [sourceFolderError, setSourceFolderError] = useState<string | null>(null);
   const [rescanningFolderId, setRescanningFolderId] = useState<string | null>(null);
 
@@ -310,7 +334,7 @@ export function App(): React.ReactElement {
 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
         e.preventDefault();
-        setIsOpenMediaModalOpen(true);
+        fileInputRef.current?.click();
         return;
       }
 
@@ -323,10 +347,6 @@ export function App(): React.ReactElement {
           setIsSaveQueueModalOpen(false);
           return;
         }
-        if (isSourceDialogOpen) {
-          setIsSourceDialogOpen(false);
-          return;
-        }
         if (isUpdateDialogOpen) {
           setIsUpdateDialogOpen(false);
           return;
@@ -337,10 +357,6 @@ export function App(): React.ReactElement {
         }
         if (isNoteModalOpen) {
           setIsNoteModalOpen(false);
-          return;
-        }
-        if (isOpenMediaModalOpen) {
-          setIsOpenMediaModalOpen(false);
           return;
         }
         if (openNoteMenuId) {
@@ -572,27 +588,8 @@ export function App(): React.ReactElement {
     }
   };
 
-  const handleOpenMediaSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      ipcClient.openMediaPath(openPathDraft);
-      setUnsupportedError(null);
-      setMissingMediaTarget(null);
-      setIsOpenMediaModalOpen(false);
-      setOpenPathDraft("");
-      setSnapshot(ipcClient.getPlaybackSnapshot());
-      setLibraryVersion((v) => v + 1);
-      setSection("now_playing");
-    } catch (err) {
-      const payload = err as AppErrorPayload;
-      if (payload.code === "AV-104") {
-        const fileName = openPathDraft.trim().split(/[\\/]/).pop() ?? openPathDraft.trim();
-        setUnsupportedError({ fileName, payload });
-        setIsOpenMediaModalOpen(false);
-        setOpenPathDraft("");
-        setSection("now_playing");
-      }
-    }
+  const triggerOpenMediaPicker = () => {
+    fileInputRef.current?.click();
   };
 
   const handleNativeFilesSelected = (fileList: FileList | null) => {
@@ -609,7 +606,6 @@ export function App(): React.ReactElement {
       ipcClient.openLocalFiles(descriptors);
       setUnsupportedError(null);
       setMissingMediaTarget(null);
-      setIsOpenMediaModalOpen(false);
       setSnapshot(ipcClient.getPlaybackSnapshot());
       setLibraryVersion((v) => v + 1);
       setSection("now_playing");
@@ -620,7 +616,6 @@ export function App(): React.ReactElement {
           fileName: descriptors[0]?.name ?? "Unknown file",
           payload,
         });
-        setIsOpenMediaModalOpen(false);
         setSection("now_playing");
       }
     }
@@ -717,22 +712,26 @@ export function App(): React.ReactElement {
 
   const currentVersion = updateStatus?.current_version || ipcClient.getCurrentVersion();
 
-  const handleAddSourceButtonClick = () => {
+  const handleAddSourceButtonClick = async () => {
+    if (isPickingSourceFolder) return;
     setSourceFolderError(null);
-    setIsSourceDialogOpen(true);
-  };
-
-  const handleSourceFolderAdded = (
-    folder: TrustedSourceFolder,
-    importedCount: number,
-  ) => {
-    setIsSourceDialogOpen(false);
-    setSettings(ipcClient.getSettings());
-    setSnapshot(ipcClient.getPlaybackSnapshot());
-    setLibraryVersion((v) => v + 1);
-    showTransientUpdateToast(
-      `Added source "${folder.label}" (${importedCount} media file${importedCount === 1 ? "" : "s"} imported).`,
-    );
+    setIsPickingSourceFolder(true);
+    try {
+      const res = await ipcClient.pickAndImportSourceFolder();
+      if (!res.cancelled && res.folder) {
+        setSettings(ipcClient.getSettings());
+        setSnapshot(ipcClient.getPlaybackSnapshot());
+        setLibraryVersion((v) => v + 1);
+        showTransientUpdateToast(
+          `Added source "${res.folder.label}" (${res.importedCount} media file${res.importedCount === 1 ? "" : "s"} imported).`,
+        );
+      }
+    } catch (err) {
+      const payload = err as AppErrorPayload;
+      setSourceFolderError(payload.message ?? "Unable to select local source folder.");
+    } finally {
+      setIsPickingSourceFolder(false);
+    }
   };
 
   const handleRescanSourceFolder = async (folder: TrustedSourceFolder) => {
@@ -921,7 +920,7 @@ export function App(): React.ReactElement {
                 data-node-id="20:11"
                 onClick={() => setIsMinHelpOpen((prev) => !prev)}
               >
-                ?
+                <IconHelpCircle size={14} />
               </button>
               <button
                 type="button"
@@ -934,7 +933,7 @@ export function App(): React.ReactElement {
                   setSettings(ipcClient.setWindowMode("full"));
                 }}
               >
-                ↗
+                <IconExpandMode size={13} />
               </button>
             </div>
           </header>
@@ -945,7 +944,7 @@ export function App(): React.ReactElement {
               data-testid="minimum-help-popover"
             >
               <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-primary)" }}>
-                Space to play · ←/→ to seek · Shift+N marker
+                Space to play · Arrow keys to seek · Shift+N marker
               </div>
               <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>
                 Press N to write a note or Esc to expand.
@@ -959,7 +958,8 @@ export function App(): React.ReactElement {
                   setSettings(ipcClient.setWindowMode("full"));
                 }}
               >
-                Open full mode ↗
+                <span>Open full mode</span>
+                <IconExpandMode size={12} />
               </button>
             </div>
           )}
@@ -985,7 +985,11 @@ export function App(): React.ReactElement {
                 setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
               }}
             >
-              {snapshot.state === "playing" ? "❚❚" : "▶"}
+              {snapshot.state === "playing" ? (
+                <IconPause size={18} />
+              ) : (
+                <IconPlay size={18} />
+              )}
             </button>
 
             <div className="minimum-time-column">
@@ -1056,7 +1060,9 @@ export function App(): React.ReactElement {
 
       {isDraggingFiles && (
         <div className="drop-zone-overlay" data-testid="drop-zone-overlay">
-          <div style={{ fontSize: 24 }}>▣</div>
+          <div style={{ color: "var(--accent-primary)" }}>
+            <IconFolderOpen size={28} />
+          </div>
           <div style={{ fontSize: 16, fontWeight: 600 }}>Drop audio or video files to open</div>
           <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>
             Files stay on your device and are never modified
@@ -1090,14 +1096,16 @@ export function App(): React.ReactElement {
             aria-pressed={false}
             onClick={() => setSettings(ipcClient.setWindowMode("minimum"))}
           >
-            ⤡ Minimum mode
+            <IconMinimizeMode size={14} />
+            <span>Minimum mode</span>
           </button>
           <button
             type="button"
             className="btn-primary"
-            onClick={() => setIsOpenMediaModalOpen(true)}
+            onClick={triggerOpenMediaPicker}
           >
-            ▣ Open media
+            <IconFolderOpen size={14} />
+            <span>Open media</span>
           </button>
         </div>
       </header>
@@ -1116,7 +1124,7 @@ export function App(): React.ReactElement {
               }}
             >
               <span className="nav-rail-icon" aria-hidden="true">
-                ▤
+                <IconLibrary size={18} />
               </span>
               <span>Library</span>
             </button>
@@ -1127,7 +1135,7 @@ export function App(): React.ReactElement {
               onClick={() => setSection("now_playing")}
             >
               <span className="nav-rail-icon" aria-hidden="true">
-                ▶
+                <IconPlay size={18} />
               </span>
               <span>Playing</span>
             </button>
@@ -1145,7 +1153,7 @@ export function App(): React.ReactElement {
               >
                 <span className="nav-rail-update-dot" aria-hidden="true" />
                 <span className="nav-rail-icon" aria-hidden="true">
-                  ↑
+                  <IconArrowUp size={17} />
                 </span>
                 <span>Update</span>
               </button>
@@ -1157,7 +1165,7 @@ export function App(): React.ReactElement {
               onClick={() => setSection("settings")}
             >
               <span className="nav-rail-icon" aria-hidden="true">
-                ⚙
+                <IconSettings size={18} />
               </span>
               <span>Settings</span>
             </button>
@@ -1228,7 +1236,9 @@ export function App(): React.ReactElement {
                     >
                       <span
                         style={{
-                          display: "inline-block",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 6,
                           padding: "4px 10px",
                           borderRadius: 6,
                           background: "var(--status-error-bg)",
@@ -1238,7 +1248,8 @@ export function App(): React.ReactElement {
                           marginBottom: 12,
                         }}
                       >
-                        ✕ Unsupported format ({unsupportedError.payload.code})
+                        <IconAlertCircle size={14} />
+                        <span>Unsupported format ({unsupportedError.payload.code})</span>
                       </span>
                       <h2 style={{ margin: "0 0 8px 0", fontSize: 22 }}>
                         {unsupportedError.payload.title}
@@ -1279,7 +1290,7 @@ export function App(): React.ReactElement {
                         <button
                           type="button"
                           className="btn-primary"
-                          onClick={() => setIsOpenMediaModalOpen(true)}
+                          onClick={triggerOpenMediaPicker}
                         >
                           Choose another file
                         </button>
@@ -1377,16 +1388,10 @@ export function App(): React.ReactElement {
                             <button
                               type="button"
                               className="btn-primary"
-                              onClick={() => fileInputRef.current?.click()}
+                              onClick={triggerOpenMediaPicker}
                             >
-                              ▣ Choose local files…
-                            </button>
-                            <button
-                              type="button"
-                              className="btn-secondary"
-                              onClick={() => setIsOpenMediaModalOpen(true)}
-                            >
-                              Enter file path…
+                              <IconFolderOpen size={14} />
+                              <span>Open media…</span>
                             </button>
                           </div>
                         )}
@@ -1459,7 +1464,8 @@ export function App(): React.ReactElement {
                         title={showPlaylistsBar ? "Hide playlists bar ([)" : "Show playlists bar ([)"}
                         onClick={togglePlaylistsBar}
                       >
-                        ☰ Playlists
+                        <IconPlaylists size={14} />
+                        <span>Playlists</span>
                       </button>
                       <button
                         type="button"
@@ -1474,7 +1480,11 @@ export function App(): React.ReactElement {
                           )
                         }
                       >
-                        {snapshot.muted || snapshot.volume === 0 ? "🔇" : "◖))"}
+                        {snapshot.muted || snapshot.volume === 0 ? (
+                          <IconVolumeMuted size={15} />
+                        ) : (
+                          <IconVolume size={15} />
+                        )}
                       </button>
                       <input
                         type="range"
@@ -1512,7 +1522,7 @@ export function App(): React.ReactElement {
                           setSnapshot(ipcClient.playbackCommand({ action: "previous" }))
                         }
                       >
-                        ⏮
+                        <IconSkipPrev size={15} />
                       </button>
                       <button
                         type="button"
@@ -1524,7 +1534,11 @@ export function App(): React.ReactElement {
                           )
                         }
                       >
-                        {snapshot.state === "playing" ? "❚❚" : "▶"}
+                        {snapshot.state === "playing" ? (
+                          <IconPause size={18} />
+                        ) : (
+                          <IconPlay size={18} />
+                        )}
                       </button>
                       <button
                         type="button"
@@ -1534,7 +1548,7 @@ export function App(): React.ReactElement {
                           setSnapshot(ipcClient.playbackCommand({ action: "next" }))
                         }
                       >
-                        ⏭
+                        <IconSkipNext size={15} />
                       </button>
                     </div>
 
@@ -1550,7 +1564,8 @@ export function App(): React.ReactElement {
                           }
                         }}
                       >
-                        ＋ Playlist
+                        <IconPlus size={13} />
+                        <span>Playlist</span>
                       </button>
                       <button
                         type="button"
@@ -1558,7 +1573,8 @@ export function App(): React.ReactElement {
                         title="Add quick marker at current timestamp (Shift+N)"
                         onClick={handleCreateQuickMarker}
                       >
-                        ⚑ Marker
+                        <IconFlag size={13} />
+                        <span>Marker</span>
                       </button>
                       <button
                         type="button"
@@ -1566,7 +1582,8 @@ export function App(): React.ReactElement {
                         title={`Add note at ${formatDurationMs(snapshot.position_ms)} (N)`}
                         onClick={openAddNoteModal}
                       >
-                        ＋ Note
+                        <IconPlus size={13} />
+                        <span>Note</span>
                       </button>
                       <button
                         type="button"
@@ -1577,7 +1594,8 @@ export function App(): React.ReactElement {
                         title={showSidePanel ? "Hide Notes & Queue bar (])" : "Show Notes & Queue bar (])"}
                         onClick={toggleSidePanel}
                       >
-                        ▤ Notes &amp; Queue
+                        <IconPanelRight size={14} />
+                        <span>Notes &amp; Queue</span>
                       </button>
                     </div>
                   </div>
@@ -1614,7 +1632,7 @@ export function App(): React.ReactElement {
                       title="Hide Notes & Queue bar (])"
                       onClick={toggleSidePanel}
                     >
-                      ⇥
+                      <IconCollapseRight size={14} />
                     </button>
                   </div>
 
@@ -1632,7 +1650,8 @@ export function App(): React.ReactElement {
                         className="btn-primary"
                         onClick={openAddNoteModal}
                       >
-                        ＋ New
+                        <IconPlus size={13} />
+                        <span>New</span>
                       </button>
                     </div>
 
@@ -1678,7 +1697,8 @@ export function App(): React.ReactElement {
                                     className="timestamp-pill tabular-nums"
                                     onClick={() => handleJumpToNote(note.id)}
                                   >
-                                    ▶ {formatDurationMs(note.position_ms)}
+                                    <IconPlay size={10} />
+                                    <span>{formatDurationMs(note.position_ms)}</span>
                                   </button>
                                   {isOutOfRange && (
                                     <span
@@ -1706,7 +1726,7 @@ export function App(): React.ReactElement {
                                       )
                                     }
                                   >
-                                    ⋯
+                                    <IconMoreHorizontal size={15} />
                                   </button>
                                   {openNoteMenuId === note.id && (
                                     <div
@@ -1768,7 +1788,8 @@ export function App(): React.ReactElement {
                                   className="jump-link-btn"
                                   onClick={() => handleJumpToNote(note.id)}
                                 >
-                                  Jump to moment →
+                                  <span>Jump to moment</span>
+                                  <IconArrowRight size={12} />
                                 </button>
                               </div>
                             </article>
@@ -1799,7 +1820,8 @@ export function App(): React.ReactElement {
                               setIsSaveQueueModalOpen(true);
                             }}
                           >
-                            ＋ Save
+                            <IconPlus size={13} />
+                            <span>Save</span>
                           </button>
                         )}
                         <button
@@ -1815,7 +1837,8 @@ export function App(): React.ReactElement {
                             )
                           }
                         >
-                          ⇄ Shuffle
+                          <IconShuffle size={13} />
+                          <span>Shuffle</span>
                         </button>
                         <button
                           type="button"
@@ -1823,7 +1846,8 @@ export function App(): React.ReactElement {
                           aria-pressed={snapshot.repeat_mode !== "off"}
                           onClick={cycleRepeatMode}
                         >
-                          ↻ Repeat: {snapshot.repeat_mode}
+                          <IconRepeat size={13} />
+                          <span>Repeat: {snapshot.repeat_mode}</span>
                         </button>
                       </div>
                     </div>
@@ -1865,11 +1889,28 @@ export function App(): React.ReactElement {
                                   padding: 0,
                                   cursor: "pointer",
                                   flex: 1,
+                                  minWidth: 0,
                                 }}
                               >
-                                <div style={{ fontSize: 13, fontWeight: 600 }}>
-                                  {isCurrent ? "▶ " : `${idx + 1}. `}
-                                  {qItem.display_name}
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 5,
+                                    fontSize: 13,
+                                    fontWeight: 600,
+                                  }}
+                                >
+                                  {isCurrent ? <IconPlay size={12} /> : <span>{idx + 1}.</span>}
+                                  <span
+                                    style={{
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    {qItem.display_name}
+                                  </span>
                                 </div>
                                 <div
                                   style={{ fontSize: 11, color: "var(--text-tertiary)" }}
@@ -1889,7 +1930,7 @@ export function App(): React.ReactElement {
                                   setSnapshot(ipcClient.removeFromQueue(qItem.id))
                                 }
                               >
-                                ×
+                                <IconClose size={13} />
                               </button>
                             </div>
                           </div>
@@ -2131,17 +2172,11 @@ export function App(): React.ReactElement {
                       </button>
                       <button
                         type="button"
-                        className="btn-secondary"
-                        onClick={() => fileInputRef.current?.click()}
-                      >
-                        Choose local files…
-                      </button>
-                      <button
-                        type="button"
                         className="btn-primary"
-                        onClick={() => setIsOpenMediaModalOpen(true)}
+                        onClick={triggerOpenMediaPicker}
                       >
-                        ＋ Add media
+                        <IconPlus size={14} />
+                        <span>Add media</span>
                       </button>
                     </div>
                   </div>
@@ -2221,16 +2256,10 @@ export function App(): React.ReactElement {
                         <button
                           type="button"
                           className="btn-primary"
-                          onClick={() => fileInputRef.current?.click()}
+                          onClick={triggerOpenMediaPicker}
                         >
-                          ▣ Open your first file
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => setIsOpenMediaModalOpen(true)}
-                        >
-                          Enter file path…
+                          <IconFolderOpen size={14} />
+                          <span>Open your first file</span>
                         </button>
                       </div>
                     </div>
@@ -2293,11 +2322,15 @@ export function App(): React.ReactElement {
                                   {isMissing ? (
                                     <span
                                       style={{
+                                        display: "inline-flex",
+                                        alignItems: "center",
+                                        gap: 4,
                                         color: "var(--accent-text)",
                                         fontWeight: 600,
                                       }}
                                     >
-                                      Locate file →
+                                      <span>Locate file</span>
+                                      <IconArrowRight size={12} />
                                     </span>
                                   ) : (
                                     (item.last_opened_at ?? "Never")
@@ -2317,7 +2350,7 @@ export function App(): React.ReactElement {
                                       )
                                     }
                                   >
-                                    ⋯
+                                    <IconMoreHorizontal size={15} />
                                   </button>
                                   {openLibraryMenuId === item.id && (
                                     <div
@@ -2443,7 +2476,10 @@ export function App(): React.ReactElement {
                                       className="timestamp-pill tabular-nums"
                                       onClick={() => handleJumpToNote(note.id)}
                                     >
-                                      ▶ {formatDurationMs(note.position_ms)} — Jump to moment
+                                      <IconPlay size={10} />
+                                      <span>
+                                        {formatDurationMs(note.position_ms)} — Jump to moment
+                                      </span>
                                     </button>
                                   </div>
                                   <p style={{ margin: 0, fontSize: 12.5 }}>
@@ -2610,9 +2646,17 @@ export function App(): React.ReactElement {
                           type="button"
                           className="btn-primary"
                           style={{ flexShrink: 0 }}
-                          onClick={handleAddSourceButtonClick}
+                          disabled={isPickingSourceFolder}
+                          onClick={() => void handleAddSourceButtonClick()}
                         >
-                          ＋ Add a source
+                          {isPickingSourceFolder ? (
+                            <span>Opening disk…</span>
+                          ) : (
+                            <>
+                              <IconPlus size={14} />
+                              <span>Add a source</span>
+                            </>
+                          )}
                         </button>
                       </div>
 
@@ -2657,7 +2701,7 @@ export function App(): React.ReactElement {
                             }}
                           >
                             No trusted source folders configured yet. Click{" "}
-                            <strong>＋ Add a source</strong> above to import audio and video files.
+                            <strong>Add a source</strong> above to import audio and video files.
                           </div>
                         ) : (
                           <div className="source-folder-list">
@@ -2705,7 +2749,14 @@ export function App(): React.ReactElement {
                                     aria-label={`Rescan ${folder.label}`}
                                     onClick={() => void handleRescanSourceFolder(folder)}
                                   >
-                                    {rescanningFolderId === folder.id ? "Scanning…" : "↻ Sync"}
+                                    {rescanningFolderId === folder.id ? (
+                                      <span>Scanning…</span>
+                                    ) : (
+                                      <>
+                                        <IconRepeat size={13} />
+                                        <span>Sync</span>
+                                      </>
+                                    )}
                                   </button>
 
                                   <button
@@ -3022,9 +3073,16 @@ export function App(): React.ReactElement {
                       {backupStatusMessage && (
                         <div
                           role="status"
-                          style={{ fontSize: 12, color: "var(--accent-text)" }}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 12,
+                            color: "var(--accent-text)",
+                          }}
                         >
-                          ✓ {backupStatusMessage}
+                          <IconCheck size={13} />
+                          <span>{backupStatusMessage}</span>
                         </div>
                       )}
 
@@ -3165,15 +3223,17 @@ export function App(): React.ReactElement {
               <button
                 type="button"
                 className="btn-secondary"
+                aria-label="Close note composer"
                 onClick={() => setIsNoteModalOpen(false)}
               >
-                ✕
+                <IconClose size={14} />
               </button>
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span className="timestamp-pill tabular-nums">
-                ▶ {formatDurationMs(capturedTimestampMs)}
+                <IconPlay size={10} />
+                <span>{formatDurationMs(capturedTimestampMs)}</span>
               </span>
               <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
                 Captured timestamp
@@ -3273,54 +3333,6 @@ export function App(): React.ReactElement {
         </div>
       )}
 
-      {/* Open Media Dialog */}
-      {isOpenMediaModalOpen && (
-        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Open media file">
-          <form className="modal-dialog" onSubmit={handleOpenMediaSubmit}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <h2 style={{ margin: 0, fontSize: 17 }}>Open local media file</h2>
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                Browse disk…
-              </button>
-            </div>
-            <p style={{ margin: 0, fontSize: 12, color: "var(--text-tertiary)" }}>
-              Supported formats: MP4 (H.264), WebM (VP8/VP9), WAV, FLAC, Ogg/Opus, MP3, M4A.
-            </p>
-            <input
-              type="text"
-              aria-label="Media file path"
-              placeholder="/path/to/local-media.mp4"
-              value={openPathDraft}
-              onChange={(e) => setOpenPathDraft(e.target.value)}
-              style={{
-                width: "100%",
-                padding: "10px 12px",
-                borderRadius: 8,
-                border: "1px solid var(--border-control)",
-                background: "var(--bg-inset)",
-                color: "var(--text-primary)",
-              }}
-            />
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => setIsOpenMediaModalOpen(false)}
-              >
-                Cancel
-              </button>
-              <button type="submit" className="btn-primary">
-                Open file
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
       {/* Add Media Item to Playlist Modal */}
       {addToPlaylistTarget && (
         <AddToPlaylistModal
@@ -3352,9 +3364,10 @@ export function App(): React.ReactElement {
                 type="button"
                 className="btn-secondary"
                 style={{ width: 30, height: 30, padding: 0 }}
+                aria-label="Close modal"
                 onClick={() => setIsSaveQueueModalOpen(false)}
               >
-                ✕
+                <IconClose size={14} />
               </button>
             </div>
             <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-tertiary)" }}>
@@ -3396,14 +3409,6 @@ export function App(): React.ReactElement {
             </div>
           </form>
         </div>
-      )}
-
-      {/* Trusted Local Source Folder Browser & Confirmation Dialog */}
-      {isSourceDialogOpen && (
-        <SourceFolderDialog
-          onAdded={handleSourceFolderAdded}
-          onClose={() => setIsSourceDialogOpen(false)}
-        />
       )}
 
       {/* Software Update Dialog */}

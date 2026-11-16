@@ -16,11 +16,20 @@ pub const MIN_PLAYBACK_RATE: f64 = 0.5;
 /// Maximum supported playback speed multiplier.
 pub const MAX_PLAYBACK_RATE: f64 = 2.0;
 
+/// Maximum UTF-8 character count allowed for playlist names.
+pub const MAX_PLAYLIST_NAME_CHARS: usize = 120;
+
+/// Maximum UTF-8 character count allowed for playlist descriptions.
+pub const MAX_PLAYLIST_DESCRIPTION_CHARS: usize = 500;
+
 /// Stable application-generated identifier for a media library record.
 pub type MediaId = String;
 
 /// Stable application-generated identifier for a timestamped note.
 pub type NoteId = String;
+
+/// Stable application-generated identifier for a user playlist.
+pub type PlaylistId = String;
 
 /// High-level media presentation kind (`Video` vs `Audio`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,8 +290,18 @@ fn default_true() -> bool {
     true
 }
 
-fn default_github_release_repo() -> String {
-    DEFAULT_GITHUB_RELEASE_REPO.to_owned()
+/// A local folder configured by the user as a trusted source of audio/video files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedSourceFolder {
+    pub id: String,
+    pub path: String,
+    pub label: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub added_at: String,
+    pub last_scanned_at: String,
+    #[serde(default)]
+    pub media_count: usize,
 }
 
 /// Persisted user preferences (`Frame 4:441`).
@@ -296,12 +315,12 @@ pub struct AppSettings {
     pub window_mode: WindowMode,
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
-    #[serde(default = "default_github_release_repo")]
-    pub github_release_repo: String,
     #[serde(default)]
     pub installed_version: Option<String>,
     #[serde(default)]
     pub dismissed_update_version: Option<String>,
+    #[serde(default)]
+    pub source_folders: Vec<TrustedSourceFolder>,
 }
 
 impl Default for AppSettings {
@@ -314,9 +333,9 @@ impl Default for AppSettings {
             timestamp_precision: TimestampPrecision::NearestSecond,
             window_mode: WindowMode::Full,
             auto_check_updates: true,
-            github_release_repo: default_github_release_repo(),
             installed_version: None,
             dismissed_update_version: None,
+            source_folders: Vec::new(),
         }
     }
 }
@@ -358,9 +377,38 @@ pub struct CleanupSummaryDto {
     pub bytes_reclaimed: u64,
 }
 
+/// A user-curated ordered playlist of local media items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Playlist {
+    pub id: PlaylistId,
+    pub name: String,
+    pub description: String,
+    pub item_ids: Vec<MediaId>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input payload for creating a new playlist (`0002_playlists`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePlaylistInput {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub initial_item_ids: Vec<MediaId>,
+}
+
+/// Input payload for updating a playlist's name and description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdatePlaylistInput {
+    pub id: PlaylistId,
+    pub name: String,
+    pub description: String,
+}
+
 /// Redacted, user-reviewable diagnostic report (`docs/SECURITY.md`).
 ///
-/// Never includes file paths, user home directories, or note bodies.
+/// Never includes file paths, user home directories, playlist titles, or note bodies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticReport {
     pub app_version: String,
@@ -370,6 +418,8 @@ pub struct DiagnosticReport {
     pub media_count: usize,
     pub missing_media_count: usize,
     pub total_note_count: usize,
+    #[serde(default)]
+    pub playlist_count: usize,
     pub playback_state: PlaybackState,
     pub last_error_code: Option<String>,
     pub generated_at: String,

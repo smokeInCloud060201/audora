@@ -3,8 +3,9 @@
 use std::path::Path;
 
 use crate::domain::models::{
-    AppSettings, Availability, CreateNoteInput, LibraryFilter, MediaItem, MediaKind, Note, NoteId,
-    PlaybackState, UpdateNoteInput,
+    AppSettings, Availability, CreateNoteInput, CreatePlaylistInput, LibraryFilter, MediaId,
+    MediaItem, MediaKind, Note, NoteId, PlaybackState, Playlist, PlaylistId, UpdateNoteInput,
+    UpdatePlaylistInput,
 };
 use crate::error::AppResult;
 
@@ -97,4 +98,37 @@ pub trait NotesRepository: Send + Sync {
 pub trait SettingsRepository: Send + Sync {
     fn load_settings(&self) -> AppResult<AppSettings>;
     fn save_settings(&self, settings: &AppSettings, now_iso: &str) -> AppResult<()>;
+}
+
+/// Persistence contract for user playlists and ordered playlist items.
+pub trait PlaylistRepository: Send + Sync {
+    fn create_playlist(
+        &self,
+        id: PlaylistId,
+        input: &CreatePlaylistInput,
+        now_iso: &str,
+    ) -> AppResult<Playlist>;
+    fn get_playlist(&self, id: &str) -> AppResult<Option<Playlist>>;
+    fn list_playlists(&self) -> AppResult<Vec<Playlist>>;
+    fn update_playlist(&self, input: &UpdatePlaylistInput, now_iso: &str) -> AppResult<Playlist>;
+    fn delete_playlist(&self, id: &str) -> AppResult<bool>;
+    fn add_items_to_playlist(
+        &self,
+        playlist_id: &str,
+        media_ids: &[MediaId],
+        now_iso: &str,
+    ) -> AppResult<Playlist>;
+    fn remove_item_from_playlist(
+        &self,
+        playlist_id: &str,
+        media_id: &str,
+        now_iso: &str,
+    ) -> AppResult<Playlist>;
+    fn move_playlist_item(
+        &self,
+        playlist_id: &str,
+        media_id: &str,
+        target_index: usize,
+        now_iso: &str,
+    ) -> AppResult<Playlist>;
 }

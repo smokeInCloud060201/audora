@@ -4,15 +4,21 @@ import type {
   AppUpdateStatusDto,
   CleanupSummaryDto,
   CreateNoteInput,
+  CreatePlaylistInput,
   DiagnosticReport,
   LibraryFilter,
   LibrarySearchResult,
+  LocalDirectoryListing,
   MediaItem,
   Note,
   PlaybackCommand,
   PlaybackSnapshot,
+  Playlist,
   ReleaseManifestDto,
+  SourceFolderPreview,
+  TrustedSourceFolder,
   UpdateNoteInput,
+  UpdatePlaylistInput,
   WindowMode,
 } from "../types/domain";
 
@@ -20,7 +26,6 @@ const STORAGE_KEY = "audora.state.v2";
 const LEGACY_STORAGE_KEY = "audora.state.v1";
 const MANIFEST_STORAGE_KEY = "audora.update.manifest.v1";
 export const DEFAULT_GITHUB_RELEASE_REPO = "smokeInCloud060201/audora";
-const LEGACY_GITHUB_RELEASE_REPO = "karsontang/audora";
 const BASE_APP_VERSION: string =
   (typeof import.meta !== "undefined" &&
     (import.meta.env?.VITE_APP_VERSION as string | undefined)?.trim()) ||
@@ -101,9 +106,9 @@ const INITIAL_SETTINGS: AppSettings = {
   timestamp_precision: "nearest_second",
   window_mode: "full",
   auto_check_updates: true,
-  github_release_repo: DEFAULT_GITHUB_RELEASE_REPO,
   installed_version: BASE_APP_VERSION,
   dismissed_update_version: null,
+  source_folders: [],
 };
 
 function createIdleSnapshot(rate = 1.0): PlaybackSnapshot {
@@ -126,6 +131,7 @@ function createIdleSnapshot(rate = 1.0): PlaybackSnapshot {
 interface PersistedState {
   media: MediaItem[];
   notes: Note[];
+  playlists?: Playlist[];
   settings: AppSettings;
 }
 
@@ -140,6 +146,7 @@ export interface LocalFileDescriptor {
 export class AudoraIpcClient {
   private media: MediaItem[] = [];
   private notes: Note[] = [];
+  private playlists: Playlist[] = [];
   private settings: AppSettings = structuredClone(INITIAL_SETTINGS);
   private stagedManifest: ReleaseManifestDto | null = null;
   private hydratedFromNative = false;
@@ -162,8 +169,8 @@ export class AudoraIpcClient {
       }
       this.media = filteredMedia;
     }
+    const validMediaIds = new Set(this.media.map((m) => m.id));
     if (Array.isArray(parsed.notes)) {
-      const validMediaIds = new Set(this.media.map((m) => m.id));
       const filteredNotes = parsed.notes.filter(
         (n) =>
           !LEGACY_MOCK_NOTE_IDS.has(n.id) &&
@@ -175,28 +182,61 @@ export class AudoraIpcClient {
       }
       this.notes = filteredNotes;
     }
+    if (Array.isArray(parsed.playlists)) {
+      this.playlists = parsed.playlists.map((pl) => ({
+        id: pl.id,
+        name: pl.name,
+        description: pl.description ?? "",
+        item_ids: Array.isArray(pl.item_ids)
+          ? Array.from(new Set(pl.item_ids)).filter((id) => validMediaIds.has(id))
+          : [],
+        created_at: pl.created_at || "Just now",
+        updated_at: pl.updated_at || "Just now",
+      }));
+    } else {
+      this.playlists = [];
+    }
     if (parsed.settings) {
-      const migratedRepo =
-        !parsed.settings.github_release_repo ||
-        parsed.settings.github_release_repo.trim() === "" ||
-        parsed.settings.github_release_repo.trim() === LEGACY_GITHUB_RELEASE_REPO
-          ? DEFAULT_GITHUB_RELEASE_REPO
-          : parsed.settings.github_release_repo.trim();
       const persistedInstalled = parsed.settings.installed_version;
       const effectiveInstalled =
         persistedInstalled && compareSemver(persistedInstalled, BASE_APP_VERSION) > 0
           ? persistedInstalled
           : BASE_APP_VERSION;
+      const normalizedFolders = Array.isArray(parsed.settings.source_folders)
+        ? parsed.settings.source_folders.map((f) => ({
+            id: f.id,
+            path: f.path,
+            label: f.label || (f.path.split(/[\\/]/).pop() ?? f.path),
+            enabled: f.enabled !== false,
+            added_at: f.added_at || "Just now",
+            last_scanned_at: f.last_scanned_at || "Just now",
+            media_count: this.media.filter((m) => m.source_folder_id === f.id).length,
+          }))
+        : [];
+      const rawSettings = { ...(parsed.settings as AppSettings & { github_release_repo?: unknown }) };
+      if ("github_release_repo" in rawSettings) {
+        delete rawSettings.github_release_repo;
+        strippedLegacyMock = true;
+      }
       this.settings = {
         ...INITIAL_SETTINGS,
-        ...parsed.settings,
-        github_release_repo: migratedRepo,
+        ...rawSettings,
         installed_version: effectiveInstalled,
+        source_folders: normalizedFolders,
       };
     }
 
+    const disabledFolderIds = new Set(
+      (this.settings.source_folders ?? [])
+        .filter((f) => !f.enabled)
+        .map((f) => f.id),
+    );
     const availableIds = this.media
-      .filter((m) => m.availability === "available")
+      .filter(
+        (m) =>
+          m.availability === "available" &&
+          (!m.source_folder_id || !disabledFolderIds.has(m.source_folder_id)),
+      )
       .map((m) => m.id);
     if (availableIds.length > 0) {
       const first = this.media.find((m) => m.id === availableIds[0])!;
@@ -281,6 +321,7 @@ export class AudoraIpcClient {
       // Strip transient blob object URLs before persisting
       media: this.media.map(({ stream_url: _stream, ...rest }) => rest),
       notes: this.notes,
+      playlists: this.playlists,
       settings: this.settings,
     };
     const serialized = JSON.stringify(payload);
@@ -742,7 +783,17 @@ export class AudoraIpcClient {
 
   public searchLibrary(query: string, filter: LibraryFilter): LibrarySearchResult {
     const q = query.trim().toLowerCase();
-    const mediaItems = this.media
+    const disabledFolderIds = new Set(
+      (this.settings.source_folders ?? [])
+        .filter((f) => !f.enabled)
+        .map((f) => f.id),
+    );
+    const visibleMedia = this.media.filter(
+      (m) => !m.source_folder_id || !disabledFolderIds.has(m.source_folder_id),
+    );
+    const visibleIds = new Set(visibleMedia.map((m) => m.id));
+
+    const mediaItems = visibleMedia
       .map((m) => ({
         ...m,
         note_count: this.notes.filter((n) => n.media_id === m.id).length,
@@ -764,7 +815,8 @@ export class AudoraIpcClient {
     const matchingNotes = q
       ? this.notes
           .filter((n) => {
-            const parent = this.media.find((m) => m.id === n.media_id);
+            if (!visibleIds.has(n.media_id)) return false;
+            const parent = visibleMedia.find((m) => m.id === n.media_id);
             if (!parent) return false;
             if (filter !== "all" && parent.media_kind !== filter) return false;
             return (
@@ -873,8 +925,11 @@ export class AudoraIpcClient {
         "Selected note no longer exists.",
       );
     }
-    this.selectMediaById(note.media_id);
-    return this.playbackCommand({ action: "seek", position_ms: note.position_ms });
+    if (this.snapshot.media_id !== note.media_id) {
+      this.selectMediaById(note.media_id);
+    }
+    this.playbackCommand({ action: "seek", position_ms: note.position_ms });
+    return this.playbackCommand({ action: "play" });
   }
 
   /**
@@ -955,9 +1010,15 @@ export class AudoraIpcClient {
   public removeMedia(mediaId: string): boolean {
     const idx = this.media.findIndex((m) => m.id === mediaId);
     if (idx < 0) return false;
-    this.media.splice(idx, 1);
+    const [removedItem] = this.media.splice(idx, 1);
     this.notes = this.notes.filter((n) => n.media_id !== mediaId);
+    for (const pl of this.playlists) {
+      pl.item_ids = pl.item_ids.filter((id) => id !== mediaId);
+    }
     this.snapshot.queue = this.snapshot.queue.filter((id) => id !== mediaId);
+    if (removedItem?.source_folder_id && this.settings.source_folders) {
+      this.recomputeSourceFolderCounts();
+    }
     if (this.snapshot.media_id === mediaId) {
       const nextAvailable = this.snapshot.queue.find((id) =>
         this.media.some((m) => m.id === id && m.availability === "available"),
@@ -970,6 +1031,514 @@ export class AudoraIpcClient {
     }
     this.persistToStorage();
     return true;
+  }
+
+  private normalizeFolderPath(rawPath: string): string {
+    const trimmed = this.validateLocalMediaPath(rawPath);
+    if (trimmed.length > 1) {
+      const stripped = trimmed.replace(/[\\/]+$/, "");
+      return stripped || trimmed;
+    }
+    return trimmed;
+  }
+
+  private recomputeSourceFolderCounts(): void {
+    const folders = this.settings.source_folders ?? [];
+    for (const folder of folders) {
+      folder.media_count = this.media.filter(
+        (m) => m.source_folder_id === folder.id,
+      ).length;
+    }
+  }
+
+  public getSourceFolders(): TrustedSourceFolder[] {
+    this.recomputeSourceFolderCounts();
+    return structuredClone(this.settings.source_folders ?? []);
+  }
+
+  /**
+   * Adds or updates a trusted local source folder (`Spotify Local Files` workflow),
+   * importing all supported audio and video files discovered inside it without failing on non-media files.
+   */
+  public addSourceFolderWithFiles(
+    rawFolderPath: string,
+    files: LocalFileDescriptor[],
+    explicitLabel?: string,
+  ): { folder: TrustedSourceFolder; importedCount: number } {
+    const normalizedPath = this.normalizeFolderPath(rawFolderPath);
+    const inferredLabel =
+      explicitLabel?.trim() ||
+      normalizedPath.split(/[\\/]/).filter(Boolean).pop() ||
+      normalizedPath;
+
+    const folders = this.settings.source_folders ?? [];
+    let folder = folders.find(
+      (f) => f.path.toLowerCase() === normalizedPath.toLowerCase(),
+    );
+    if (!folder) {
+      folder = {
+        id: `src_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        path: normalizedPath,
+        label: inferredLabel,
+        enabled: true,
+        added_at: "Just now",
+        last_scanned_at: "Just now",
+        media_count: 0,
+      };
+      folders.push(folder);
+      this.settings.source_folders = folders;
+    } else {
+      folder.enabled = true;
+      folder.last_scanned_at = "Just now";
+      if (explicitLabel?.trim()) {
+        folder.label = explicitLabel.trim();
+      }
+    }
+
+    const supportedVideo = ["mp4", "m4v", "mov", "webm", "mkv"];
+    const supportedAudio = ["wav", "flac", "ogg", "opus", "mp3", "m4a", "aac"];
+    let importedCount = 0;
+
+    for (const f of files) {
+      const rawItemPath =
+        f.path && f.path.trim()
+          ? f.path.trim()
+          : `${normalizedPath}/${f.name}`;
+      const fileName = rawItemPath.split(/[\\/]/).pop() ?? f.name;
+      const ext = fileName.includes(".")
+        ? (fileName.split(".").pop()?.toLowerCase() ?? "")
+        : "";
+      if (!supportedVideo.includes(ext) && !supportedAudio.includes(ext)) {
+        continue;
+      }
+
+      const streamUrl =
+        f.streamUrl ??
+        (isBrowserRuntime() &&
+        (window.location.hostname === "127.0.0.1" ||
+          window.location.hostname === "localhost") &&
+        (rawItemPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawItemPath))
+          ? `/__audora_media?path=${encodeURIComponent(rawItemPath)}`
+          : undefined);
+
+      const existing = this.media.find((m) => m.path === rawItemPath);
+      if (!existing) {
+        const created: MediaItem = {
+          id: `med_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          path: rawItemPath,
+          display_name: fileName,
+          media_kind: supportedVideo.includes(ext) ? "video" : "audio",
+          duration_ms: f.durationMs ?? null,
+          last_position_ms: 0,
+          completed: false,
+          file_size_bytes: f.size ?? null,
+          fingerprint: null,
+          availability: "available",
+          added_at: "Just now",
+          last_opened_at: null,
+          last_seen_at: "Just now",
+          note_count: 0,
+          source_folder_id: folder.id,
+          stream_url: streamUrl,
+        };
+        this.media.push(created);
+        if (!this.snapshot.queue.includes(created.id)) {
+          this.snapshot.queue.push(created.id);
+        }
+        importedCount += 1;
+      } else {
+        if (!existing.source_folder_id) {
+          existing.source_folder_id = folder.id;
+        }
+        existing.availability = "available";
+        existing.last_seen_at = "Just now";
+        if (streamUrl && !existing.stream_url) {
+          existing.stream_url = streamUrl;
+        }
+        if (!this.snapshot.queue.includes(existing.id)) {
+          this.snapshot.queue.push(existing.id);
+        }
+      }
+    }
+
+    // Link any already-known media items residing inside this folder path
+    const prefixSlash = `${normalizedPath}/`;
+    const prefixBackslash = `${normalizedPath}\\`;
+    for (const m of this.media) {
+      if (
+        !m.source_folder_id &&
+        (m.path.startsWith(prefixSlash) || m.path.startsWith(prefixBackslash))
+      ) {
+        m.source_folder_id = folder.id;
+      }
+    }
+
+    if (!this.snapshot.media_id && this.snapshot.queue.length > 0) {
+      const firstAvailable = this.media.find(
+        (m) =>
+          m.availability === "available" &&
+          this.snapshot.queue.includes(m.id),
+      );
+      if (firstAvailable) {
+        this.selectMediaById(firstAvailable.id);
+      }
+    }
+
+    this.recomputeSourceFolderCounts();
+    this.persistToStorage();
+    return {
+      folder: structuredClone(folder),
+      importedCount,
+    };
+  }
+
+  public async scanAndAddSourceFolderPath(
+    rawFolderPath: string,
+  ): Promise<{ folder: TrustedSourceFolder; importedCount: number }> {
+    const normalizedPath = this.normalizeFolderPath(rawFolderPath);
+    if (
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost")
+    ) {
+      try {
+        const res = await fetch(
+          `/__audora_scan_folder?path=${encodeURIComponent(normalizedPath)}`,
+        );
+        const text = await res.text();
+        if (text.trim().startsWith("{")) {
+          const payload = JSON.parse(text) as {
+            ok?: boolean;
+            message?: string;
+            folder_path?: string;
+            folder_name?: string;
+            files?: Array<{ path: string; name: string; size: number }>;
+          };
+          if (!payload.ok) {
+            throw this.makeError(
+              "AV-101",
+              "MediaUnavailable",
+              "Source folder not found",
+              payload.message ??
+                "The selected local folder does not exist or could not be read.",
+            );
+          }
+          const descriptors: LocalFileDescriptor[] = (payload.files ?? []).map(
+            (f) => ({
+              name: f.name,
+              path: f.path,
+              size: f.size,
+            }),
+          );
+          return this.addSourceFolderWithFiles(
+            payload.folder_path || normalizedPath,
+            descriptors,
+            payload.folder_name,
+          );
+        }
+      } catch (err) {
+        if (err && typeof err === "object" && "code" in err) {
+          throw err;
+        }
+        // Running on Vite dev server without native `/__audora_scan_folder`; register folder record cleanly.
+      }
+    }
+    return this.addSourceFolderWithFiles(normalizedPath, []);
+  }
+
+  public async browseLocalDirectories(
+    targetPath?: string,
+  ): Promise<LocalDirectoryListing> {
+    if (
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost")
+    ) {
+      const query = targetPath?.trim()
+        ? `?path=${encodeURIComponent(targetPath.trim())}`
+        : "";
+      const res = await fetch(`/__audora_browse_dirs${query}`);
+      const text = await res.text();
+      if (text.trim().startsWith("{")) {
+        const payload = JSON.parse(text) as {
+          ok?: boolean;
+          message?: string;
+          current_path?: string;
+          parent_path?: string | null;
+          folder_name?: string;
+          direct_media_count?: number;
+          roots?: Array<{ label: string; path: string }>;
+          directories?: Array<{ name: string; path: string }>;
+        };
+        if (!payload.ok || !payload.current_path) {
+          throw this.makeError(
+            "AV-101",
+            "MediaUnavailable",
+            "Directory unavailable",
+            payload.message ?? "Unable to read the selected local folder.",
+          );
+        }
+        return {
+          current_path: payload.current_path,
+          parent_path: payload.parent_path ?? null,
+          folder_name: payload.folder_name || payload.current_path,
+          direct_media_count: payload.direct_media_count ?? 0,
+          roots: payload.roots ?? [],
+          directories: payload.directories ?? [],
+        };
+      }
+    }
+    throw this.makeError(
+      "AV-101",
+      "MediaUnavailable",
+      "Local directory browser unavailable",
+      "Run Audora desktop or local dev server to browse local folders.",
+    );
+  }
+
+  public async previewSourceFolder(
+    rawFolderPath: string,
+  ): Promise<SourceFolderPreview> {
+    const normalizedPath = this.normalizeFolderPath(rawFolderPath);
+    const supportedVideo = new Set(["mp4", "m4v", "mov", "webm", "mkv"]);
+    if (
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost")
+    ) {
+      const res = await fetch(
+        `/__audora_scan_folder?path=${encodeURIComponent(normalizedPath)}`,
+      );
+      const text = await res.text();
+      if (text.trim().startsWith("{")) {
+        const payload = JSON.parse(text) as {
+          ok?: boolean;
+          message?: string;
+          folder_path?: string;
+          folder_name?: string;
+          files?: Array<{ path: string; name: string; size: number }>;
+        };
+        if (!payload.ok) {
+          throw this.makeError(
+            "AV-101",
+            "MediaUnavailable",
+            "Source folder not found",
+            payload.message ??
+              "The selected local folder does not exist or could not be read.",
+          );
+        }
+        const files = payload.files ?? [];
+        let videoCount = 0;
+        let audioCount = 0;
+        for (const f of files) {
+          const ext = f.name.includes(".")
+            ? (f.name.split(".").pop()?.toLowerCase() ?? "")
+            : "";
+          if (supportedVideo.has(ext)) {
+            videoCount += 1;
+          } else {
+            audioCount += 1;
+          }
+        }
+        return {
+          folder_path: payload.folder_path || normalizedPath,
+          folder_name:
+            payload.folder_name ||
+            normalizedPath.split(/[\\/]/).filter(Boolean).pop() ||
+            normalizedPath,
+          files,
+          video_count: videoCount,
+          audio_count: audioCount,
+        };
+      }
+    }
+    return {
+      folder_path: normalizedPath,
+      folder_name:
+        normalizedPath.split(/[\\/]/).filter(Boolean).pop() || normalizedPath,
+      files: [],
+      video_count: 0,
+      audio_count: 0,
+    };
+  }
+
+  public confirmSourceFolderImport(
+    preview: SourceFolderPreview,
+  ): { folder: TrustedSourceFolder; importedCount: number } {
+    const descriptors: LocalFileDescriptor[] = preview.files.map((f) => ({
+      name: f.name,
+      path: f.path,
+      size: f.size,
+    }));
+    return this.addSourceFolderWithFiles(
+      preview.folder_path,
+      descriptors,
+      preview.folder_name,
+    );
+  }
+
+  public async rescanSourceFolder(
+    folderId: string,
+  ): Promise<{ folder: TrustedSourceFolder; importedCount: number }> {
+    const folder = (this.settings.source_folders ?? []).find(
+      (f) => f.id === folderId,
+    );
+    if (!folder) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Source folder not found",
+        "Selected source folder no longer exists.",
+      );
+    }
+    return this.scanAndAddSourceFolderPath(folder.path);
+  }
+
+  public async syncEnabledSourceFolders(): Promise<number> {
+    const enabledFolders = (this.settings.source_folders ?? []).filter(
+      (f) => f.enabled,
+    );
+    let totalImported = 0;
+    for (const folder of enabledFolders) {
+      try {
+        const res = await this.scanAndAddSourceFolderPath(folder.path);
+        totalImported += res.importedCount;
+      } catch {
+        // Ignore temporarily disconnected external drives during startup sync.
+      }
+    }
+    return totalImported;
+  }
+
+  public toggleSourceFolder(
+    folderId: string,
+    enabled: boolean,
+  ): TrustedSourceFolder {
+    const folder = (this.settings.source_folders ?? []).find(
+      (f) => f.id === folderId,
+    );
+    if (!folder) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Source folder not found",
+        "Selected source folder no longer exists.",
+      );
+    }
+    folder.enabled = enabled;
+    if (!enabled) {
+      const hiddenIds = new Set(
+        this.media
+          .filter((m) => m.source_folder_id === folderId)
+          .map((m) => m.id),
+      );
+      this.snapshot.queue = this.snapshot.queue.filter(
+        (id) => !hiddenIds.has(id),
+      );
+      if (this.snapshot.media_id && hiddenIds.has(this.snapshot.media_id)) {
+        const nextAvailable = this.snapshot.queue.find((id) =>
+          this.media.some(
+            (m) => m.id === id && m.availability === "available",
+          ),
+        );
+        if (nextAvailable) {
+          this.selectMediaById(nextAvailable);
+        } else {
+          this.snapshot = createIdleSnapshot(
+            this.settings.default_playback_speed,
+          );
+        }
+      }
+    } else {
+      for (const m of this.media) {
+        if (
+          m.source_folder_id === folderId &&
+          m.availability === "available" &&
+          !this.snapshot.queue.includes(m.id)
+        ) {
+          this.snapshot.queue.push(m.id);
+        }
+      }
+    }
+    this.recomputeSourceFolderCounts();
+    this.persistToStorage();
+    return structuredClone(folder);
+  }
+
+  /**
+   * Deletes a trusted source folder from Settings (Spotify Local Sources style).
+   * Removes un-annotated library items imported from that folder while preserving any items
+   * that have user-created timestamped notes, and never modifies or deletes files on disk.
+   */
+  public removeSourceFolder(folderId: string): {
+    removed: boolean;
+    folderLabel: string;
+    removedMediaCount: number;
+    preservedNotedCount: number;
+  } {
+    const folders = this.settings.source_folders ?? [];
+    const idx = folders.findIndex((f) => f.id === folderId);
+    if (idx < 0) {
+      return {
+        removed: false,
+        folderLabel: "",
+        removedMediaCount: 0,
+        preservedNotedCount: 0,
+      };
+    }
+    const [removedFolder] = folders.splice(idx, 1);
+    this.settings.source_folders = folders;
+
+    const notedMediaIds = new Set(this.notes.map((n) => n.media_id));
+    let removedMediaCount = 0;
+    let preservedNotedCount = 0;
+    const removedIds = new Set<string>();
+
+    this.media = this.media.filter((m) => {
+      if (m.source_folder_id !== folderId) {
+        return true;
+      }
+      if (notedMediaIds.has(m.id)) {
+        m.source_folder_id = null;
+        preservedNotedCount += 1;
+        return true;
+      }
+      removedIds.add(m.id);
+      removedMediaCount += 1;
+      return false;
+    });
+
+    if (removedIds.size > 0) {
+      for (const pl of this.playlists) {
+        pl.item_ids = pl.item_ids.filter((id) => !removedIds.has(id));
+      }
+      this.snapshot.queue = this.snapshot.queue.filter(
+        (id) => !removedIds.has(id),
+      );
+      if (this.snapshot.media_id && removedIds.has(this.snapshot.media_id)) {
+        const nextAvailable = this.snapshot.queue.find((id) =>
+          this.media.some(
+            (m) => m.id === id && m.availability === "available",
+          ),
+        );
+        if (nextAvailable) {
+          this.selectMediaById(nextAvailable);
+        } else {
+          this.snapshot = createIdleSnapshot(
+            this.settings.default_playback_speed,
+          );
+        }
+      }
+    }
+
+    this.recomputeSourceFolderCounts();
+    this.persistToStorage();
+    return {
+      removed: true,
+      folderLabel: removedFolder.label,
+      removedMediaCount,
+      preservedNotedCount,
+    };
   }
 
   public handleAudioRouteDisconnected(): PlaybackSnapshot {
@@ -987,6 +1556,7 @@ export class AudoraIpcClient {
         const payload: PersistedState = {
           media: this.media.map(({ stream_url: _stream, ...rest }) => rest),
           notes: this.notes,
+          playlists: this.playlists,
           settings: this.settings,
         };
         window.localStorage.setItem(backupKey, JSON.stringify(payload));
@@ -997,19 +1567,301 @@ export class AudoraIpcClient {
     return "~/Library/Application Support/com.audora.desktop/audora.sqlite.manual.bak";
   }
 
+  // =========================================================================
+  // Multi-Playlist Management (`0002_playlists`)
+  // =========================================================================
+
+  private disabledSourceFolderIds(): Set<string> {
+    return new Set(
+      (this.settings.source_folders ?? [])
+        .filter((f) => !f.enabled)
+        .map((f) => f.id),
+    );
+  }
+
+  public listPlaylists(): Playlist[] {
+    const disabledFolders = this.disabledSourceFolderIds();
+    const visibleMediaIds = new Set(
+      this.media
+        .filter(
+          (m) =>
+            !m.source_folder_id || !disabledFolders.has(m.source_folder_id),
+        )
+        .map((m) => m.id),
+    );
+    return structuredClone(
+      this.playlists.map((pl) => ({
+        ...pl,
+        item_ids: pl.item_ids.filter((id) => visibleMediaIds.has(id)),
+      })),
+    );
+  }
+
+  public getPlaylist(playlistId: string): Playlist | null {
+    const found = this.listPlaylists().find((pl) => pl.id === playlistId);
+    return found ?? null;
+  }
+
+  public createPlaylist(input: CreatePlaylistInput): Playlist {
+    const trimmedName = input.name.trim();
+    if (!trimmedName) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist name required",
+        "Enter a name for your playlist before saving.",
+      );
+    }
+    if (trimmedName.length > 120) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist name too long",
+        "Playlist name must be 120 characters or fewer.",
+      );
+    }
+    const trimmedDesc = (input.description ?? "").trim();
+    if (trimmedDesc.length > 500) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Description too long",
+        "Playlist description must be 500 characters or fewer.",
+      );
+    }
+
+    const validIds = new Set(this.media.map((m) => m.id));
+    const dedupedInitial = Array.from(new Set(input.initial_item_ids ?? [])).filter(
+      (id) => validIds.has(id),
+    );
+
+    const created: Playlist = {
+      id: `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name: trimmedName,
+      description: trimmedDesc,
+      item_ids: dedupedInitial,
+      created_at: "Just now",
+      updated_at: "Just now",
+    };
+    this.playlists.unshift(created);
+    this.persistToStorage();
+    return structuredClone(created);
+  }
+
+  public updatePlaylist(input: UpdatePlaylistInput): Playlist {
+    const trimmedName = input.name.trim();
+    if (!trimmedName) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist name required",
+        "Playlist name cannot be empty.",
+      );
+    }
+    if (trimmedName.length > 120) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist name too long",
+        "Playlist name must be 120 characters or fewer.",
+      );
+    }
+    const trimmedDesc = input.description.trim();
+    if (trimmedDesc.length > 500) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Description too long",
+        "Playlist description must be 500 characters or fewer.",
+      );
+    }
+
+    const target = this.playlists.find((pl) => pl.id === input.id);
+    if (!target) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist not found",
+        "Selected playlist no longer exists.",
+      );
+    }
+    target.name = trimmedName;
+    target.description = trimmedDesc;
+    target.updated_at = "Just now";
+    this.persistToStorage();
+    return structuredClone(target);
+  }
+
+  public deletePlaylist(playlistId: string): Playlist | null {
+    const idx = this.playlists.findIndex((pl) => pl.id === playlistId);
+    if (idx < 0) return null;
+    const [removed] = this.playlists.splice(idx, 1);
+    this.persistToStorage();
+    return structuredClone(removed);
+  }
+
+  public restorePlaylist(playlist: Playlist): Playlist {
+    const validIds = new Set(this.media.map((m) => m.id));
+    const restored: Playlist = {
+      ...structuredClone(playlist),
+      item_ids: playlist.item_ids.filter((id) => validIds.has(id)),
+    };
+    const existingIdx = this.playlists.findIndex((p) => p.id === restored.id);
+    if (existingIdx >= 0) {
+      this.playlists[existingIdx] = restored;
+    } else {
+      this.playlists.unshift(restored);
+    }
+    this.persistToStorage();
+    return structuredClone(restored);
+  }
+
+  public addMediaToPlaylist(playlistId: string, mediaIds: string[]): Playlist {
+    const target = this.playlists.find((pl) => pl.id === playlistId);
+    if (!target) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist not found",
+        "Selected playlist no longer exists.",
+      );
+    }
+    const validIds = new Set(this.media.map((m) => m.id));
+    for (const id of mediaIds) {
+      if (validIds.has(id) && !target.item_ids.includes(id)) {
+        target.item_ids.push(id);
+      }
+    }
+    target.updated_at = "Just now";
+    this.persistToStorage();
+    return structuredClone(target);
+  }
+
+  public removeMediaFromPlaylist(playlistId: string, mediaId: string): Playlist {
+    const target = this.playlists.find((pl) => pl.id === playlistId);
+    if (!target) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist not found",
+        "Selected playlist no longer exists.",
+      );
+    }
+    target.item_ids = target.item_ids.filter((id) => id !== mediaId);
+    target.updated_at = "Just now";
+    this.persistToStorage();
+    return structuredClone(target);
+  }
+
+  public movePlaylistItem(
+    playlistId: string,
+    mediaId: string,
+    targetIndex: number,
+  ): Playlist {
+    const target = this.playlists.find((pl) => pl.id === playlistId);
+    if (!target) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist not found",
+        "Selected playlist no longer exists.",
+      );
+    }
+    const currIdx = target.item_ids.indexOf(mediaId);
+    if (currIdx >= 0) {
+      target.item_ids.splice(currIdx, 1);
+      const bounded = Math.max(0, Math.min(targetIndex, target.item_ids.length));
+      target.item_ids.splice(bounded, 0, mediaId);
+      target.updated_at = "Just now";
+      this.persistToStorage();
+    }
+    return structuredClone(target);
+  }
+
+  public createPlaylistFromQueue(name: string, description = ""): Playlist {
+    if (this.snapshot.queue.length === 0) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Queue is empty",
+        "Add media files to the queue before saving as a playlist.",
+      );
+    }
+    return this.createPlaylist({
+      name,
+      description,
+      initial_item_ids: [...this.snapshot.queue],
+    });
+  }
+
+  public playPlaylist(
+    playlistId: string,
+    options?: { startMediaId?: string; shuffle?: boolean },
+  ): PlaybackSnapshot {
+    const playlist = this.getPlaylist(playlistId);
+    if (!playlist) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Playlist not found",
+        "Selected playlist no longer exists.",
+      );
+    }
+
+    const availableItems = playlist.item_ids
+      .map((id) => this.media.find((m) => m.id === id))
+      .filter(
+        (m): m is MediaItem => Boolean(m) && m!.availability === "available",
+      );
+
+    if (availableItems.length === 0) {
+      throw this.makeError(
+        "AV-101",
+        "MediaUnavailable",
+        "No playable files in playlist",
+        "Add media files or relink offline items before playing this playlist.",
+      );
+    }
+
+    const queueIds = availableItems.map((m) => m.id);
+    let orderedQueue = [...queueIds];
+    const useShuffle = Boolean(options?.shuffle);
+
+    let firstId =
+      options?.startMediaId && queueIds.includes(options.startMediaId)
+        ? options.startMediaId
+        : queueIds[0];
+
+    if (useShuffle && !options?.startMediaId && orderedQueue.length > 1) {
+      for (let i = orderedQueue.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = orderedQueue[i]!;
+        orderedQueue[i] = orderedQueue[j]!;
+        orderedQueue[j] = tmp;
+      }
+      firstId = orderedQueue[0]!;
+    }
+
+    this.selectMediaById(firstId);
+    this.snapshot.queue = orderedQueue;
+    this.snapshot.shuffle = useShuffle;
+    return this.playbackCommand({ action: "play" });
+  }
+
   /**
    * Generates a redacted, user-reviewable diagnostic report (`docs/SECURITY.md`).
-   * Guarantees that zero file paths, filenames, or note contents appear in the report.
+   * Guarantees that zero file paths, filenames, playlist titles, or note contents appear in the report.
    */
   public generateDiagnosticReport(): DiagnosticReport {
     return {
       app_version: this.getCurrentVersion(),
       os_family: "macos",
       arch: "aarch64",
-      schema_version: 1,
+      schema_version: 2,
       media_count: this.media.length,
       missing_media_count: this.media.filter((m) => m.availability === "missing").length,
       total_note_count: this.notes.length,
+      playlist_count: this.playlists.length,
       playback_state: this.snapshot.state,
       last_error_code: this.snapshot.error?.code ?? null,
       generated_at: new Date().toISOString(),
@@ -1111,9 +1963,7 @@ export class AudoraIpcClient {
 
   public checkForUpdates(includeDismissed = false): AppUpdateStatusDto {
     const currentVersion = this.getCurrentVersion();
-    const repo =
-      (this.settings.github_release_repo ?? DEFAULT_GITHUB_RELEASE_REPO).trim() ||
-      DEFAULT_GITHUB_RELEASE_REPO;
+    const repo = DEFAULT_GITHUB_RELEASE_REPO;
     const now = Date.now();
 
     if (this.stagedManifest) {
@@ -1155,10 +2005,8 @@ export class AudoraIpcClient {
   }
 
   public async checkForUpdatesOnline(includeDismissed = false): Promise<AppUpdateStatusDto> {
-    const repo =
-      (this.settings.github_release_repo ?? DEFAULT_GITHUB_RELEASE_REPO).trim() ||
-      DEFAULT_GITHUB_RELEASE_REPO;
-    if (typeof fetch === "function" && repo.includes("/")) {
+    const repo = DEFAULT_GITHUB_RELEASE_REPO;
+    if (typeof fetch === "function") {
       try {
         const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
           headers: { Accept: "application/vnd.github+json" },
@@ -1211,9 +2059,6 @@ export class AudoraIpcClient {
     targetVersion: string,
   ): Promise<{ status: AppUpdateStatusDto; message: string }> {
     const clean = targetVersion.trim().replace(/^v/i, "");
-    const repo =
-      (this.settings.github_release_repo ?? DEFAULT_GITHUB_RELEASE_REPO).trim() ||
-      DEFAULT_GITHUB_RELEASE_REPO;
     const status = this.installUpdate(clean);
 
     if (isBrowserRuntime()) {
@@ -1224,7 +2069,7 @@ export class AudoraIpcClient {
       ) {
         try {
           const res = await fetch(
-            `/__audora_update?version=${encodeURIComponent(clean)}&repo=${encodeURIComponent(repo)}`,
+            `/__audora_update?version=${encodeURIComponent(clean)}`,
           );
           const text = await res.text();
           if (text.trim().startsWith("{")) {
@@ -1295,6 +2140,7 @@ export class AudoraIpcClient {
     }
     this.media = [];
     this.notes = [];
+    this.playlists = [];
     this.settings = structuredClone(INITIAL_SETTINGS);
     this.snapshot = createIdleSnapshot(INITIAL_SETTINGS.default_playback_speed);
     this.stagedManifest = null;

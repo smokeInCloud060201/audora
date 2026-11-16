@@ -17,7 +17,8 @@ use adapters::{FakePlaybackBackend, GStreamerBackend};
 use commands::CommandDispatcher;
 use error::AppResult;
 use persistence::{
-    Database, SqliteMediaRepository, SqliteNotesRepository, SqliteSettingsRepository,
+    Database, SqliteMediaRepository, SqliteNotesRepository, SqlitePlaylistRepository,
+    SqliteSettingsRepository,
 };
 use services::AudoraAppService;
 
@@ -30,11 +31,13 @@ pub fn build_production_dispatcher(db_path: impl AsRef<Path>) -> AppResult<Comma
     let db = Database::open_or_recover(path_ref)?;
     let media_repo = Arc::new(SqliteMediaRepository::new(db.clone()));
     let notes_repo = Arc::new(SqliteNotesRepository::new(db.clone()));
+    let playlist_repo = Arc::new(SqlitePlaylistRepository::new(db.clone()));
     let settings_repo = Arc::new(SqliteSettingsRepository::new(db));
     let playback_backend = Arc::new(GStreamerBackend::new());
     let service = AudoraAppService::with_data_dir(
         media_repo,
         notes_repo,
+        playlist_repo,
         settings_repo,
         playback_backend,
         app_data_dir,
@@ -47,9 +50,16 @@ pub fn build_test_dispatcher() -> AppResult<(CommandDispatcher, Arc<FakePlayback
     let db = Database::open_in_memory()?;
     let media_repo = Arc::new(SqliteMediaRepository::new(db.clone()));
     let notes_repo = Arc::new(SqliteNotesRepository::new(db.clone()));
+    let playlist_repo = Arc::new(SqlitePlaylistRepository::new(db.clone()));
     let settings_repo = Arc::new(SqliteSettingsRepository::new(db));
     let backend = Arc::new(FakePlaybackBackend::new());
-    let service = AudoraAppService::new(media_repo, notes_repo, settings_repo, backend.clone());
+    let service = AudoraAppService::new(
+        media_repo,
+        notes_repo,
+        playlist_repo,
+        settings_repo,
+        backend.clone(),
+    );
     Ok((CommandDispatcher::new(service), backend))
 }
 
@@ -61,12 +71,14 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::domain::{
-        Availability, BackendEvent, CreateNoteInput, LibraryFilter, MediaKind, MediaRepository,
-        NotesRepository, PlaybackCommand, PlaybackState, ProbedMediaMetadata, TimestampPrecision,
-        UpdateNoteInput, WindowMode,
+        Availability, BackendEvent, CreateNoteInput, CreatePlaylistInput, LibraryFilter, MediaKind,
+        MediaRepository, NotesRepository, PlaybackCommand, PlaybackState, ProbedMediaMetadata,
+        TimestampPrecision, UpdateNoteInput, UpdatePlaylistInput, WindowMode,
     };
     use crate::error::ErrorCode;
-    use crate::persistence::{MigrationSpec, MIGRATION_0001_INITIAL_SQL};
+    use crate::persistence::{
+        MigrationSpec, MIGRATION_0001_INITIAL_SQL, MIGRATION_0002_PLAYLISTS_SQL,
+    };
 
     fn create_dummy_media_file(dir: &TempDir, name: &str, contents: &[u8]) -> std::path::PathBuf {
         let path = dir.path().join(name);
@@ -96,7 +108,7 @@ mod tests {
                 .expect("create note");
         }
 
-        // 2. Attempt to upgrade with a faulty v2 migration.
+        // 2. Attempt to upgrade with a faulty v3 migration on top of v1 + v2.
         let faulty_migrations = [
             MigrationSpec {
                 version: 1,
@@ -105,7 +117,12 @@ mod tests {
             },
             MigrationSpec {
                 version: 2,
-                name: "0002_broken",
+                name: "0002_playlists",
+                sql: MIGRATION_0002_PLAYLISTS_SQL,
+            },
+            MigrationSpec {
+                version: 3,
+                name: "0003_broken",
                 sql: "ALTER TABLE notes ADD COLUMN valid_col TEXT; INVALID SQL SYNTAX HERE;",
             },
         ];
@@ -115,17 +132,17 @@ mod tests {
         let err = result.err().expect("error");
         assert_eq!(err.code(), ErrorCode::PersistenceFailure);
 
-        // 3. Verify that the pre-migration backup file was created before v2 ran.
-        let expected_backup = db_path.with_extension("sqlite.pre-v1.bak");
+        // 3. Verify that the pre-migration backup file was created before v3 ran.
+        let expected_backup = db_path.with_extension("sqlite.pre-v2.bak");
         assert!(
             expected_backup.exists(),
             "pre-migration backup file must exist at {}",
             expected_backup.display()
         );
 
-        // 4. Verify the original database rolled back cleanly to v1 and kept the note!
-        let recovered_db = Database::open(&db_path).expect("reopen rolled-back v1 db");
-        assert_eq!(recovered_db.schema_version().expect("version"), 1);
+        // 4. Verify the original database rolled back cleanly to v2 and kept the note!
+        let recovered_db = Database::open(&db_path).expect("reopen rolled-back v2 db");
+        assert_eq!(recovered_db.schema_version().expect("version"), 2);
         let notes_repo = SqliteNotesRepository::new(recovered_db.clone());
         let media_repo = SqliteMediaRepository::new(recovered_db);
         let items = media_repo
@@ -289,11 +306,12 @@ mod tests {
         assert_eq!(search.matching_notes.len(), 1);
         assert_eq!(search.matching_notes[0].id, early_note.id);
 
-        // 7. Activate note seeks directly to 3_425 ms.
+        // 7. Activate note seeks directly to 3_425 ms and auto-plays.
         let snap = dispatcher
             .activate_note(&early_note.id)
             .expect("activate note");
         assert_eq!(snap.position_ms, 3_425);
+        assert_eq!(snap.state, PlaybackState::Playing);
     }
 
     #[test]
@@ -723,5 +741,101 @@ Properties:
             .expect("cleanup application data");
         assert!(!cleanup.removed_paths.is_empty());
         assert!(cleanup.bytes_reclaimed > 0);
+    }
+
+    #[test]
+    fn multi_playlist_crud_reorder_cascade_and_play_skips_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let track1_path = create_dummy_media_file(&temp, "track1.mp3", b"audio-1");
+        let track2_path = create_dummy_media_file(&temp, "track2.mp4", b"video-2");
+        let track3_path = create_dummy_media_file(&temp, "track3.wav", b"audio-3");
+
+        let (dispatcher, _) = build_test_dispatcher().expect("dispatcher");
+        let t1 = dispatcher
+            .open_media(track1_path.to_str().expect("p1"))
+            .expect("t1");
+        let t2 = dispatcher
+            .open_media(track2_path.to_str().expect("p2"))
+            .expect("t2");
+        let t3 = dispatcher
+            .open_media(track3_path.to_str().expect("p3"))
+            .expect("t3");
+
+        // Create multiple playlists; a media item can belong to several playlists
+        let study = dispatcher
+            .create_playlist(CreatePlaylistInput {
+                name: "Deep Study".to_owned(),
+                description: "Focus tracks and lectures".to_owned(),
+                initial_item_ids: vec![t1.id.clone(), t2.id.clone()],
+            })
+            .expect("create study playlist");
+        assert_eq!(study.item_ids, vec![t1.id.clone(), t2.id.clone()]);
+
+        let commute = dispatcher
+            .create_playlist(CreatePlaylistInput {
+                name: "Commute Mix".to_owned(),
+                description: String::new(),
+                initial_item_ids: vec![t2.id.clone()],
+            })
+            .expect("create commute playlist");
+        assert_eq!(dispatcher.list_playlists().expect("list").len(), 2);
+
+        // Append items (ignoring duplicates) and reorder
+        let study = dispatcher
+            .add_items_to_playlist(&study.id, &[t2.id.clone(), t3.id.clone()])
+            .expect("add items");
+        assert_eq!(
+            study.item_ids,
+            vec![t1.id.clone(), t2.id.clone(), t3.id.clone()]
+        );
+
+        let reordered = dispatcher
+            .move_playlist_item(&study.id, &t3.id, 0)
+            .expect("move t3 to front");
+        assert_eq!(
+            reordered.item_ids,
+            vec![t3.id.clone(), t1.id.clone(), t2.id.clone()]
+        );
+
+        // Rename playlist
+        let renamed = dispatcher
+            .update_playlist(UpdatePlaylistInput {
+                id: commute.id.clone(),
+                name: "Morning Commute".to_owned(),
+                description: "Podcasts".to_owned(),
+            })
+            .expect("rename");
+        assert_eq!(renamed.name, "Morning Commute");
+
+        // Mark t3 missing -> play_playlist skips t3 and plays [t1, t2] starting at t1
+        dispatcher
+            .mark_media_missing(&t3.id)
+            .expect("mark t3 missing");
+        let snap = dispatcher
+            .play_playlist(&study.id, None, true)
+            .expect("play playlist");
+        assert_eq!(snap.state, PlaybackState::Playing);
+        assert_eq!(snap.media_id.as_deref(), Some(t1.id.as_str()));
+        assert_eq!(snap.queue, vec![t1.id.clone(), t2.id.clone()]);
+        assert!(snap.shuffle);
+
+        // Removing t2 from the library cascades cleanly out of both playlists
+        dispatcher.remove_media(&t2.id).expect("remove t2");
+        let study_after = dispatcher.get_playlist(&study.id).expect("get study");
+        assert_eq!(study_after.item_ids, vec![t3.id.clone(), t1.id.clone()]);
+        let commute_after = dispatcher.get_playlist(&commute.id).expect("get commute");
+        assert!(commute_after.item_ids.is_empty());
+
+        // Deleting a playlist never deletes the underlying media items in the library
+        assert!(dispatcher.delete_playlist(&study.id).expect("delete study"));
+        assert_eq!(dispatcher.list_playlists().expect("list").len(), 1);
+        assert_eq!(
+            dispatcher
+                .search_library(None, LibraryFilter::All)
+                .expect("search")
+                .media_items
+                .len(),
+            2
+        );
     }
 }

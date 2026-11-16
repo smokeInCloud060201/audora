@@ -89,6 +89,7 @@ describe("AudoraIpcClient workflows", () => {
 
     const snap = client.activateNote(marker.id);
     expect(snap.position_ms).toBe(15_000);
+    expect(snap.state).toBe("playing");
   });
 
   it("blocks duplicate relink paths with AV-201 and rejects unsupported formats with AV-104", () => {
@@ -284,5 +285,110 @@ describe("AudoraIpcClient workflows", () => {
     const cleanup = client.cleanupApplicationData();
     expect(cleanup.removed_paths.length).toBeGreaterThan(0);
     expect(client.getCurrentVersion()).toBe("0.1.0");
+    expect("github_release_repo" in client.getSettings()).toBe(false);
+  });
+
+  it("manages trusted local source folders (import, toggle visibility, and delete source folder like Spotify while preserving noted media)", () => {
+    const client = new AudoraIpcClient(false);
+    expect(client.getSourceFolders()).toHaveLength(0);
+
+    const added = client.addSourceFolderWithFiles("/tmp/Lectures", [
+      { name: "Lecture_01.mp4", path: "/tmp/Lectures/Lecture_01.mp4", size: 12_000_000 },
+      { name: "Lecture_02.mp3", path: "/tmp/Lectures/Lecture_02.mp3", size: 4_500_000 },
+      { name: "cover.jpg", path: "/tmp/Lectures/cover.jpg", size: 120_000 },
+    ]);
+
+    expect(added.importedCount).toBe(2);
+    expect(added.folder.label).toBe("Lectures");
+    expect(added.folder.media_count).toBe(2);
+    expect(client.getSourceFolders()).toHaveLength(1);
+    expect(client.searchLibrary("", "all").media_items).toHaveLength(2);
+
+    // Add a timestamped note to Lecture_01 so note-preservation is verified when deleting the source folder
+    const lecture1 = client
+      .searchLibrary("", "all")
+      .media_items.find((m) => m.display_name === "Lecture_01.mp4")!;
+    client.createNote({
+      media_id: lecture1.id,
+      position_ms: 15_000,
+      is_quick_marker: false,
+      body: "Key theorem proof",
+    });
+
+    // Toggle source folder off -> hides folder items from library view
+    client.toggleSourceFolder(added.folder.id, false);
+    expect(client.searchLibrary("", "all").media_items).toHaveLength(0);
+
+    // Toggle back on -> restores folder items in library view
+    client.toggleSourceFolder(added.folder.id, true);
+    expect(client.searchLibrary("", "all").media_items).toHaveLength(2);
+
+    // Delete trusted source folder -> removes un-annotated imported media, preserves item with notes
+    const removed = client.removeSourceFolder(added.folder.id);
+    expect(removed.removed).toBe(true);
+    expect(removed.removedMediaCount).toBe(1);
+    expect(removed.preservedNotedCount).toBe(1);
+    expect(client.getSourceFolders()).toHaveLength(0);
+
+    const remaining = client.searchLibrary("", "all").media_items;
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].display_name).toBe("Lecture_01.mp4");
+    expect(client.listNotes(lecture1.id)).toHaveLength(1);
+  });
+
+  it("supports creating multiple playlists, reordering items, saving queue as playlist, undo restore, and auto-play", () => {
+    const client = new AudoraIpcClient(false);
+    const [trackA, trackB, trackC] = client.openLocalFiles([
+      { name: "Intro.mp3", path: "/tmp/Intro.mp3", size: 2_000_000, durationMs: 60_000 },
+      { name: "Main_Talk.mp4", path: "/tmp/Main_Talk.mp4", size: 15_000_000, durationMs: 300_000 },
+      { name: "Outro.wav", path: "/tmp/Outro.wav", size: 4_000_000, durationMs: 90_000 },
+    ]);
+
+    expect(() => client.createPlaylist({ name: "   " })).toThrow();
+
+    const focus = client.createPlaylist({
+      name: "Focus Sessions",
+      description: "Deep work recordings",
+      initial_item_ids: [trackA.id, trackB.id],
+    });
+    const favorites = client.createPlaylistFromQueue("Queue Snapshot");
+
+    expect(client.listPlaylists()).toHaveLength(2);
+    expect(favorites.item_ids).toEqual([trackA.id, trackB.id, trackC.id]);
+
+    // Add item (deduplicating existing), reorder, and rename
+    client.addMediaToPlaylist(focus.id, [trackB.id, trackC.id]);
+    expect(client.getPlaylist(focus.id)?.item_ids).toEqual([trackA.id, trackB.id, trackC.id]);
+
+    client.movePlaylistItem(focus.id, trackC.id, 0);
+    expect(client.getPlaylist(focus.id)?.item_ids).toEqual([trackC.id, trackA.id, trackB.id]);
+
+    const renamed = client.updatePlaylist({
+      id: focus.id,
+      name: "Evening Study",
+      description: "Updated description",
+    });
+    expect(renamed.name).toBe("Evening Study");
+
+    // Mark trackC missing -> playPlaylist skips offline trackC and auto-plays trackA
+    client.markMediaMissing(trackC.id);
+    const snap = client.playPlaylist(focus.id);
+    expect(snap.state).toBe("playing");
+    expect(snap.media_id).toBe(trackA.id);
+    expect(snap.queue).toEqual([trackA.id, trackB.id]);
+
+    // Redacted diagnostic report includes playlist_count without exposing playlist names
+    const diag = client.generateDiagnosticReport();
+    expect(diag.playlist_count).toBe(2);
+    expect(JSON.stringify(diag)).not.toContain("Evening Study");
+
+    // Delete & Undo restore preserves library items
+    const deleted = client.deletePlaylist(focus.id);
+    expect(deleted?.name).toBe("Evening Study");
+    expect(client.listPlaylists()).toHaveLength(1);
+    expect(client.searchLibrary("", "all").media_items).toHaveLength(3);
+
+    client.restorePlaylist(deleted!);
+    expect(client.listPlaylists()).toHaveLength(2);
   });
 });

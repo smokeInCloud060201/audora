@@ -3,9 +3,10 @@
 //! All commands return `Result<T, AppErrorPayload>` with stable `AV-*` error codes (`docs/ERROR_CATALOG.md`).
 
 use crate::domain::{
-    AppSettings, AppUpdateStatusDto, CleanupSummaryDto, CreateNoteInput, DiagnosticReport,
-    LibraryFilter, LibrarySearchResult, MediaItem, Note, PlaybackCommand, PlaybackSnapshot,
-    ReleaseManifestDto, UpdateNoteInput, WindowMode,
+    AppSettings, AppUpdateStatusDto, CleanupSummaryDto, CreateNoteInput, CreatePlaylistInput,
+    DiagnosticReport, LibraryFilter, LibrarySearchResult, MediaId, MediaItem, Note,
+    PlaybackCommand, PlaybackSnapshot, Playlist, ReleaseManifestDto, UpdateNoteInput,
+    UpdatePlaylistInput, WindowMode,
 };
 use crate::error::AppErrorPayload;
 use crate::services::AudoraAppService;
@@ -186,6 +187,78 @@ impl CommandDispatcher {
     pub fn cleanup_application_data(&self) -> CommandResult<CleanupSummaryDto> {
         self.service
             .cleanup_application_data()
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn create_playlist(&self, input: CreatePlaylistInput) -> CommandResult<Playlist> {
+        self.service
+            .create_playlist(input)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn update_playlist(&self, input: UpdatePlaylistInput) -> CommandResult<Playlist> {
+        self.service
+            .update_playlist(input)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn delete_playlist(&self, playlist_id: &str) -> CommandResult<bool> {
+        self.service
+            .delete_playlist(playlist_id)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn list_playlists(&self) -> CommandResult<Vec<Playlist>> {
+        self.service
+            .list_playlists()
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn get_playlist(&self, playlist_id: &str) -> CommandResult<Playlist> {
+        self.service
+            .get_playlist(playlist_id)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn add_items_to_playlist(
+        &self,
+        playlist_id: &str,
+        media_ids: &[MediaId],
+    ) -> CommandResult<Playlist> {
+        self.service
+            .add_items_to_playlist(playlist_id, media_ids)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn remove_item_from_playlist(
+        &self,
+        playlist_id: &str,
+        media_id: &str,
+    ) -> CommandResult<Playlist> {
+        self.service
+            .remove_item_from_playlist(playlist_id, media_id)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn move_playlist_item(
+        &self,
+        playlist_id: &str,
+        media_id: &str,
+        target_index: usize,
+    ) -> CommandResult<Playlist> {
+        self.service
+            .move_playlist_item(playlist_id, media_id, target_index)
+            .map_err(|err| err.to_payload())
+    }
+
+    pub fn play_playlist(
+        &self,
+        playlist_id: &str,
+        start_media_id: Option<&str>,
+        shuffle: bool,
+    ) -> CommandResult<PlaybackSnapshot> {
+        self.service
+            .play_playlist(playlist_id, start_media_id, shuffle)
             .map_err(|err| err.to_payload())
     }
 }

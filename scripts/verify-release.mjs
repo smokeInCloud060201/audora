@@ -33,6 +33,7 @@ const requiredFiles = [
   ".docs/USER_GUIDE.md",
   "crates/audora-core/Cargo.toml",
   "crates/audora-core/migrations/0001_initial.sql",
+  "crates/audora-core/migrations/0002_playlists.sql",
   "apps/desktop/src-tauri/Cargo.toml",
   "apps/desktop/src-tauri/tauri.conf.json",
   "apps/desktop/src-tauri/Entitlements.plist",
@@ -89,6 +90,7 @@ const checksumTargets = [
   "THIRD_PARTY_NOTICES.md",
   "sbom.cdx.json",
   "crates/audora-core/migrations/0001_initial.sql",
+  "crates/audora-core/migrations/0002_playlists.sql",
   "apps/desktop/ui/dist/index.html",
 ];
 

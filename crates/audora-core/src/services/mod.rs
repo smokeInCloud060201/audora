@@ -12,11 +12,13 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::{
     AppSettings, AppUpdateStatusDto, Availability, BackendEvent, CleanupSummaryDto,
-    CreateNoteInput, DiagnosticReport, LibraryFilter, LibrarySearchResult, MediaItem,
-    MediaRepository, Note, NotesRepository, PlaybackBackend, PlaybackCommand, PlaybackSnapshot,
-    PlaybackState, ReleaseManifestDto, RelinkMediaRecord, RepeatMode, SettingsRepository,
-    TimestampPrecision, UpdateNoteInput, WindowMode, MAX_NOTE_BODY_CHARS, MAX_PLAYBACK_RATE,
-    MAX_SEARCH_QUERY_CHARS, MIN_PLAYBACK_RATE,
+    CreateNoteInput, CreatePlaylistInput, DiagnosticReport, LibraryFilter, LibrarySearchResult,
+    MediaId, MediaItem, MediaRepository, Note, NotesRepository, PlaybackBackend, PlaybackCommand,
+    PlaybackSnapshot, PlaybackState, Playlist, PlaylistRepository, ReleaseManifestDto,
+    RelinkMediaRecord, RepeatMode, SettingsRepository, TimestampPrecision, UpdateNoteInput,
+    UpdatePlaylistInput, WindowMode, MAX_NOTE_BODY_CHARS, MAX_PLAYBACK_RATE,
+    MAX_PLAYLIST_DESCRIPTION_CHARS, MAX_PLAYLIST_NAME_CHARS, MAX_SEARCH_QUERY_CHARS,
+    MIN_PLAYBACK_RATE,
 };
 use crate::error::{redact_path, AppError, AppResult};
 
@@ -39,10 +41,11 @@ fn now_timestamp_string() -> String {
     format!("{secs}")
 }
 
-/// Core application coordinator owning domain invariants across playback, library, notes, and settings.
+/// Core application coordinator owning domain invariants across playback, library, notes, playlists, and settings.
 pub struct AudoraAppService {
     media_repo: Arc<dyn MediaRepository>,
     notes_repo: Arc<dyn NotesRepository>,
+    playlist_repo: Arc<dyn PlaylistRepository>,
     settings_repo: Arc<dyn SettingsRepository>,
     playback_backend: Arc<dyn PlaybackBackend>,
     snapshot: Mutex<PlaybackSnapshot>,
@@ -54,6 +57,7 @@ impl AudoraAppService {
     pub fn new(
         media_repo: Arc<dyn MediaRepository>,
         notes_repo: Arc<dyn NotesRepository>,
+        playlist_repo: Arc<dyn PlaylistRepository>,
         settings_repo: Arc<dyn SettingsRepository>,
         playback_backend: Arc<dyn PlaybackBackend>,
     ) -> Self {
@@ -62,6 +66,7 @@ impl AudoraAppService {
         Self::with_data_dir(
             media_repo,
             notes_repo,
+            playlist_repo,
             settings_repo,
             playback_backend,
             default_dir,
@@ -72,6 +77,7 @@ impl AudoraAppService {
     pub fn with_data_dir(
         media_repo: Arc<dyn MediaRepository>,
         notes_repo: Arc<dyn NotesRepository>,
+        playlist_repo: Arc<dyn PlaylistRepository>,
         settings_repo: Arc<dyn SettingsRepository>,
         playback_backend: Arc<dyn PlaybackBackend>,
         app_data_dir: PathBuf,
@@ -87,6 +93,7 @@ impl AudoraAppService {
         Self {
             media_repo,
             notes_repo,
+            playlist_repo,
             settings_repo,
             playback_backend,
             snapshot: Mutex::new(snapshot),
@@ -655,8 +662,8 @@ impl AudoraAppService {
         self.notes_repo.list_notes_for_media(media_id)
     }
 
-    /// Activates a note ("Jump to moment"): loads the note's media if not already active and seeks
-    /// directly to `note.position_ms` (overriding `Resume where I left off`).
+    /// Activates a note ("Jump to moment"): loads the note's media if not already active, seeks
+    /// directly to `note.position_ms` (overriding `Resume where I left off`), and starts playback.
     pub fn activate_note(&self, note_id: &str) -> AppResult<PlaybackSnapshot> {
         let note = self
             .notes_repo
@@ -693,7 +700,8 @@ impl AudoraAppService {
 
         self.playback_command(PlaybackCommand::Seek {
             position_ms: note.position_ms,
-        })
+        })?;
+        self.playback_command(PlaybackCommand::Play)
     }
 
     /// Searches media titles and note text locally (`Flow 5`).
@@ -859,20 +867,175 @@ impl AudoraAppService {
             .filter(|m| m.availability == Availability::Missing)
             .count();
         let total_note_count: usize = all_media.iter().map(|m| m.note_count).sum();
+        let playlist_count = self.playlist_repo.list_playlists()?.len();
         let snap = self.get_playback_snapshot()?;
 
         Ok(DiagnosticReport {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             os_family: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
-            schema_version: 1,
+            schema_version: 2,
             media_count,
             missing_media_count,
             total_note_count,
+            playlist_count,
             playback_state: snap.state,
             last_error_code: snap.error.map(|e| e.code.as_str().to_owned()),
             generated_at: now_timestamp_string(),
         })
+    }
+
+    /// Creates a new user playlist (`0002_playlists`).
+    pub fn create_playlist(&self, input: CreatePlaylistInput) -> AppResult<Playlist> {
+        let trimmed_name = input.name.trim();
+        if trimmed_name.is_empty() {
+            return Err(AppError::validation("Playlist name must not be empty"));
+        }
+        if trimmed_name.chars().count() > MAX_PLAYLIST_NAME_CHARS {
+            return Err(AppError::validation(format!(
+                "Playlist name must not exceed {MAX_PLAYLIST_NAME_CHARS} characters"
+            )));
+        }
+        let trimmed_desc = input.description.trim();
+        if trimmed_desc.chars().count() > MAX_PLAYLIST_DESCRIPTION_CHARS {
+            return Err(AppError::validation(format!(
+                "Playlist description must not exceed {MAX_PLAYLIST_DESCRIPTION_CHARS} characters"
+            )));
+        }
+        let sanitized = CreatePlaylistInput {
+            name: trimmed_name.to_owned(),
+            description: trimmed_desc.to_owned(),
+            initial_item_ids: input.initial_item_ids,
+        };
+        let id = generate_id("pl");
+        let now = now_timestamp_string();
+        self.playlist_repo.create_playlist(id, &sanitized, &now)
+    }
+
+    /// Updates a playlist's name and description.
+    pub fn update_playlist(&self, input: UpdatePlaylistInput) -> AppResult<Playlist> {
+        let trimmed_name = input.name.trim();
+        if trimmed_name.is_empty() {
+            return Err(AppError::validation("Playlist name must not be empty"));
+        }
+        if trimmed_name.chars().count() > MAX_PLAYLIST_NAME_CHARS {
+            return Err(AppError::validation(format!(
+                "Playlist name must not exceed {MAX_PLAYLIST_NAME_CHARS} characters"
+            )));
+        }
+        let trimmed_desc = input.description.trim();
+        if trimmed_desc.chars().count() > MAX_PLAYLIST_DESCRIPTION_CHARS {
+            return Err(AppError::validation(format!(
+                "Playlist description must not exceed {MAX_PLAYLIST_DESCRIPTION_CHARS} characters"
+            )));
+        }
+        let sanitized = UpdatePlaylistInput {
+            id: input.id,
+            name: trimmed_name.to_owned(),
+            description: trimmed_desc.to_owned(),
+        };
+        self.playlist_repo
+            .update_playlist(&sanitized, &now_timestamp_string())
+    }
+
+    /// Deletes a playlist container without removing media items or notes from the library.
+    pub fn delete_playlist(&self, playlist_id: &str) -> AppResult<bool> {
+        self.playlist_repo.delete_playlist(playlist_id)
+    }
+
+    /// Lists all playlists ordered by most recently updated.
+    pub fn list_playlists(&self) -> AppResult<Vec<Playlist>> {
+        self.playlist_repo.list_playlists()
+    }
+
+    /// Returns a single playlist by ID.
+    pub fn get_playlist(&self, playlist_id: &str) -> AppResult<Playlist> {
+        self.playlist_repo
+            .get_playlist(playlist_id)?
+            .ok_or_else(|| AppError::validation("Selected playlist does not exist"))
+    }
+
+    /// Appends one or more existing library items to a playlist (deduplicating already-present items).
+    pub fn add_items_to_playlist(
+        &self,
+        playlist_id: &str,
+        media_ids: &[MediaId],
+    ) -> AppResult<Playlist> {
+        self.playlist_repo
+            .add_items_to_playlist(playlist_id, media_ids, &now_timestamp_string())
+    }
+
+    /// Removes a single media item from a playlist without removing it from the library.
+    pub fn remove_item_from_playlist(
+        &self,
+        playlist_id: &str,
+        media_id: &str,
+    ) -> AppResult<Playlist> {
+        self.playlist_repo
+            .remove_item_from_playlist(playlist_id, media_id, &now_timestamp_string())
+    }
+
+    /// Moves a media item to `target_index` (`0-based`) within a playlist.
+    pub fn move_playlist_item(
+        &self,
+        playlist_id: &str,
+        media_id: &str,
+        target_index: usize,
+    ) -> AppResult<Playlist> {
+        self.playlist_repo.move_playlist_item(
+            playlist_id,
+            media_id,
+            target_index,
+            &now_timestamp_string(),
+        )
+    }
+
+    /// Loads a playlist's available items into the session queue (skipping offline items) and starts playback.
+    pub fn play_playlist(
+        &self,
+        playlist_id: &str,
+        start_media_id: Option<&str>,
+        shuffle: bool,
+    ) -> AppResult<PlaybackSnapshot> {
+        let playlist = self.get_playlist(playlist_id)?;
+        let mut available_items: Vec<MediaItem> = Vec::new();
+        for mid in &playlist.item_ids {
+            if let Some(item) = self.media_repo.get_by_id(mid)? {
+                if item.availability == Availability::Available && Path::new(&item.path).exists() {
+                    available_items.push(item);
+                } else if !Path::new(&item.path).exists() {
+                    let _ = self.media_repo.update_availability(
+                        &item.id,
+                        Availability::Missing,
+                        &now_timestamp_string(),
+                    );
+                }
+            }
+        }
+
+        if available_items.is_empty() {
+            return Err(AppError::media_unavailable(
+                "No playable media files are currently available in this playlist.",
+            ));
+        }
+
+        let target = start_media_id
+            .and_then(|sid| available_items.iter().find(|m| m.id == sid))
+            .unwrap_or(&available_items[0]);
+
+        self.open_media(&target.path)?;
+
+        let queue_ids: Vec<MediaId> = available_items.iter().map(|m| m.id.clone()).collect();
+        {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+            snap.queue = queue_ids;
+            snap.shuffle = shuffle;
+        }
+
+        self.playback_command(PlaybackCommand::Play)
     }
 
     fn updates_dir(&self) -> PathBuf {
@@ -922,11 +1085,7 @@ impl AudoraAppService {
             Some(ref v) if compare_semver(v, &cargo_ver) == CmpOrdering::Greater => v.clone(),
             _ => cargo_ver,
         };
-        let github_repo = if settings.github_release_repo.trim().is_empty() {
-            crate::domain::DEFAULT_GITHUB_RELEASE_REPO.to_owned()
-        } else {
-            settings.github_release_repo.trim().to_owned()
-        };
+        let github_repo = crate::domain::DEFAULT_GITHUB_RELEASE_REPO.to_owned();
 
         let now_ms = i64::try_from(
             SystemTime::now()

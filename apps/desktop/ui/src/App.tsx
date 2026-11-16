@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_GITHUB_RELEASE_REPO, ipcClient } from "./api/ipc";
+import { ipcClient } from "./api/ipc";
+import { AddToPlaylistModal } from "./components/AddToPlaylistModal";
 import { AudoraLogo } from "./components/AudoraLogo";
+import { PlaylistsView } from "./components/PlaylistsView";
+import { SourceFolderDialog } from "./components/SourceFolderDialog";
 import { UpdateDialog } from "./components/UpdateDialog";
 import type {
   AppErrorPayload,
@@ -11,18 +14,27 @@ import type {
   MediaItem,
   Note,
   PlaybackSnapshot,
+  Playlist,
   PrimarySection,
   RepeatMode,
   SidePanelTab,
   ThemeMode,
   TimestampPrecision,
+  TrustedSourceFolder,
 } from "./types/domain";
 import { formatDurationMs, progressPercent } from "./utils/format";
 
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const WAVEFORM_BAR_HEIGHTS = [24, 42, 68, 52, 88, 60, 34, 76, 94, 64, 46, 82, 58, 38, 72, 50, 32, 22];
 
-type SettingsTab = "appearance" | "playback" | "notes" | "keyboard" | "privacy" | "about";
+type SettingsTab =
+  | "appearance"
+  | "sources"
+  | "playback"
+  | "notes"
+  | "keyboard"
+  | "privacy"
+  | "about";
 
 export function App(): React.ReactElement {
   const [settings, setSettings] = useState<AppSettings>(() => ipcClient.getSettings());
@@ -74,24 +86,38 @@ export function App(): React.ReactElement {
   // Minimum mode `? Help` popover (Frame 2:115)
   const [isMinHelpOpen, setIsMinHelpOpen] = useState<boolean>(false);
 
-  // Undo toast for deleted note (Frame 4:578) & software update state
+  // Undo toast for deleted note/playlist (Frame 4:578) & software update state
   const [deletedNoteToast, setDeletedNoteToast] = useState<Note | null>(null);
+  const [deletedPlaylistToast, setDeletedPlaylistToast] = useState<Playlist | null>(null);
   const [backupStatusMessage, setBackupStatusMessage] = useState<string | null>(null);
   const [diagnosticReport, setDiagnosticReport] = useState<DiagnosticReport | null>(null);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatusDto | null>(null);
   const [isUpdateDialogOpen, setIsUpdateDialogOpen] = useState<boolean>(false);
   const [updateToastMessage, setUpdateToastMessage] = useState<string | null>(null);
 
+  // Playlists state
+  const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
+  const [addToPlaylistTarget, setAddToPlaylistTarget] = useState<MediaItem | null>(null);
+  const [isSaveQueueModalOpen, setIsSaveQueueModalOpen] = useState<boolean>(false);
+  const [saveQueueNameDraft, setSaveQueueNameDraft] = useState<string>("");
+  const [saveQueueError, setSaveQueueError] = useState<string | null>(null);
+
+  // Trusted Local Source Folders state (Spotify Local Files workflow in Settings)
+  const [isSourceDialogOpen, setIsSourceDialogOpen] = useState<boolean>(false);
+  const [sourceFolderError, setSourceFolderError] = useState<string | null>(null);
+  const [rescanningFolderId, setRescanningFolderId] = useState<string | null>(null);
+
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaElementRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
 
-  // Hydrate persisted native state and check for updates on launch if enabled
+  // Hydrate persisted native state, sync enabled trusted source folders, and check for updates on launch if enabled
   useEffect(() => {
     let cancelled = false;
     const init = async () => {
       await ipcClient.ensureHydratedFromNative();
+      await ipcClient.syncEnabledSourceFolders();
       if (cancelled) return;
       const loadedSettings = ipcClient.getSettings();
       const loadedSnapshot = ipcClient.getPlaybackSnapshot();
@@ -240,6 +266,11 @@ export function App(): React.ReactElement {
     [missingMediaTarget, libraryVersion],
   );
 
+  const playlists = useMemo(
+    () => ipcClient.listPlaylists(),
+    [settings, snapshot, libraryVersion, deletedPlaylistToast],
+  );
+
   // Global keyboard shortcuts (Section 5 of `docs/UI_DESIGN.md`)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -263,6 +294,18 @@ export function App(): React.ReactElement {
       }
 
       if (e.key === "Escape") {
+        if (addToPlaylistTarget) {
+          setAddToPlaylistTarget(null);
+          return;
+        }
+        if (isSaveQueueModalOpen) {
+          setIsSaveQueueModalOpen(false);
+          return;
+        }
+        if (isSourceDialogOpen) {
+          setIsSourceDialogOpen(false);
+          return;
+        }
         if (isUpdateDialogOpen) {
           setIsUpdateDialogOpen(false);
           return;
@@ -406,6 +449,68 @@ export function App(): React.ReactElement {
     ipcClient.restoreNote(deletedNoteToast);
     setDeletedNoteToast(null);
     setLibraryVersion((v) => v + 1);
+  };
+
+  const handlePlaylistDeleted = (deleted: Playlist) => {
+    setDeletedPlaylistToast(deleted);
+    setLibraryVersion((v) => v + 1);
+    window.setTimeout(() => {
+      setDeletedPlaylistToast((curr) => (curr?.id === deleted.id ? null : curr));
+    }, 6_000);
+  };
+
+  const handleUndoDeletePlaylist = () => {
+    if (!deletedPlaylistToast) return;
+    const restored = ipcClient.restorePlaylist(deletedPlaylistToast);
+    setDeletedPlaylistToast(null);
+    setSelectedPlaylistId(restored.id);
+    setLibraryVersion((v) => v + 1);
+  };
+
+  const handlePlayPlaylist = (
+    playlistId: string,
+    options?: { startMediaId?: string; shuffle?: boolean },
+  ) => {
+    try {
+      const prevMediaId = snapshot.media_id;
+      const nextSnap = ipcClient.playPlaylist(playlistId, options);
+      setUnsupportedError(null);
+      setMissingMediaTarget(null);
+      setSnapshot(nextSnap);
+      setSection("now_playing");
+      const el = mediaElementRef.current;
+      if (el && prevMediaId === nextSnap.media_id) {
+        try {
+          el.currentTime = nextSnap.position_ms / 1000;
+        } catch {
+          // `onLoadedMetadata` will sync position
+        }
+        if (el.paused) {
+          void el.play().catch(() => {});
+        }
+      }
+    } catch (err) {
+      const payload = err as AppErrorPayload;
+      showTransientUpdateToast(payload.message ?? "Unable to play playlist.");
+    }
+  };
+
+  const handleSaveQueueAsPlaylist = (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaveQueueError(null);
+    try {
+      const created = ipcClient.createPlaylistFromQueue(saveQueueNameDraft);
+      setIsSaveQueueModalOpen(false);
+      setSaveQueueNameDraft("");
+      setSelectedPlaylistId(created.id);
+      setLibraryVersion((v) => v + 1);
+      showTransientUpdateToast(
+        `Saved queue as playlist "${created.name}" (${created.item_ids.length} items).`,
+      );
+    } catch (err) {
+      const payload = err as AppErrorPayload;
+      setSaveQueueError(payload.message ?? "Unable to save queue as playlist.");
+    }
   };
 
   const handleSelectLibraryItem = (item: MediaItem) => {
@@ -569,6 +674,93 @@ export function App(): React.ReactElement {
     );
   };
 
+  const sourceFolders = useMemo(
+    () => ipcClient.getSourceFolders(),
+    [settings, libraryVersion, snapshot],
+  );
+
+  const currentVersion = updateStatus?.current_version || ipcClient.getCurrentVersion();
+
+  const handleAddSourceButtonClick = () => {
+    setSourceFolderError(null);
+    setIsSourceDialogOpen(true);
+  };
+
+  const handleSourceFolderAdded = (
+    folder: TrustedSourceFolder,
+    importedCount: number,
+  ) => {
+    setIsSourceDialogOpen(false);
+    setSettings(ipcClient.getSettings());
+    setSnapshot(ipcClient.getPlaybackSnapshot());
+    setLibraryVersion((v) => v + 1);
+    showTransientUpdateToast(
+      `Added source "${folder.label}" (${importedCount} media file${importedCount === 1 ? "" : "s"} imported).`,
+    );
+  };
+
+  const handleRescanSourceFolder = async (folder: TrustedSourceFolder) => {
+    setSourceFolderError(null);
+    setRescanningFolderId(folder.id);
+    try {
+      const res = await ipcClient.rescanSourceFolder(folder.id);
+      setSettings(ipcClient.getSettings());
+      setSnapshot(ipcClient.getPlaybackSnapshot());
+      setLibraryVersion((v) => v + 1);
+      showTransientUpdateToast(
+        `Rescanned "${res.folder.label}" (${res.importedCount} new media file${res.importedCount === 1 ? "" : "s"}).`,
+      );
+    } catch (err) {
+      const payload = err as AppErrorPayload;
+      setSourceFolderError(payload.message ?? "Unable to rescan source folder.");
+    } finally {
+      setRescanningFolderId(null);
+    }
+  };
+
+  const handleToggleSourceFolder = (folder: TrustedSourceFolder) => {
+    ipcClient.toggleSourceFolder(folder.id, !folder.enabled);
+    setSettings(ipcClient.getSettings());
+    setSnapshot(ipcClient.getPlaybackSnapshot());
+    setLibraryVersion((v) => v + 1);
+  };
+
+  const handleDeleteSourceFolder = (folder: TrustedSourceFolder) => {
+    const res = ipcClient.removeSourceFolder(folder.id);
+    setSettings(ipcClient.getSettings());
+    setSnapshot(ipcClient.getPlaybackSnapshot());
+    setLibraryVersion((v) => v + 1);
+    if (res.removed) {
+      const notedNote =
+        res.preservedNotedCount > 0
+          ? ` (${res.preservedNotedCount} item${res.preservedNotedCount === 1 ? "" : "s"} with saved notes preserved)`
+          : "";
+      showTransientUpdateToast(
+        `Removed source "${res.folderLabel}"${notedNote} — files on disk untouched.`,
+      );
+    }
+  };
+
+  const handleJumpToNote = (noteId: string) => {
+    const prevMediaId = snapshot.media_id;
+    const nextSnap = ipcClient.activateNote(noteId);
+    setSnapshot(nextSnap);
+    setSection("now_playing");
+    const el = mediaElementRef.current;
+    if (el && prevMediaId === nextSnap.media_id) {
+      try {
+        el.currentTime = nextSnap.position_ms / 1000;
+      } catch {
+        // Element metadata not ready yet; `onLoadedMetadata` will sync position.
+      }
+      if (el.paused) {
+        void el.play().catch(() => {
+          // Ignore autoplay restrictions in headless browsers
+        });
+      }
+    }
+  };
+
   const handleMediaLoadedMetadata = (
     el: HTMLVideoElement | HTMLAudioElement,
   ) => {
@@ -580,6 +772,11 @@ export function App(): React.ReactElement {
       } catch {
         // Ignore seek before ready state
       }
+    }
+    if (snapshot.state === "playing" && el.paused) {
+      void el.play().catch(() => {
+        // Ignore autoplay restrictions in headless browsers
+      });
     }
     setSnapshot(
       ipcClient.syncMediaElementPosition(snapshot.position_ms, probedDurationMs),
@@ -791,7 +988,7 @@ export function App(): React.ReactElement {
         ref={fileInputRef}
         type="file"
         multiple
-        accept="audio/*,video/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.flac,.ogg,.opus,.m4a"
+        accept="audio/*,video/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.flac,.ogg,.opus,.m4a,.aac"
         style={{ display: "none" }}
         onChange={(e) => handleNativeFilesSelected(e.target.files)}
       />
@@ -826,17 +1023,6 @@ export function App(): React.ReactElement {
         </div>
 
         <div className="titlebar-actions">
-          {updateStatus?.update_available && (
-            <button
-              type="button"
-              className="titlebar-update-btn"
-              data-testid="titlebar-update-btn"
-              onClick={() => setIsUpdateDialogOpen(true)}
-            >
-              <span className="titlebar-update-dot" aria-hidden="true" />
-              <span>Update v{updateStatus.latest_version}</span>
-            </button>
-          )}
           <button
             type="button"
             className="btn-secondary"
@@ -876,6 +1062,21 @@ export function App(): React.ReactElement {
             <button
               type="button"
               className="nav-rail-btn"
+              data-testid="nav-rail-playlists-btn"
+              aria-current={section === "playlists" ? "page" : undefined}
+              onClick={() => {
+                setMissingMediaTarget(null);
+                setSection("playlists");
+              }}
+            >
+              <span className="nav-rail-icon" aria-hidden="true">
+                ☰
+              </span>
+              <span>Playlists</span>
+            </button>
+            <button
+              type="button"
+              className="nav-rail-btn"
               aria-current={section === "now_playing" ? "page" : undefined}
               onClick={() => setSection("now_playing")}
             >
@@ -887,6 +1088,22 @@ export function App(): React.ReactElement {
           </div>
 
           <div className="nav-rail-group">
+            {updateStatus?.update_available && (
+              <button
+                type="button"
+                className="nav-rail-btn nav-rail-update-btn"
+                data-testid="nav-rail-update-btn"
+                aria-label={`Update available: v${updateStatus.latest_version}`}
+                title={`New version v${updateStatus.latest_version} available`}
+                onClick={() => setIsUpdateDialogOpen(true)}
+              >
+                <span className="nav-rail-update-dot" aria-hidden="true" />
+                <span className="nav-rail-icon" aria-hidden="true">
+                  ↑
+                </span>
+                <span>Update</span>
+              </button>
+            )}
             <button
               type="button"
               className="nav-rail-btn"
@@ -898,6 +1115,13 @@ export function App(): React.ReactElement {
               </span>
               <span>Settings</span>
             </button>
+            <span
+              className="nav-rail-version tabular-nums"
+              data-testid="nav-rail-version"
+              title={`Current version: v${currentVersion}`}
+            >
+              v{currentVersion}
+            </span>
           </div>
         </nav>
 
@@ -1136,9 +1360,7 @@ export function App(): React.ReactElement {
                                 note.body || "Quick marker"
                               }`}
                               aria-label={`Jump to note at ${formatDurationMs(note.position_ms)}`}
-                              onClick={() =>
-                                setSnapshot(ipcClient.activateNote(note.id))
-                              }
+                              onClick={() => handleJumpToNote(note.id)}
                             />
                           );
                         })}
@@ -1247,6 +1469,19 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary"
+                        disabled={!activeMedia}
+                        title="Add current media to a playlist"
+                        onClick={() => {
+                          if (activeMedia) {
+                            setAddToPlaylistTarget(activeMedia);
+                          }
+                        }}
+                      >
+                        ＋ Playlist
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary"
                         title="Add quick marker at current timestamp (Shift+N)"
                         onClick={handleCreateQuickMarker}
                       >
@@ -1325,7 +1560,15 @@ export function App(): React.ReactElement {
                             activeMedia?.duration_ms !== undefined &&
                             note.position_ms > activeMedia.duration_ms;
                           return (
-                            <article key={note.id} className="note-card">
+                            <article
+                              key={note.id}
+                              className="note-card clickable"
+                              onClick={(e) => {
+                                const target = e.target as HTMLElement | null;
+                                if (target?.closest("button")) return;
+                                handleJumpToNote(note.id);
+                              }}
+                            >
                               <div
                                 style={{
                                   display: "flex",
@@ -1337,9 +1580,7 @@ export function App(): React.ReactElement {
                                   <button
                                     type="button"
                                     className="timestamp-pill tabular-nums"
-                                    onClick={() =>
-                                      setSnapshot(ipcClient.activateNote(note.id))
-                                    }
+                                    onClick={() => handleJumpToNote(note.id)}
                                   >
                                     ▶ {formatDurationMs(note.position_ms)}
                                   </button>
@@ -1429,9 +1670,7 @@ export function App(): React.ReactElement {
                                 <button
                                   type="button"
                                   className="jump-link-btn"
-                                  onClick={() =>
-                                    setSnapshot(ipcClient.activateNote(note.id))
-                                  }
+                                  onClick={() => handleJumpToNote(note.id)}
                                 >
                                   Jump to moment →
                                 </button>
@@ -1452,7 +1691,21 @@ export function App(): React.ReactElement {
                           {snapshot.queue.length} items in queue
                         </div>
                       </div>
-                      <div style={{ display: "flex", gap: 6 }}>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        {snapshot.queue.length > 0 && (
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            title="Save current queue as a playlist"
+                            onClick={() => {
+                              setSaveQueueError(null);
+                              setSaveQueueNameDraft("");
+                              setIsSaveQueueModalOpen(true);
+                            }}
+                          >
+                            ＋ Save
+                          </button>
+                        )}
                         <button
                           type="button"
                           className="btn-secondary"
@@ -1551,6 +1804,35 @@ export function App(): React.ReactElement {
                 )}
               </aside>
             </>
+          )}
+
+          {section === "playlists" && (
+            <PlaylistsView
+              playlists={playlists}
+              allMedia={allMedia}
+              activeMediaId={snapshot.media_id}
+              selectedPlaylistId={selectedPlaylistId}
+              onSelectPlaylist={setSelectedPlaylistId}
+              onPlayPlaylist={handlePlayPlaylist}
+              onAddToQueue={(mediaId) => {
+                setSnapshot(ipcClient.addToQueue(mediaId));
+                showTransientUpdateToast("Added item to playback queue.");
+              }}
+              onRelinkMissingMedia={(item) => {
+                setMissingMediaTarget(item);
+                setRelinkPathDraft(item.path);
+                setRelinkError(null);
+                setSection("library");
+              }}
+              onOpenLocalFiles={() => fileInputRef.current?.click()}
+              onPlaylistsMutated={(msg) => {
+                setLibraryVersion((v) => v + 1);
+                if (msg) {
+                  showTransientUpdateToast(msg);
+                }
+              }}
+              onPlaylistDeleted={handlePlaylistDeleted}
+            />
           )}
 
           {section === "library" && (
@@ -1770,6 +2052,16 @@ export function App(): React.ReactElement {
                       </p>
                     </div>
                     <div style={{ display: "flex", gap: 10 }}>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => {
+                          setSection("settings");
+                          setSettingsTab("sources");
+                        }}
+                      >
+                        Local sources ({sourceFolders.length})
+                      </button>
                       <button
                         type="button"
                         className="btn-secondary"
@@ -1994,6 +2286,16 @@ export function App(): React.ReactElement {
                                       >
                                         Add to queue
                                       </button>
+                                      <button
+                                        type="button"
+                                        className="btn-secondary"
+                                        onClick={() => {
+                                          setAddToPlaylistTarget(item);
+                                          setOpenLibraryMenuId(null);
+                                        }}
+                                      >
+                                        Add to playlist…
+                                      </button>
                                       {!isMissing && (
                                         <button
                                           type="button"
@@ -2044,7 +2346,15 @@ export function App(): React.ReactElement {
                             {libraryResult.matching_notes.map((note) => {
                               const parent = allMedia.find((m) => m.id === note.media_id);
                               return (
-                                <div key={note.id} className="note-card">
+                                <div
+                                  key={note.id}
+                                  className="note-card clickable"
+                                  onClick={(e) => {
+                                    const target = e.target as HTMLElement | null;
+                                    if (target?.closest("button")) return;
+                                    handleJumpToNote(note.id);
+                                  }}
+                                >
                                   <div
                                     style={{
                                       display: "flex",
@@ -2064,10 +2374,7 @@ export function App(): React.ReactElement {
                                     <button
                                       type="button"
                                       className="timestamp-pill tabular-nums"
-                                      onClick={() => {
-                                        setSnapshot(ipcClient.activateNote(note.id));
-                                        setSection("now_playing");
-                                      }}
+                                      onClick={() => handleJumpToNote(note.id)}
                                     >
                                       ▶ {formatDurationMs(note.position_ms)} — Jump to moment
                                     </button>
@@ -2103,6 +2410,7 @@ export function App(): React.ReactElement {
                   {(
                     [
                       ["appearance", "Appearance"],
+                      ["sources", "Local sources"],
                       ["playback", "Playback"],
                       ["notes", "Notes"],
                       ["keyboard", "Keyboard"],
@@ -2189,6 +2497,163 @@ export function App(): React.ReactElement {
                             </span>
                           </button>
                         ))}
+                      </div>
+                    </section>
+                  )}
+
+                  {settingsTab === "sources" && (
+                    <section
+                      data-testid="settings-sources-panel"
+                      style={{
+                        padding: 24,
+                        borderRadius: 10,
+                        background: "var(--bg-surface-1)",
+                        border: "1px solid var(--border-control)",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 18,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "flex-start",
+                          gap: 16,
+                        }}
+                      >
+                        <div>
+                          <h2 style={{ margin: "0 0 6px 0", fontSize: 16 }}>
+                            Local media sources
+                          </h2>
+                          <p
+                            style={{
+                              margin: 0,
+                              fontSize: 12.5,
+                              color: "var(--text-tertiary)",
+                              lineHeight: 1.45,
+                            }}
+                          >
+                            Add trusted local folders containing your video or audio files. Audora
+                            imports media from enabled folders and lets you disable or delete any
+                            source folder after importing—your files on disk are never modified.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          style={{ flexShrink: 0 }}
+                          onClick={handleAddSourceButtonClick}
+                        >
+                          ＋ Add a source
+                        </button>
+                      </div>
+
+                      {sourceFolderError && (
+                        <div
+                          role="alert"
+                          style={{ fontSize: 12, color: "var(--status-error-text)" }}
+                        >
+                          {sourceFolderError}
+                        </div>
+                      )}
+
+                      <div
+                        style={{
+                          paddingTop: 14,
+                          borderTop: "1px solid var(--border-subtle)",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 12,
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontSize: 12,
+                            fontWeight: 600,
+                            color: "var(--text-secondary)",
+                          }}
+                        >
+                          Show media from ({sourceFolders.length})
+                        </div>
+
+                        {sourceFolders.length === 0 ? (
+                          <div
+                            style={{
+                              padding: "22px 16px",
+                              borderRadius: 8,
+                              border: "1px dashed var(--border-control)",
+                              background: "var(--bg-inset)",
+                              textAlign: "center",
+                              fontSize: 12.5,
+                              color: "var(--text-tertiary)",
+                            }}
+                          >
+                            No trusted source folders configured yet. Click{" "}
+                            <strong>＋ Add a source</strong> above to import audio and video files.
+                          </div>
+                        ) : (
+                          <div className="source-folder-list">
+                            {sourceFolders.map((folder) => (
+                              <div
+                                key={folder.id}
+                                className="source-folder-row"
+                                data-testid={`source-folder-${folder.id}`}
+                              >
+                                <div className="source-folder-meta">
+                                  <div className="source-folder-title-row">
+                                    <span className="source-folder-title">{folder.label}</span>
+                                    <span className="source-folder-count tabular-nums">
+                                      {folder.media_count}{" "}
+                                      {folder.media_count === 1 ? "file" : "files"}
+                                    </span>
+                                  </div>
+                                  <code className="source-folder-path" title={folder.path}>
+                                    {folder.path}
+                                  </code>
+                                </div>
+
+                                <div className="source-folder-actions">
+                                  <button
+                                    type="button"
+                                    role="switch"
+                                    aria-checked={folder.enabled}
+                                    aria-label={`Show media from ${folder.label}`}
+                                    title={
+                                      folder.enabled
+                                        ? "Showing media from this folder"
+                                        : "Hidden from library"
+                                    }
+                                    className="source-toggle-switch"
+                                    onClick={() => handleToggleSourceFolder(folder)}
+                                  >
+                                    <span className="source-toggle-thumb" />
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    className="btn-secondary"
+                                    style={{ height: 30, padding: "0 10px", fontSize: 12 }}
+                                    disabled={rescanningFolderId === folder.id}
+                                    aria-label={`Rescan ${folder.label}`}
+                                    onClick={() => void handleRescanSourceFolder(folder)}
+                                  >
+                                    {rescanningFolderId === folder.id ? "Scanning…" : "↻ Sync"}
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    className="btn-danger-subtle"
+                                    aria-label={`Delete source folder ${folder.label}`}
+                                    onClick={() => handleDeleteSourceFolder(folder)}
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </section>
                   )}
@@ -2526,39 +2991,23 @@ export function App(): React.ReactElement {
                         gap: 16,
                       }}
                     >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "flex-start",
-                          gap: 12,
-                        }}
-                      >
-                        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                          <AudoraLogo variant="icon" size={48} />
-                          <div>
-                            <h2 style={{ margin: "0 0 4px 0", fontSize: 16 }}>
-                              Audora v{ipcClient.getCurrentVersion()}
-                            </h2>
-                            <p
-                              style={{
-                                margin: 0,
-                                fontSize: 13,
-                                color: "var(--text-secondary)",
-                              }}
-                            >
-                              Cross-platform local-first audio and video player with timestamped
-                              notes.
-                            </p>
-                          </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                        <AudoraLogo variant="icon" size={48} />
+                        <div>
+                          <h2 style={{ margin: "0 0 4px 0", fontSize: 16 }}>
+                            Audora v{currentVersion}
+                          </h2>
+                          <p
+                            style={{
+                              margin: 0,
+                              fontSize: 13,
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            Cross-platform local-first audio and video player with timestamped
+                            notes.
+                          </p>
                         </div>
-                        <button
-                          type="button"
-                          className="btn-primary"
-                          onClick={() => void handleCheckForUpdates()}
-                        >
-                          Check for updates…
-                        </button>
                       </div>
 
                       <div
@@ -2583,9 +3032,7 @@ export function App(): React.ReactElement {
                               Automatically check for updates
                             </div>
                             <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
-                              Query GitHub Releases (
-                              {settings.github_release_repo ?? DEFAULT_GITHUB_RELEASE_REPO}) on
-                              launch
+                              Notify in the sidebar when a verified new Audora release is available
                             </div>
                           </div>
                           <input
@@ -2608,46 +3055,6 @@ export function App(): React.ReactElement {
                                   .checkForUpdatesOnline(false)
                                   .then(setUpdateStatus);
                               }
-                            }}
-                          />
-                        </label>
-
-                        <label
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                            gap: 16,
-                          }}
-                        >
-                          <div>
-                            <div style={{ fontSize: 13, fontWeight: 600 }}>
-                              GitHub Release Repository
-                            </div>
-                            <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
-                              Repository slug (`owner/repo`) used for verified self-updates
-                            </div>
-                          </div>
-                          <input
-                            type="text"
-                            aria-label="GitHub Release Repository"
-                            placeholder={DEFAULT_GITHUB_RELEASE_REPO}
-                            value={settings.github_release_repo ?? DEFAULT_GITHUB_RELEASE_REPO}
-                            onChange={(e) => {
-                              const next = ipcClient.updateSettings({
-                                ...settings,
-                                github_release_repo: e.target.value,
-                              });
-                              setSettings(next);
-                            }}
-                            style={{
-                              width: 240,
-                              padding: "6px 10px",
-                              borderRadius: 8,
-                              border: "1px solid var(--border-control)",
-                              background: "var(--bg-inset)",
-                              color: "var(--text-primary)",
-                              fontSize: 12,
                             }}
                           />
                         </label>
@@ -2845,6 +3252,91 @@ export function App(): React.ReactElement {
         </div>
       )}
 
+      {/* Add Media Item to Playlist Modal */}
+      {addToPlaylistTarget && (
+        <AddToPlaylistModal
+          mediaItem={addToPlaylistTarget}
+          playlists={playlists}
+          onChanged={(msg) => {
+            setLibraryVersion((v) => v + 1);
+            if (msg) {
+              showTransientUpdateToast(msg);
+            }
+          }}
+          onClose={() => setAddToPlaylistTarget(null)}
+        />
+      )}
+
+      {/* Save Current Queue as Playlist Modal */}
+      {isSaveQueueModalOpen && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Save queue as playlist"
+          data-testid="save-queue-playlist-modal"
+        >
+          <form className="modal-dialog" onSubmit={handleSaveQueueAsPlaylist}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ margin: 0, fontSize: 17 }}>Save queue as playlist</h2>
+              <button
+                type="button"
+                className="btn-secondary"
+                style={{ width: 30, height: 30, padding: 0 }}
+                onClick={() => setIsSaveQueueModalOpen(false)}
+              >
+                ✕
+              </button>
+            </div>
+            <p style={{ margin: 0, fontSize: 12.5, color: "var(--text-tertiary)" }}>
+              Creates a new playlist containing all {snapshot.queue.length}{" "}
+              {snapshot.queue.length === 1 ? "item" : "items"} currently in your queue.
+            </p>
+            <input
+              type="text"
+              autoFocus
+              aria-label="Playlist name"
+              placeholder="Playlist name…"
+              value={saveQueueNameDraft}
+              onChange={(e) => setSaveQueueNameDraft(e.target.value)}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 8,
+                border: "1px solid var(--border-control)",
+                background: "var(--bg-inset)",
+                color: "var(--text-primary)",
+              }}
+            />
+            {saveQueueError && (
+              <div role="alert" style={{ fontSize: 12, color: "var(--status-error-text)" }}>
+                {saveQueueError}
+              </div>
+            )}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setIsSaveQueueModalOpen(false)}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="btn-primary">
+                Save playlist
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Trusted Local Source Folder Browser & Confirmation Dialog */}
+      {isSourceDialogOpen && (
+        <SourceFolderDialog
+          onAdded={handleSourceFolderAdded}
+          onClose={() => setIsSourceDialogOpen(false)}
+        />
+      )}
+
       {/* Software Update Dialog */}
       {isUpdateDialogOpen && updateStatus && (
         <UpdateDialog
@@ -2856,7 +3348,7 @@ export function App(): React.ReactElement {
         />
       )}
 
-      {/* 6-second Undo Toast Banner (Frame 4:578) & Update Status Toast */}
+      {/* 6-second Undo Toast Banners (Frame 4:578) & Status Toast */}
       {deletedNoteToast && (
         <div className="toast-banner" role="status">
           <span>Note deleted</span>
@@ -2866,7 +3358,16 @@ export function App(): React.ReactElement {
         </div>
       )}
 
-      {!deletedNoteToast && updateToastMessage && (
+      {!deletedNoteToast && deletedPlaylistToast && (
+        <div className="toast-banner" role="status" data-testid="deleted-playlist-toast">
+          <span>Playlist “{deletedPlaylistToast.name}” deleted</span>
+          <button type="button" className="jump-link-btn" onClick={handleUndoDeletePlaylist}>
+            Undo
+          </button>
+        </div>
+      )}
+
+      {!deletedNoteToast && !deletedPlaylistToast && updateToastMessage && (
         <div className="toast-banner" role="status" data-testid="update-toast">
           <span>{updateToastMessage}</span>
           <button

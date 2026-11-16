@@ -385,16 +385,20 @@ fn is_safe_semver(v: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-fn is_safe_github_repo(repo: &str) -> bool {
-    let parts: Vec<&str> = repo.split('/').collect();
-    parts.len() == 2
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.len() <= 64
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-        })
+fn escape_json_str(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn handle_http_connection(
@@ -423,38 +427,61 @@ fn handle_http_connection(
         return;
     }
 
+    if raw_path == "/__audora_browse_dirs" {
+        let mut folder_path_str = String::new();
+        for pair in raw_query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "path" {
+                    folder_path_str = percent_decode(v);
+                }
+            }
+        }
+        handle_browse_dirs_request(&mut stream, &folder_path_str);
+        return;
+    }
+
+    if raw_path == "/__audora_scan_folder" {
+        let mut folder_path_str = String::new();
+        for pair in raw_query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "path" {
+                    folder_path_str = percent_decode(v);
+                }
+            }
+        }
+        handle_scan_folder_request(&mut stream, &folder_path_str);
+        return;
+    }
+
     if raw_path == "/__audora_update" {
         let mut version = String::new();
-        let mut repo = DEFAULT_GITHUB_RELEASE_REPO.to_owned();
         for pair in raw_query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 if k == "version" {
                     version = percent_decode(v);
-                } else if k == "repo" && !v.is_empty() {
-                    repo = percent_decode(v);
                 }
             }
         }
 
         let clean_ver = version.trim().trim_start_matches(['v', 'V']).to_owned();
-        if !is_safe_semver(&clean_ver) || !is_safe_github_repo(&repo) {
+        if !is_safe_semver(&clean_ver) {
             write_json_response(
                 &mut stream,
                 "400 Bad Request",
-                br#"{"ok":false,"status":"invalid_parameters","message":"Invalid target version or repository parameter."}"#,
+                br#"{"ok":false,"status":"invalid_parameters","message":"Invalid target version parameter."}"#,
             );
             return;
         }
 
-        match perform_native_self_update(&repo, &clean_ver, proxy) {
+        match perform_native_self_update(DEFAULT_GITHUB_RELEASE_REPO, &clean_ver, proxy) {
             Ok((status_code, msg)) => {
-                let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped = escape_json_str(&msg);
                 let body =
                     format!(r#"{{"ok":true,"status":"{status_code}","message":"{escaped}"}}"#);
                 write_json_response(&mut stream, "200 OK", body.as_bytes());
             }
             Err((status_code, err_msg)) => {
-                let escaped = err_msg.replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped = escape_json_str(&err_msg);
                 let body =
                     format!(r#"{{"ok":false,"status":"{status_code}","message":"{escaped}"}}"#);
                 write_json_response(&mut stream, "500 Internal Server Error", body.as_bytes());
@@ -873,4 +900,236 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         "aac" => "audio/aac",
         _ => "application/octet-stream",
     }
+}
+
+fn normalize_folder_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() > 1 {
+        let stripped = trimmed.trim_end_matches(['/', '\\']);
+        if stripped.is_empty() {
+            trimmed.to_owned()
+        } else {
+            stripped.to_owned()
+        }
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn default_user_home_dir() -> PathBuf {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+        let pb = PathBuf::from(home);
+        if pb.is_dir() {
+            return pb;
+        }
+    }
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+fn handle_browse_dirs_request(stream: &mut TcpStream, raw_path: &str) {
+    let home = default_user_home_dir();
+    let target_buf = if raw_path.trim().is_empty() {
+        home.clone()
+    } else {
+        PathBuf::from(normalize_folder_path(raw_path))
+    };
+
+    if !target_buf.is_absolute() || !target_buf.is_dir() {
+        write_json_response(
+            stream,
+            "400 Bad Request",
+            br#"{"ok":false,"message":"Selected directory is unavailable."}"#,
+        );
+        return;
+    }
+
+    let current_path_str = normalize_folder_path(&target_buf.to_string_lossy());
+    let folder_name = target_buf
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&current_path_str);
+
+    let parent_json = match target_buf.parent() {
+        Some(p) if p != target_buf && !p.as_os_str().is_empty() => {
+            let p_str = escape_json_str(&normalize_folder_path(&p.to_string_lossy()));
+            format!(r#""{p_str}""#)
+        }
+        _ => "null".to_owned(),
+    };
+
+    let candidate_roots = [
+        ("Home", home.clone()),
+        ("Music", home.join("Music")),
+        ("Movies", home.join("Movies")),
+        ("Videos", home.join("Videos")),
+        ("Downloads", home.join("Downloads")),
+        ("Desktop", home.join("Desktop")),
+        ("Documents", home.join("Documents")),
+    ];
+    let mut roots_json = String::from("[");
+    let mut first_root = true;
+    for (label, pb) in candidate_roots {
+        if pb.is_dir() {
+            if !first_root {
+                roots_json.push(',');
+            }
+            first_root = false;
+            let escaped_p = escape_json_str(&normalize_folder_path(&pb.to_string_lossy()));
+            roots_json.push_str(&format!(r#"{{"label":"{label}","path":"{escaped_p}"}}"#));
+        }
+    }
+    roots_json.push(']');
+
+    let mut subdirs: Vec<(String, String)> = Vec::new();
+    let mut direct_media_count = 0_usize;
+
+    if let Ok(entries) = fs::read_dir(&target_buf) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Some(name) = entry_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(&entry_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                subdirs.push((
+                    name.to_owned(),
+                    normalize_folder_path(&entry_path.to_string_lossy()),
+                ));
+            } else if meta.is_file() && meta.len() > 0 {
+                let ext = entry_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if is_supported_media_extension(&ext) {
+                    direct_media_count = direct_media_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    subdirs.sort_by_key(|a| a.0.to_ascii_lowercase());
+
+    let mut dirs_json = String::from("[");
+    for (idx, (name, dir_path)) in subdirs.iter().take(400).enumerate() {
+        if idx > 0 {
+            dirs_json.push(',');
+        }
+        let esc_name = escape_json_str(name);
+        let esc_path = escape_json_str(dir_path);
+        dirs_json.push_str(&format!(r#"{{"name":"{esc_name}","path":"{esc_path}"}}"#));
+    }
+    dirs_json.push(']');
+
+    let esc_curr = escape_json_str(&current_path_str);
+    let esc_fname = escape_json_str(folder_name);
+    let body = format!(
+        r#"{{"ok":true,"current_path":"{esc_curr}","parent_path":{parent_json},"folder_name":"{esc_fname}","direct_media_count":{direct_media_count},"roots":{roots_json},"directories":{dirs_json}}}"#
+    );
+    write_json_response(stream, "200 OK", body.as_bytes());
+}
+
+fn collect_media_files_in_dir(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    max_files: usize,
+    out: &mut Vec<(String, String, u64)>,
+) {
+    if depth > max_depth || out.len() >= max_files {
+        return;
+    }
+    let Ok(entries_iter) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = entries_iter
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+
+    for path in entries {
+        if out.len() >= max_files {
+            break;
+        }
+        let Some(name_str) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_media_files_in_dir(&path, depth.saturating_add(1), max_depth, max_files, out);
+        } else if meta.is_file() && meta.len() > 0 {
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if is_supported_media_extension(&ext) {
+                out.push((
+                    path.to_string_lossy().into_owned(),
+                    name_str.to_owned(),
+                    meta.len(),
+                ));
+            }
+        }
+    }
+}
+
+fn handle_scan_folder_request(stream: &mut TcpStream, raw_path: &str) {
+    let normalized = normalize_folder_path(raw_path);
+    let candidate = Path::new(&normalized);
+    if normalized.is_empty() || !candidate.is_absolute() || !candidate.is_dir() {
+        write_json_response(
+            stream,
+            "400 Bad Request",
+            br#"{"ok":false,"message":"Folder not found or not accessible on this device."}"#,
+        );
+        return;
+    }
+
+    let folder_name = candidate
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&normalized);
+
+    let mut discovered: Vec<(String, String, u64)> = Vec::new();
+    collect_media_files_in_dir(candidate, 0, 4, 2_000, &mut discovered);
+
+    let mut files_json = String::from("[");
+    for (idx, (file_path, file_name, size)) in discovered.iter().enumerate() {
+        if idx > 0 {
+            files_json.push(',');
+        }
+        let escaped_path = escape_json_str(file_path);
+        let escaped_name = escape_json_str(file_name);
+        files_json.push_str(&format!(
+            r#"{{"path":"{escaped_path}","name":"{escaped_name}","size":{size}}}"#
+        ));
+    }
+    files_json.push(']');
+
+    let escaped_folder_path = escape_json_str(&normalized);
+    let escaped_folder_name = escape_json_str(folder_name);
+    let body = format!(
+        r#"{{"ok":true,"folder_path":"{escaped_folder_path}","folder_name":"{escaped_folder_name}","files":{files_json}}}"#
+    );
+    write_json_response(stream, "200 OK", body.as_bytes());
 }

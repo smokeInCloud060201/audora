@@ -41,6 +41,7 @@ export interface MediaItem {
   last_opened_at: string | null;
   last_seen_at: string;
   note_count: number;
+  source_folder_id?: string | null;
   stream_url?: string;
 }
 
@@ -120,6 +121,33 @@ export type TimestampPrecision = "nearest_second" | "milliseconds";
 
 export type WindowMode = "full" | "minimum";
 
+export interface TrustedSourceFolder {
+  id: string;
+  path: string;
+  label: string;
+  enabled: boolean;
+  added_at: string;
+  last_scanned_at: string;
+  media_count: number;
+}
+
+export interface LocalDirectoryListing {
+  current_path: string;
+  parent_path: string | null;
+  folder_name: string;
+  direct_media_count: number;
+  roots: Array<{ label: string; path: string }>;
+  directories: Array<{ name: string; path: string }>;
+}
+
+export interface SourceFolderPreview {
+  folder_path: string;
+  folder_name: string;
+  files: Array<{ path: string; name: string; size: number }>;
+  video_count: number;
+  audio_count: number;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   resume_where_left_off: boolean;
@@ -128,9 +156,9 @@ export interface AppSettings {
   timestamp_precision: TimestampPrecision;
   window_mode: WindowMode;
   auto_check_updates?: boolean;
-  github_release_repo?: string;
   installed_version?: string | null;
   dismissed_update_version?: string | null;
+  source_folders?: TrustedSourceFolder[];
 }
 
 export interface ReleaseManifestDto {
@@ -163,7 +191,28 @@ export interface CleanupSummaryDto {
   bytes_reclaimed: number;
 }
 
-export type PrimarySection = "library" | "now_playing" | "settings";
+export interface Playlist {
+  id: string;
+  name: string;
+  description: string;
+  item_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreatePlaylistInput {
+  name: string;
+  description?: string;
+  initial_item_ids?: string[];
+}
+
+export interface UpdatePlaylistInput {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export type PrimarySection = "library" | "playlists" | "now_playing" | "settings";
 
 export type SidePanelTab = "queue" | "notes";
 
@@ -175,6 +224,7 @@ export interface DiagnosticReport {
   media_count: number;
   missing_media_count: number;
   total_note_count: number;
+  playlist_count: number;
   playback_state: PlaybackState;
   last_error_code: ErrorCode | null;
   generated_at: string;

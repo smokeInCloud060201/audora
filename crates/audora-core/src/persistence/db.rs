@@ -11,6 +11,9 @@ use crate::error::{AppError, AppResult};
 /// Embedded SQL for migration `0001_initial.sql`.
 pub const MIGRATION_0001_INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
 
+/// Embedded SQL for migration `0002_playlists.sql`.
+pub const MIGRATION_0002_PLAYLISTS_SQL: &str = include_str!("../../migrations/0002_playlists.sql");
+
 /// A versioned SQL migration specification.
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationSpec {
@@ -20,11 +23,18 @@ pub struct MigrationSpec {
 }
 
 /// Built-in ordered schema migrations.
-pub const BUILTIN_MIGRATIONS: &[MigrationSpec] = &[MigrationSpec {
-    version: 1,
-    name: "0001_initial",
-    sql: MIGRATION_0001_INITIAL_SQL,
-}];
+pub const BUILTIN_MIGRATIONS: &[MigrationSpec] = &[
+    MigrationSpec {
+        version: 1,
+        name: "0001_initial",
+        sql: MIGRATION_0001_INITIAL_SQL,
+    },
+    MigrationSpec {
+        version: 2,
+        name: "0002_playlists",
+        sql: MIGRATION_0002_PLAYLISTS_SQL,
+    },
+];
 
 /// Thread-safe SQLite database handle with migration and backup guarantees.
 #[derive(Clone)]
@@ -69,10 +79,13 @@ impl Database {
             let _ = fs::remove_file(&shm_path);
 
             let manual_bak = db_path.with_extension("sqlite.manual.bak");
+            let pre_v2_bak = db_path.with_extension("sqlite.pre-v2.bak");
             let pre_v1_bak = db_path.with_extension("sqlite.pre-v1.bak");
 
             if manual_bak.exists() {
                 let _ = fs::copy(&manual_bak, &db_path);
+            } else if pre_v2_bak.exists() {
+                let _ = fs::copy(&pre_v2_bak, &db_path);
             } else if pre_v1_bak.exists() {
                 let _ = fs::copy(&pre_v1_bak, &db_path);
             } else {

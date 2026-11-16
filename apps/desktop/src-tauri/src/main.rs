@@ -154,6 +154,7 @@ fn main() {
 
     let window = match WindowBuilder::new()
         .with_title("Audora")
+        .with_resizable(true)
         .with_inner_size(LogicalSize::new(DEFAULT_FULL_WIDTH, DEFAULT_FULL_HEIGHT))
         .with_min_inner_size(LogicalSize::new(MIN_FULL_WIDTH, MIN_FULL_HEIGHT))
         .build(&event_loop)
@@ -259,8 +260,6 @@ fn main() {
                         is_minimum_mode = true;
                         let min_sz = LogicalSize::new(MINIMUM_WIDGET_WIDTH, MINIMUM_WIDGET_HEIGHT);
                         win.set_min_inner_size(Some(min_sz));
-                        win.set_max_inner_size(Some(min_sz));
-                        win.set_resizable(false);
                         win.set_decorations(false);
                         win.set_always_on_top(true);
                         win.set_inner_size(min_sz);
@@ -270,7 +269,6 @@ fn main() {
                         win.set_always_on_top(false);
                         win.set_decorations(true);
                         win.set_resizable(true);
-                        win.set_max_inner_size(None::<LogicalSize<f64>>);
                         apply_full_window_bounds_and_center(win, saved_full_size);
                     }
                 }

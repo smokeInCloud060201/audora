@@ -276,6 +276,22 @@ function audoraLocalDevBridge(): Plugin {
         if (!req.url) return next();
         const urlObj = new URL(req.url, "http://localhost");
 
+        if (urlObj.pathname.startsWith("/__audora_")) {
+          const secFetchSite = String(req.headers["sec-fetch-site"] ?? "").toLowerCase();
+          const origin = String(req.headers.origin ?? "").trim();
+          const crossSite =
+            (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") ||
+            (origin &&
+              origin !== "null" &&
+              !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin));
+          if (crossSite) {
+            res.statusCode = 403;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ ok: false, message: "Cross-origin loopback request blocked." }));
+            return;
+          }
+        }
+
         if (urlObj.pathname === "/__audora_probe_media") {
           const rawPath = urlObj.searchParams.get("path")?.trim() ?? "";
           res.setHeader("Content-Type", "application/json; charset=utf-8");

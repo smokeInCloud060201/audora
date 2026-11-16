@@ -28,6 +28,7 @@
   --text-tertiary: #929aa6;
   --text-muted: #8d96a0;
   --status-error-fg: #ec7d77;
+  --status-error-text: #ec7d77;
   --status-error-bg: #231c1d;
   --status-error-border: #3b3535;
   --status-warn-fg: #e3b341;
@@ -65,6 +66,7 @@
   --text-tertiary: #5a636e;
   --text-muted: #5a636e;
   --status-error-fg: #b42318;
+  --status-error-text: #b42318;
   --status-error-bg: #fef3f2;
   --status-error-border: #fecdca;
   --status-warn-fg: #b54708;

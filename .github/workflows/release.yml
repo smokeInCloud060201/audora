@@ -180,6 +180,8 @@ jobs:
             codesign --verify --deep --strict --verbose=2 "dist-macos/Audora.app"
 
             ln -s /Applications "dist-macos/Applications"
+            cp apps/desktop/src-tauri/installer/macos/uninstall-cleanup.sh "dist-macos/Uninstall Audora.command"
+            chmod +x "dist-macos/Uninstall Audora.command"
             if command -v SetFile >/dev/null 2>&1; then
               SetFile -a C "dist-macos" || true
             fi
@@ -240,8 +242,55 @@ jobs:
             cp -R apps/desktop/ui/dist/* "${WIN_STAGE}/ui/"
             cp LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json "${WIN_STAGE}/"
             cp apps/desktop/src-tauri/installer/windows/nsis-hooks.nsh "${WIN_STAGE}/installer/"
-            PRIMARY_ASSET="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-setup.zip"
-            powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist-windows/Audora/*' -DestinationPath '${PRIMARY_ASSET}' -Force"
+            PORTABLE_ZIP="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-portable.zip"
+            powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist-windows/Audora/*' -DestinationPath '${PORTABLE_ZIP}' -Force"
+
+            if command -v makensis >/dev/null 2>&1 || [[ -x "/c/Program Files (x86)/NSIS/makensis.exe" ]]; then
+              MAKENSIS_BIN=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
+              SETUP_EXE="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-setup.exe"
+              cat > dist-windows/audora-installer.nsi <<NSIS
+          !include "MUI2.nsh"
+          Name "Audora ${CLEAN_VERSION}"
+          OutFile "../${SETUP_EXE}"
+          InstallDir "\$LOCALAPPDATA\\Programs\\Audora"
+          RequestExecutionLevel user
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_UNPAGE_CONFIRM
+          !insertmacro MUI_UNPAGE_INSTFILES
+          !insertmacro MUI_LANGUAGE "English"
+
+          Section "Install"
+            SetOutPath "\$INSTDIR"
+            File /r "Audora\\*.*"
+            WriteUninstaller "\$INSTDIR\\Uninstall.exe"
+            CreateDirectory "\$SMPROGRAMS\\Audora"
+            CreateShortCut "\$SMPROGRAMS\\Audora\\Audora.lnk" "\$INSTDIR\\Audora.exe"
+            CreateShortCut "\$DESKTOP\\Audora.lnk" "\$INSTDIR\\Audora.exe"
+            WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayName" "Audora"
+            WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayVersion" "${CLEAN_VERSION}"
+            WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "Publisher" "Audora Contributors"
+            WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "UninstallString" '"\$INSTDIR\\Uninstall.exe"'
+          SectionEnd
+
+          Section "Uninstall"
+            IfFileExists "\$INSTDIR\\Audora.exe" 0 +2
+              nsExec::ExecToLog '"\$INSTDIR\\Audora.exe" --uninstall-cleanup'
+            RMDir /r "\$APPDATA\\com.audora.desktop"
+            RMDir /r "\$APPDATA\\com.audora.app"
+            RMDir /r "\$LOCALAPPDATA\\com.audora.desktop"
+            Delete "\$SMPROGRAMS\\Audora\\Audora.lnk"
+            RMDir "\$SMPROGRAMS\\Audora"
+            Delete "\$DESKTOP\\Audora.lnk"
+            RMDir /r "\$INSTDIR"
+            DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora"
+          SectionEnd
+          NSIS
+              (cd dist-windows && "${MAKENSIS_BIN}" audora-installer.nsi)
+              PRIMARY_ASSET="${SETUP_EXE}"
+            else
+              PRIMARY_ASSET="${PORTABLE_ZIP}"
+            fi
           fi
 
           ASSET_BASENAME=$(basename "${PRIMARY_ASSET}")

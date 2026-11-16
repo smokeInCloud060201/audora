@@ -1812,6 +1812,35 @@ export class AudoraIpcClient {
     return "~/Library/Application Support/com.audora.desktop/audora.sqlite.manual.bak";
   }
 
+  public async createManualBackupNative(): Promise<string> {
+    const fallbackPath = this.createManualBackup();
+    this.persistToStorage();
+    if (
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost")
+    ) {
+      try {
+        const res = await fetch("/__audora_backup", { method: "POST" });
+        if (res.ok) {
+          const text = await res.text();
+          if (text.trim().startsWith("{")) {
+            const parsed = JSON.parse(text) as {
+              ok?: boolean;
+              backup_path?: string;
+            };
+            if (parsed.ok && parsed.backup_path) {
+              return parsed.backup_path;
+            }
+          }
+        }
+      } catch {
+        // Fall back to localStorage snapshot path in browser dev mode
+      }
+    }
+    return fallbackPath;
+  }
+
   // =========================================================================
   // Multi-Playlist Management (`0002_playlists`)
   // =========================================================================

@@ -24,6 +24,14 @@ use services::AudoraAppService;
 
 /// Builds a production `CommandDispatcher` backed by an on-disk SQLite database and `GStreamerBackend`.
 pub fn build_production_dispatcher(db_path: impl AsRef<Path>) -> AppResult<CommandDispatcher> {
+    let (dispatcher, _) = build_production_dispatcher_with_db(db_path)?;
+    Ok(dispatcher)
+}
+
+/// Builds a production `CommandDispatcher` and returns its shared `Database` handle for SQLite state/backup operations.
+pub fn build_production_dispatcher_with_db(
+    db_path: impl AsRef<Path>,
+) -> AppResult<(CommandDispatcher, Database)> {
     let path_ref = db_path.as_ref();
     let app_data_dir = path_ref
         .parent()
@@ -32,7 +40,7 @@ pub fn build_production_dispatcher(db_path: impl AsRef<Path>) -> AppResult<Comma
     let media_repo = Arc::new(SqliteMediaRepository::new(db.clone()));
     let notes_repo = Arc::new(SqliteNotesRepository::new(db.clone()));
     let playlist_repo = Arc::new(SqlitePlaylistRepository::new(db.clone()));
-    let settings_repo = Arc::new(SqliteSettingsRepository::new(db));
+    let settings_repo = Arc::new(SqliteSettingsRepository::new(db.clone()));
     let playback_backend = Arc::new(GStreamerBackend::new());
     let service = AudoraAppService::with_data_dir(
         media_repo,
@@ -42,7 +50,7 @@ pub fn build_production_dispatcher(db_path: impl AsRef<Path>) -> AppResult<Comma
         playback_backend,
         app_data_dir,
     );
-    Ok(CommandDispatcher::new(service))
+    Ok((CommandDispatcher::new(service), db))
 }
 
 /// Builds an in-memory `CommandDispatcher` with a `FakePlaybackBackend` for deterministic testing.
@@ -78,6 +86,7 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::persistence::{
         MigrationSpec, MIGRATION_0001_INITIAL_SQL, MIGRATION_0002_PLAYLISTS_SQL,
+        MIGRATION_0003_UI_STATE_SQL,
     };
 
     fn create_dummy_media_file(dir: &TempDir, name: &str, contents: &[u8]) -> std::path::PathBuf {
@@ -108,7 +117,7 @@ mod tests {
                 .expect("create note");
         }
 
-        // 2. Attempt to upgrade with a faulty v3 migration on top of v1 + v2.
+        // 2. Attempt to upgrade with a faulty v4 migration on top of v1 + v2 + v3.
         let faulty_migrations = [
             MigrationSpec {
                 version: 1,
@@ -122,7 +131,12 @@ mod tests {
             },
             MigrationSpec {
                 version: 3,
-                name: "0003_broken",
+                name: "0003_ui_state",
+                sql: MIGRATION_0003_UI_STATE_SQL,
+            },
+            MigrationSpec {
+                version: 4,
+                name: "0004_broken",
                 sql: "ALTER TABLE notes ADD COLUMN valid_col TEXT; INVALID SQL SYNTAX HERE;",
             },
         ];
@@ -132,17 +146,17 @@ mod tests {
         let err = result.err().expect("error");
         assert_eq!(err.code(), ErrorCode::PersistenceFailure);
 
-        // 3. Verify that the pre-migration backup file was created before v3 ran.
-        let expected_backup = db_path.with_extension("sqlite.pre-v2.bak");
+        // 3. Verify that the pre-migration backup file was created before v4 ran.
+        let expected_backup = db_path.with_extension("sqlite.pre-v3.bak");
         assert!(
             expected_backup.exists(),
             "pre-migration backup file must exist at {}",
             expected_backup.display()
         );
 
-        // 4. Verify the original database rolled back cleanly to v2 and kept the note!
-        let recovered_db = Database::open(&db_path).expect("reopen rolled-back v2 db");
-        assert_eq!(recovered_db.schema_version().expect("version"), 2);
+        // 4. Verify the original database rolled back cleanly to v3 and kept the note!
+        let recovered_db = Database::open(&db_path).expect("reopen rolled-back v3 db");
+        assert_eq!(recovered_db.schema_version().expect("version"), 3);
         let notes_repo = SqliteNotesRepository::new(recovered_db.clone());
         let media_repo = SqliteMediaRepository::new(recovered_db);
         let items = media_repo
@@ -837,5 +851,31 @@ Properties:
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn sqlite_ui_state_snapshot_persists_backs_up_and_clears_atomically() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora.sqlite");
+        let (_, db) = build_production_dispatcher_with_db(&db_path).expect("open db");
+
+        assert_eq!(db.schema_version().expect("schema v3"), 3);
+        assert_eq!(db.get_ui_state_json().expect("empty state"), None);
+
+        let sample = r#"{"media":[],"notes":[],"playlists":[],"settings":{"theme":"dark"}}"#;
+        db.set_ui_state_json(sample).expect("persist ui state");
+        assert_eq!(
+            db.get_ui_state_json().expect("read ui state").as_deref(),
+            Some(sample)
+        );
+
+        let backup_path = db
+            .create_manual_backup()
+            .expect("create backup")
+            .expect("backup path");
+        assert!(backup_path.is_file());
+
+        db.clear_ui_state().expect("clear ui state");
+        assert_eq!(db.get_ui_state_json().expect("cleared"), None);
     }
 }

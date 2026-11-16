@@ -16,15 +16,16 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use audora_desktop::{
-    build_production_dispatcher, default_app_data_dir, default_database_path,
-    domain::DEFAULT_GITHUB_RELEASE_REPO, services::cleanup_all_app_artifacts,
+    build_production_dispatcher_with_db, default_app_data_dir, default_database_path,
+    domain::DEFAULT_GITHUB_RELEASE_REPO, persistence::Database,
+    services::cleanup_all_app_artifacts,
 };
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Window, WindowBuilder};
 use tracing::{error, info, warn};
-use wry::{BackgroundThrottlingPolicy, WebViewBuilder};
+use wry::{BackgroundThrottlingPolicy, WebContext, WebViewBuilder};
 
 #[derive(Debug, Clone, Copy)]
 enum DesktopUserEvent {
@@ -74,8 +75,8 @@ fn main() {
     }
 
     let db_path = default_database_path();
-    let dispatcher = match build_production_dispatcher(&db_path) {
-        Ok(d) => Arc::new(d),
+    let (dispatcher, db) = match build_production_dispatcher_with_db(&db_path) {
+        Ok((d, database)) => (Arc::new(d), database),
         Err(err) => {
             error!(
                 code = err.code().as_str(),
@@ -84,6 +85,20 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // One-time seamless migration of legacy `ui-state.json` into `audora.sqlite`
+    let legacy_state_file = default_app_data_dir().join("ui-state.json");
+    if legacy_state_file.is_file() {
+        if let Ok(None) = db.get_ui_state_json() {
+            if let Ok(raw) = fs::read_to_string(&legacy_state_file) {
+                if raw.trim().starts_with('{') && db.set_ui_state_json(&raw).is_ok() {
+                    let _ = fs::remove_file(&legacy_state_file);
+                }
+            }
+        } else {
+            let _ = fs::remove_file(&legacy_state_file);
+        }
+    }
 
     let cli_paths: Vec<String> = args
         .iter()
@@ -130,7 +145,7 @@ fn main() {
     let event_loop = EventLoopBuilder::<DesktopUserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let Some(server_url) = start_local_ui_server(ui_dist, proxy.clone()) else {
+    let Some(server_url) = start_local_ui_server(ui_dist, proxy.clone(), db) else {
         error!("Failed to bind local UI loopback server");
         std::process::exit(1);
     };
@@ -170,8 +185,12 @@ fn main() {
       });
     "#;
 
+    let webview_data_dir = default_app_data_dir().join("webview");
+    let _ = fs::create_dir_all(&webview_data_dir);
+    let mut web_context = WebContext::new(Some(webview_data_dir));
+
     let ipc_proxy = proxy.clone();
-    let webview = match WebViewBuilder::new()
+    let webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_url(&server_url)
         .with_initialization_script(init_script)
         .with_ipc_handler(move |request| match request.body().as_str() {
@@ -209,6 +228,7 @@ fn main() {
     };
 
     let mut webview = Some(webview);
+    let mut web_context = Some(web_context);
     let mut window = Some(window);
     let mut saved_full_size = LogicalSize::new(DEFAULT_FULL_WIDTH, DEFAULT_FULL_HEIGHT);
     let mut is_minimum_mode = false;
@@ -224,6 +244,7 @@ fn main() {
             | Event::UserEvent(DesktopUserEvent::Quit)
             | Event::LoopDestroyed => {
                 drop(webview.take());
+                drop(web_context.take());
                 drop(window.take());
                 *control_flow = ControlFlow::Exit;
                 std::process::exit(0);
@@ -357,22 +378,34 @@ fn resolve_ui_dist_dir() -> Option<PathBuf> {
     None
 }
 
+struct ParsedHttpRequest {
+    method: String,
+    raw_target: String,
+    range_header: Option<String>,
+    origin: Option<String>,
+    sec_fetch_site: Option<String>,
+    body: Vec<u8>,
+}
+
 fn start_local_ui_server(
     ui_dist: PathBuf,
     proxy: EventLoopProxy<DesktopUserEvent>,
+    db: Database,
 ) -> Option<String> {
     let listener = (41957..=41966)
         .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
         .or_else(|| TcpListener::bind(("127.0.0.1", 0)).ok())?;
     let local_addr = listener.local_addr().ok()?;
-    let url = format!("http://127.0.0.1:{}/", local_addr.port());
+    let local_port = local_addr.port();
+    let url = format!("http://127.0.0.1:{local_port}/");
 
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let root = ui_dist.clone();
             let stream_proxy = proxy.clone();
+            let stream_db = db.clone();
             thread::spawn(move || {
-                handle_http_connection(stream, &root, &stream_proxy);
+                handle_http_connection(stream, &root, &stream_proxy, &stream_db, local_port);
             });
         }
     });
@@ -380,7 +413,7 @@ fn start_local_ui_server(
     Some(url)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Option<(String, String, Option<String>, Vec<u8>)> {
+fn read_http_request(stream: &mut TcpStream) -> Option<ParsedHttpRequest> {
     let mut header_buf = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
@@ -409,6 +442,8 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String, Option<S
 
     let mut content_length = 0_usize;
     let mut range_header: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut sec_fetch_site: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
@@ -418,6 +453,10 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String, Option<S
                 }
             } else if key.eq_ignore_ascii_case("range") {
                 range_header = Some(v.trim().to_owned());
+            } else if key.eq_ignore_ascii_case("origin") {
+                origin = Some(v.trim().to_owned());
+            } else if key.eq_ignore_ascii_case("sec-fetch-site") {
+                sec_fetch_site = Some(v.trim().to_ascii_lowercase());
             }
         }
     }
@@ -439,7 +478,39 @@ fn read_http_request(stream: &mut TcpStream) -> Option<(String, String, Option<S
     }
     body.truncate(content_length);
 
-    Some((method, raw_target, range_header, body))
+    Some(ParsedHttpRequest {
+        method,
+        raw_target,
+        range_header,
+        origin,
+        sec_fetch_site,
+        body,
+    })
+}
+
+fn is_trusted_loopback_request(
+    local_port: u16,
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+) -> bool {
+    if let Some(site) = sec_fetch_site {
+        if site != "same-origin" && site != "none" {
+            return false;
+        }
+    }
+    if let Some(orig) = origin {
+        let trimmed = orig.trim();
+        if !trimmed.is_empty() && trimmed != "null" {
+            let expected_ip = format!("http://127.0.0.1:{local_port}");
+            let expected_local = format!("http://localhost:{local_port}");
+            if !trimmed.eq_ignore_ascii_case(&expected_ip)
+                && !trimmed.eq_ignore_ascii_case(&expected_local)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn write_json_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
@@ -479,14 +550,35 @@ fn handle_http_connection(
     mut stream: TcpStream,
     root: &Path,
     proxy: &EventLoopProxy<DesktopUserEvent>,
+    db: &Database,
+    local_port: u16,
 ) {
-    let Some((method, raw_target, range_header, req_body)) = read_http_request(&mut stream) else {
+    let Some(req) = read_http_request(&mut stream) else {
         return;
     };
+    let method = req.method;
+    let raw_target = req.raw_target;
+    let range_header = req.range_header;
+    let req_body = req.body;
 
     let (raw_path, raw_query) = raw_target
         .split_once('?')
         .map_or((raw_target.as_str(), ""), |(p, q)| (p, q));
+
+    if raw_path.starts_with("/__audora_")
+        && !is_trusted_loopback_request(
+            local_port,
+            req.origin.as_deref(),
+            req.sec_fetch_site.as_deref(),
+        )
+    {
+        write_json_response(
+            &mut stream,
+            "403 Forbidden",
+            br#"{"ok":false,"message":"Cross-origin loopback request blocked."}"#,
+        );
+        return;
+    }
 
     if raw_path == "/__audora_media" {
         let mut media_path_str = String::new();
@@ -622,23 +714,43 @@ fn handle_http_connection(
         return;
     }
 
-    if raw_path == "/__audora_state" {
-        let data_dir = default_app_data_dir();
-        let state_file = data_dir.join("ui-state.json");
-        match method.as_str() {
-            "GET" => {
-                if let Ok(bytes) = fs::read(&state_file) {
-                    write_json_response(&mut stream, "200 OK", &bytes);
-                } else {
-                    write_json_response(&mut stream, "200 OK", b"{}");
-                }
+    if raw_path == "/__audora_backup" && method == "POST" {
+        match db.create_manual_backup() {
+            Ok(Some(backup_path)) => {
+                let escaped = escape_json_str(&backup_path.display().to_string());
+                let body = format!(r#"{{"ok":true,"backup_path":"{escaped}"}}"#);
+                write_json_response(&mut stream, "200 OK", body.as_bytes());
             }
+            _ => {
+                write_json_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    br#"{"ok":false,"message":"Failed to create SQLite manual backup."}"#,
+                );
+            }
+        }
+        return;
+    }
+
+    if raw_path == "/__audora_state" {
+        let legacy_state_file = default_app_data_dir().join("ui-state.json");
+        match method.as_str() {
+            "GET" => match db.get_ui_state_json() {
+                Ok(Some(json)) => {
+                    write_json_response(&mut stream, "200 OK", json.as_bytes());
+                }
+                _ => {
+                    if let Ok(bytes) = fs::read(&legacy_state_file) {
+                        write_json_response(&mut stream, "200 OK", &bytes);
+                    } else {
+                        write_json_response(&mut stream, "200 OK", b"{}");
+                    }
+                }
+            },
             "POST" => {
-                if fs::create_dir_all(&data_dir).is_ok() {
-                    let tmp_file = data_dir.join("ui-state.json.tmp");
-                    if fs::write(&tmp_file, &req_body).is_ok()
-                        && fs::rename(&tmp_file, &state_file).is_ok()
-                    {
+                if let Ok(json_str) = std::str::from_utf8(&req_body) {
+                    if json_str.trim().starts_with('{') && db.set_ui_state_json(json_str).is_ok() {
+                        let _ = fs::remove_file(&legacy_state_file);
                         write_json_response(&mut stream, "200 OK", br#"{"ok":true}"#);
                         return;
                     }
@@ -646,7 +758,8 @@ fn handle_http_connection(
                 write_json_response(&mut stream, "500 Internal Server Error", br#"{"ok":false}"#);
             }
             "DELETE" => {
-                let _ = fs::remove_file(&state_file);
+                let _ = db.clear_ui_state();
+                let _ = fs::remove_file(&legacy_state_file);
                 write_json_response(&mut stream, "200 OK", br#"{"ok":true}"#);
             }
             _ => {

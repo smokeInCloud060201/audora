@@ -14,6 +14,9 @@ pub const MIGRATION_0001_INITIAL_SQL: &str = include_str!("../../migrations/0001
 /// Embedded SQL for migration `0002_playlists.sql`.
 pub const MIGRATION_0002_PLAYLISTS_SQL: &str = include_str!("../../migrations/0002_playlists.sql");
 
+/// Embedded SQL for migration `0003_ui_state.sql`.
+pub const MIGRATION_0003_UI_STATE_SQL: &str = include_str!("../../migrations/0003_ui_state.sql");
+
 /// A versioned SQL migration specification.
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationSpec {
@@ -33,6 +36,11 @@ pub const BUILTIN_MIGRATIONS: &[MigrationSpec] = &[
         version: 2,
         name: "0002_playlists",
         sql: MIGRATION_0002_PLAYLISTS_SQL,
+    },
+    MigrationSpec {
+        version: 3,
+        name: "0003_ui_state",
+        sql: MIGRATION_0003_UI_STATE_SQL,
     },
 ];
 
@@ -79,11 +87,14 @@ impl Database {
             let _ = fs::remove_file(&shm_path);
 
             let manual_bak = db_path.with_extension("sqlite.manual.bak");
+            let pre_v3_bak = db_path.with_extension("sqlite.pre-v3.bak");
             let pre_v2_bak = db_path.with_extension("sqlite.pre-v2.bak");
             let pre_v1_bak = db_path.with_extension("sqlite.pre-v1.bak");
 
             if manual_bak.exists() {
                 let _ = fs::copy(&manual_bak, &db_path);
+            } else if pre_v3_bak.exists() {
+                let _ = fs::copy(&pre_v3_bak, &db_path);
             } else if pre_v2_bak.exists() {
                 let _ = fs::copy(&pre_v2_bak, &db_path);
             } else if pre_v1_bak.exists() {
@@ -212,6 +223,44 @@ impl Database {
     /// Returns the highest applied migration version (`0` if none applied).
     pub fn schema_version(&self) -> AppResult<i64> {
         self.with_conn(|conn| Self::current_schema_version(conn))
+    }
+
+    /// Reads the canonical persisted UI state JSON snapshot from `app_ui_state`, if present.
+    pub fn get_ui_state_json(&self) -> AppResult<Option<String>> {
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT payload_json FROM app_ui_state WHERE key = 'v2' LIMIT 1;")?;
+            let mut rows = stmt.query([])?;
+            if let Some(row) = rows.next()? {
+                let val: String = row.get(0)?;
+                Ok(Some(val))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Atomically upserts the canonical persisted UI state JSON snapshot inside `audora.sqlite`.
+    pub fn set_ui_state_json(&self, payload_json: &str) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO app_ui_state (key, payload_json, updated_at)
+                 VALUES ('v2', ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 ON CONFLICT(key) DO UPDATE SET
+                   payload_json = excluded.payload_json,
+                   updated_at = excluded.updated_at;",
+                [payload_json],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Clears persisted UI state from `app_ui_state`.
+    pub fn clear_ui_state(&self) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM app_ui_state;", [])?;
+            Ok(())
+        })
     }
 
     fn configure_pragmas(conn: &Connection) -> AppResult<()> {

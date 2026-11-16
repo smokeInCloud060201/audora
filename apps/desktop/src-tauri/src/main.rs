@@ -947,10 +947,15 @@ fn normalize_folder_path(raw: &str) -> String {
 }
 
 fn canonical_path_string(p: &Path) -> String {
-    fs::canonicalize(p)
+    let raw = fs::canonicalize(p)
         .unwrap_or_else(|_| p.to_path_buf())
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        stripped.to_owned()
+    } else {
+        raw
+    }
 }
 
 fn pick_native_media_files() -> Vec<(String, String, u64)> {

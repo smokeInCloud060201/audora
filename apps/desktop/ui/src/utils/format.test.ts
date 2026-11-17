@@ -258,7 +258,7 @@ describe("AudoraIpcClient workflows", () => {
   it("stages GitHub release JSON, prioritizes .app.tar.gz over .dmg, respects dismiss vs manual check, installs update, and cleans up app data", async () => {
     const client = new AudoraIpcClient(false);
     const initial = client.checkForUpdates();
-    expect(initial.current_version).toBe("1.1.0");
+    expect(initial.current_version).toBe("1.1.1");
     expect(initial.github_repo).toBe(DEFAULT_GITHUB_RELEASE_REPO);
     expect(initial.update_available).toBe(false);
 
@@ -308,7 +308,7 @@ describe("AudoraIpcClient workflows", () => {
 
     const cleanup = client.cleanupApplicationData();
     expect(cleanup.removed_paths.length).toBeGreaterThan(0);
-    expect(client.getCurrentVersion()).toBe("1.1.0");
+    expect(client.getCurrentVersion()).toBe("1.1.1");
     expect("github_release_repo" in client.getSettings()).toBe(false);
   });
 

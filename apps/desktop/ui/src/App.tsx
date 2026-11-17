@@ -1758,6 +1758,15 @@ export function App(): React.ReactElement {
                         min={0}
                         max={snapshot.duration_ms ?? 100}
                         value={displayPositionMs}
+                        style={
+                          {
+                            "--scrub-pct": `${
+                              snapshot.duration_ms && snapshot.duration_ms > 0
+                                ? Math.min(100, Math.max(0, (displayPositionMs / snapshot.duration_ms) * 100))
+                                : 0
+                            }%`,
+                          } as React.CSSProperties
+                        }
                         onPointerDown={handleScrubPointerDown}
                         onChange={(e) => handleScrubChange(Number(e.target.value))}
                         onPointerUp={(e) => handleScrubCommit(Number(e.currentTarget.value))}

@@ -18,6 +18,8 @@
   --border-control: #303640;
   --border-window: #30353d;
   --border-dashed: #343a43;
+  --scrubber-track-bg: #2c333d;
+  --scrubber-track-hover-bg: #363f4b;
   --accent-primary: #73d4bd;
   --accent-on-primary: #092019;
   --accent-surface: #172a26;
@@ -56,6 +58,8 @@
   --border-control: #c7c4bc;
   --border-window: #c7c4bc;
   --border-dashed: #b5b1a8;
+  --scrubber-track-bg: #d4d1c8;
+  --scrubber-track-hover-bg: #c6c2b8;
   --accent-primary: #127864;
   --accent-on-primary: #ffffff;
   --accent-surface: #dff3ee;

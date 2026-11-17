@@ -2,6 +2,11 @@
 
 All notable changes to Audora are documented in this file.
 
+## [1.1.1] - 2026-11-17
+
+### Fixed
+- **Dark Mode Seek Timeline Visibility:** Replaced native WebView range slider groove styling on `.scrubber-slider` with explicit theme tokens (`--scrubber-track-bg: #2c333d`, `#363f4b` on hover) and a live progress gradient, and subtly lightened Minimum Mode's dark `--min-track-bg` (`#38413f`) so the unfilled timeline bar remains clearly visible against dark backgrounds in production builds.
+
 ## [1.1.0] - 2026-11-17
 
 ### Added

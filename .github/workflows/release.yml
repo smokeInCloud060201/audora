@@ -7,14 +7,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   package:
     name: Build Native Installers (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -63,12 +65,21 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
-      - name: Install frontend dependencies & build UI dist
+      - name: Verify tag version synchronization, install frontend dependencies & build UI dist
         shell: bash
         run: |
-          RAW_TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          set -euo pipefail
+          CARGO_VER=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/\[workspace\.package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m)[1])')
+          RAW_TAG="${GITHUB_REF_NAME:-v${CARGO_VER}}"
           if [[ "${RAW_TAG}" == v* ]]; then
-            export VITE_APP_VERSION="${RAW_TAG#v}"
+            TAG_VER="${RAW_TAG#v}"
+            if [[ "${TAG_VER}" != "${CARGO_VER}" ]]; then
+              echo "::error::Release tag v${TAG_VER} does not match Cargo.toml workspace version ${CARGO_VER}"
+              exit 1
+            fi
+            export VITE_APP_VERSION="${TAG_VER}"
+          else
+            export VITE_APP_VERSION="${CARGO_VER}"
           fi
           pnpm install --frozen-lockfile
           pnpm --dir apps/desktop/ui build
@@ -97,9 +108,10 @@ jobs:
           test -f THIRD_PARTY_NOTICES.md
           test -f sbom.cdx.json
 
-          RAW_TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          CARGO_VER=$(node -e 'console.log(require("fs").readFileSync("Cargo.toml","utf8").match(/\[workspace\.package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m)[1])')
+          RAW_TAG="${GITHUB_REF_NAME:-v${CARGO_VER}}"
           if [[ "${RAW_TAG}" != v* ]]; then
-            RAW_TAG="v0.1.0"
+            RAW_TAG="v${CARGO_VER}"
           fi
           CLEAN_VERSION="${RAW_TAG#v}"
           PUBLISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -185,7 +197,8 @@ jobs:
               xcrun stapler staple "dist-macos/Audora.app"
               rm -f "${RUNNER_TEMP}/Audora-notarize.zip"
             fi
-            tar -czf "release-artifacts/Audora_${CLEAN_VERSION}_macos-aarch64.app.tar.gz" -C dist-macos Audora.app
+            PRIMARY_ASSET="release-artifacts/Audora_${CLEAN_VERSION}_macos-aarch64.app.tar.gz"
+            tar -czf "${PRIMARY_ASSET}" -C dist-macos Audora.app
 
             ln -s /Applications "dist-macos/Applications"
             cp apps/desktop/src-tauri/installer/macos/uninstall-cleanup.sh "dist-macos/Uninstall Audora.command"
@@ -194,12 +207,12 @@ jobs:
               SetFile -a C "dist-macos" || true
             fi
 
-            PRIMARY_ASSET="release-artifacts/Audora_${CLEAN_VERSION}_macos-aarch64.dmg"
-            hdiutil create -volname "Audora" -srcfolder dist-macos -ov -format UDZO "${PRIMARY_ASSET}"
+            DMG_ASSET="release-artifacts/Audora_${CLEAN_VERSION}_macos-aarch64.dmg"
+            hdiutil create -volname "Audora" -srcfolder dist-macos -ov -format UDZO "${DMG_ASSET}"
             if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-              codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --timestamp "${PRIMARY_ASSET}"
-              xcrun notarytool submit "${PRIMARY_ASSET}" --apple-id "${APPLE_ID}" --password "${APPLE_PASSWORD}" --team-id "${APPLE_TEAM_ID}" --wait
-              xcrun stapler staple "${PRIMARY_ASSET}"
+              codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --timestamp "${DMG_ASSET}"
+              xcrun notarytool submit "${DMG_ASSET}" --apple-id "${APPLE_ID}" --password "${APPLE_PASSWORD}" --team-id "${APPLE_TEAM_ID}" --wait
+              xcrun stapler staple "${DMG_ASSET}"
             fi
 
           elif [[ "${MATRIX_PLATFORM}" == "ubuntu-latest" ]]; then
@@ -241,7 +254,7 @@ jobs:
 
           else
             WIN_STAGE="dist-windows/Audora"
-            mkdir -p "${WIN_STAGE}/ui" "${WIN_STAGE}/installer"
+            mkdir -p "${WIN_STAGE}/ui"
             if [[ -n "${WINDOWS_CERTIFICATE:-}" ]]; then
               echo "${WINDOWS_CERTIFICATE}" | base64 --decode > "${RUNNER_TEMP}/win_cert.pfx"
               signtool.exe sign /f "${RUNNER_TEMP}/win_cert.pfx" /p "${WINDOWS_CERTIFICATE_PASSWORD:-}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/audora.exe
@@ -249,7 +262,6 @@ jobs:
             cp target/release/audora.exe "${WIN_STAGE}/Audora.exe"
             cp -R apps/desktop/ui/dist/* "${WIN_STAGE}/ui/"
             cp LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json "${WIN_STAGE}/"
-            cp apps/desktop/src-tauri/installer/windows/nsis-hooks.nsh "${WIN_STAGE}/installer/"
             PORTABLE_ZIP="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-portable.zip"
             powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist-windows/Audora/*' -DestinationPath '${PORTABLE_ZIP}' -Force"
 
@@ -291,7 +303,6 @@ jobs:
             Delete "\$DESKTOP\\Audora.lnk"
             ; Remove only Audora's installed files & owned subdirectories — NEVER RMDir /r \$INSTDIR (`H-1`)
             RMDir /r "\$INSTDIR\\ui"
-            RMDir /r "\$INSTDIR\\installer"
             Delete "\$INSTDIR\\Audora.exe"
             Delete "\$INSTDIR\\LICENSE"
             Delete "\$INSTDIR\\THIRD_PARTY_NOTICES.md"
@@ -315,10 +326,8 @@ jobs:
           ASSET_SIZE=$(wc -c < "${PRIMARY_ASSET}" | tr -d '[:space:]')
           if command -v sha256sum >/dev/null 2>&1; then
             ASSET_SHA256=$(sha256sum "${PRIMARY_ASSET}" | awk '{print $1}')
-            sha256sum LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json release-artifacts/* > "release-artifacts/release-manifests-${ARTIFACT_LABEL}.sha256"
           else
             ASSET_SHA256=$(shasum -a 256 "${PRIMARY_ASSET}" | awk '{print $1}')
-            shasum -a 256 LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json release-artifacts/* > "release-artifacts/release-manifests-${ARTIFACT_LABEL}.sha256"
           fi
 
           cat > "release-artifacts/release-manifest-${ARTIFACT_LABEL}.json" <<EOF
@@ -333,9 +342,16 @@ jobs:
           }
           EOF
 
-      - name: Attest Cryptographic Build Provenance (Free GitHub Sigstore SLSA)
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json release-artifacts/* > "${RUNNER_TEMP}/release-manifests-${ARTIFACT_LABEL}.sha256"
+          else
+            shasum -a 256 LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json release-artifacts/* > "${RUNNER_TEMP}/release-manifests-${ARTIFACT_LABEL}.sha256"
+          fi
+          mv "${RUNNER_TEMP}/release-manifests-${ARTIFACT_LABEL}.sha256" "release-artifacts/release-manifests-${ARTIFACT_LABEL}.sha256"
+
+      - name: Attest Cryptographic Build Provenance (GitHub Sigstore SLSA)
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@v2
-        continue-on-error: true
         with:
           subject-path: "release-artifacts/*"
 
@@ -351,6 +367,8 @@ jobs:
     needs: package
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all platform installer artifacts
         uses: actions/download-artifact@v4

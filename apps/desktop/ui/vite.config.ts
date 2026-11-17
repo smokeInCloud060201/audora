@@ -85,10 +85,11 @@ function readMp4BoxHeader(
 
 function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
   let pos = 0;
-  let sidxFallbackMs: number | null = null;
+  let sidxSumMs = 0;
+  let hasSidx = false;
   let guard = 0;
 
-  while (pos < fileLen && guard < 256) {
+  while (pos < fileLen && guard < 4096) {
     guard += 1;
     const box = readMp4BoxHeader(fd, pos, fileLen);
     if (!box) break;
@@ -97,7 +98,7 @@ function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
       const moovEnd = pos + box.size;
       let cpos = pos + box.hdrLen;
       let cguard = 0;
-      while (cpos < moovEnd && cguard < 128) {
+      while (cpos < moovEnd && cguard < 512) {
         cguard += 1;
         const cbox = readMp4BoxHeader(fd, cpos, moovEnd);
         if (!cbox) break;
@@ -128,7 +129,7 @@ function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
         }
         cpos += cbox.size;
       }
-    } else if (box.type === "sidx" && sidxFallbackMs === null) {
+    } else if (box.type === "sidx") {
       const payloadLen = box.size - box.hdrLen;
       if (payloadLen >= 24 && payloadLen <= 2_097_152) {
         const sidx = readExactAt(fd, pos + box.hdrLen, payloadLen);
@@ -146,7 +147,10 @@ function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
               }
               if (sum > 0n) {
                 const ms = Number((sum * 1000n) / timescale);
-                if (Number.isFinite(ms) && ms > 0) sidxFallbackMs = ms;
+                if (Number.isFinite(ms) && ms > 0) {
+                  sidxSumMs += ms;
+                  hasSidx = true;
+                }
               }
             }
           }
@@ -157,12 +161,231 @@ function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
     pos += box.size;
   }
 
-  return sidxFallbackMs;
+  return hasSidx && sidxSumMs > 0 ? sidxSumMs : null;
+}
+
+function skipId3v2Tags(fd: number, fileLen: number): number {
+  let offset = 0;
+  for (let i = 0; i < 8; i += 1) {
+    if (offset + 10 > fileLen) break;
+    const hdr = readExactAt(fd, offset, 10);
+    if (!hdr || hdr.toString("latin1", 0, 3) !== "ID3") break;
+    if ((hdr[6]! & 0x80) !== 0 || (hdr[7]! & 0x80) !== 0 || (hdr[8]! & 0x80) !== 0 || (hdr[9]! & 0x80) !== 0) {
+      break;
+    }
+    const tagLen =
+      ((hdr[6]! & 0x7f) << 21) |
+      ((hdr[7]! & 0x7f) << 14) |
+      ((hdr[8]! & 0x7f) << 7) |
+      (hdr[9]! & 0x7f);
+    const footer = (hdr[5]! & 0x10) !== 0 ? 10 : 0;
+    const next = offset + 10 + tagLen + footer;
+    if (next <= offset || next >= fileLen) break;
+    offset = next;
+  }
+  return offset;
+}
+
+function probeMp3DurationMs(fd: number, fileLen: number): number | null {
+  const start = skipId3v2Tags(fd, fileLen);
+  const windowLen = Math.min(65536, fileLen - start);
+  if (windowLen < 8) return null;
+  const buf = readExactAt(fd, start, windowLen);
+  if (!buf) return null;
+  const sampleRates: Record<number, number[]> = {
+    3: [44100, 48000, 32000], // MPEG 1
+    2: [22050, 24000, 16000], // MPEG 2
+    0: [11025, 12000, 8000], // MPEG 2.5
+  };
+  const bitratesV1L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+  const bitratesV2L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+
+  for (let i = 0; i + 4 <= buf.length; i += 1) {
+    if (buf[i] !== 0xff || (buf[i + 1]! & 0xe0) !== 0xe0) continue;
+    const verBits = (buf[i + 1]! >> 3) & 0x03;
+    const layerBits = (buf[i + 1]! >> 1) & 0x03;
+    if (verBits === 1 || layerBits !== 1) continue;
+    const brIdx = (buf[i + 2]! >> 4) & 0x0f;
+    const srIdx = (buf[i + 2]! >> 2) & 0x03;
+    if (brIdx === 0 || brIdx === 15 || srIdx === 3) continue;
+    const sr = sampleRates[verBits]?.[srIdx] ?? 0;
+    const kbps = verBits === 3 ? (bitratesV1L3[brIdx] ?? 0) : (bitratesV2L3[brIdx] ?? 0);
+    if (!sr || !kbps) continue;
+    const padding = (buf[i + 2]! >> 1) & 0x01;
+    const samplesPerFrame = verBits === 3 ? 1152 : 576;
+    const frameLen = Math.floor(((samplesPerFrame / 8) * kbps * 1000) / sr) + padding;
+    if (frameLen < 24) continue;
+    if (i + frameLen + 2 <= buf.length) {
+      if (buf[i + frameLen] !== 0xff || (buf[i + frameLen + 1]! & 0xe0) !== 0xe0) continue;
+    }
+    const hasCrc = (buf[i + 1]! & 0x01) === 0;
+    const chanMode = (buf[i + 3]! >> 6) & 0x03;
+    const sideInfo = verBits === 3 ? (chanMode === 3 ? 17 : 32) : chanMode === 3 ? 9 : 17;
+    const xingOff = i + 4 + (hasCrc ? 2 : 0) + sideInfo;
+    if (xingOff + 12 <= buf.length) {
+      const tag = buf.toString("latin1", xingOff, xingOff + 4);
+      if ((tag === "Xing" || tag === "Info") && (buf.readUInt32BE(xingOff + 4) & 1) !== 0) {
+        const frames = buf.readUInt32BE(xingOff + 8);
+        if (frames > 0) return Math.round((frames * samplesPerFrame * 1000) / sr);
+      }
+    }
+    let audioBytes = fileLen - (start + i);
+    if (fileLen >= 128) {
+      const tail = readExactAt(fd, fileLen - 128, 3);
+      if (tail && tail.toString("latin1", 0, 3) === "TAG" && audioBytes > 128) {
+        audioBytes -= 128;
+      }
+    }
+    return Math.round((audioBytes * 8) / kbps);
+  }
+  return null;
+}
+
+function probeAacAdtsDurationMs(fd: number, fileLen: number): number | null {
+  const start = skipId3v2Tags(fd, fileLen);
+  const windowLen = Math.min(65536, fileLen - start);
+  if (windowLen < 14) return null;
+  const buf = readExactAt(fd, start, windowLen);
+  if (!buf) return null;
+  const freqs = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+  let pos = 0;
+  let sr = 0;
+  let frames = 0;
+  let bytesSum = 0;
+  while (pos + 7 <= buf.length && frames < 128) {
+    if (buf[pos] !== 0xff || (buf[pos + 1]! & 0xf6) !== 0xf0) {
+      if (frames > 0) break;
+      pos += 1;
+      continue;
+    }
+    const sfIdx = (buf[pos + 2]! >> 2) & 0x0f;
+    const freq = freqs[sfIdx] ?? 0;
+    const frameLen = ((buf[pos + 3]! & 0x03) << 11) | (buf[pos + 4]! << 3) | ((buf[pos + 5]! >> 5) & 0x07);
+    if (!freq || frameLen < 7) {
+      if (frames > 0) break;
+      pos += 1;
+      continue;
+    }
+    if (frames === 0) sr = freq;
+    else if (sr !== freq) break;
+    frames += 1;
+    bytesSum += frameLen;
+    pos += frameLen;
+  }
+  if (frames >= 2 && sr > 0 && bytesSum > 0) {
+    const estFrames = Math.round(((fileLen - start) * frames) / bytesSum);
+    return Math.round((estFrames * 1024 * 1000) / sr);
+  }
+  return probeIsoBmffDurationMs(fd, fileLen);
+}
+
+function probeOggDurationMs(fd: number, fileLen: number): number | null {
+  const head = readExactAt(fd, 0, Math.min(8192, fileLen));
+  if (!head || head.length < 36 || head.toString("latin1", 0, 4) !== "OggS") return null;
+  const serial = head.readUInt32LE(14);
+  const segCount = head[26]!;
+  const pktOff = 27 + segCount;
+  let sampleRate = 0;
+  let preSkip = 0;
+  if (pktOff + 19 <= head.length && head.toString("latin1", pktOff, pktOff + 8) === "OpusHead") {
+    sampleRate = 48000;
+    preSkip = head.readUInt16LE(pktOff + 10);
+  } else if (pktOff + 16 <= head.length && head[pktOff] === 1 && head.toString("latin1", pktOff + 1, pktOff + 7) === "vorbis") {
+    sampleRate = head.readUInt32LE(pktOff + 12);
+  }
+  if (sampleRate <= 0) return null;
+  const tailLen = Math.min(65536, fileLen);
+  const tail = readExactAt(fd, fileLen - tailLen, tailLen);
+  if (!tail) return null;
+  let lastGranule = -1n;
+  for (let i = 0; i + 27 <= tail.length; i += 1) {
+    if (tail.toString("latin1", i, i + 4) !== "OggS" || tail[i + 4] !== 0) continue;
+    const sc = tail[i + 26]!;
+    if (i + 27 + sc > tail.length) continue;
+    if (tail.readUInt32LE(i + 14) !== serial) continue;
+    const gran = tail.readBigInt64LE(i + 6);
+    if (gran > 0n) lastGranule = gran;
+  }
+  if (lastGranule <= BigInt(preSkip)) return null;
+  return Number(((lastGranule - BigInt(preSkip)) * 1000n) / BigInt(sampleRate));
+}
+
+function readEbmlVint(buf: Buffer, pos: number, keepMarker: boolean): [bigint, number] | null {
+  if (pos >= buf.length) return null;
+  const first = buf[pos]!;
+  if (first === 0) return null;
+  let len = 1;
+  while (len <= 8 && (first & (0x80 >> (len - 1))) === 0) len += 1;
+  if (len > 8 || pos + len > buf.length) return null;
+  let val = BigInt(keepMarker ? first : first & ((1 << (8 - len)) - 1));
+  for (let i = 1; i < len; i += 1) {
+    val = (val << 8n) | BigInt(buf[pos + i]!);
+  }
+  return [val, len];
+}
+
+function probeEbmlDurationMs(fd: number, fileLen: number): number | null {
+  const buf = readExactAt(fd, 0, Math.min(262144, fileLen));
+  if (!buf || buf.length < 4 || buf.readUInt32BE(0) !== 0x1a45dfa3) return null;
+  let pos = 0;
+  const hdrId = readEbmlVint(buf, pos, true);
+  if (!hdrId) return null;
+  pos += hdrId[1];
+  const hdrSz = readEbmlVint(buf, pos, false);
+  if (!hdrSz) return null;
+  pos += hdrSz[1] + Number(hdrSz[0]);
+  while (pos < buf.length) {
+    const idRes = readEbmlVint(buf, pos, true);
+    if (!idRes) break;
+    pos += idRes[1];
+    const szRes = readEbmlVint(buf, pos, false);
+    if (!szRes) break;
+    pos += szRes[1];
+    const elemId = Number(idRes[0]);
+    const elemSz = Number(szRes[0]);
+    if (elemId === 0x18538067) {
+      // Segment: continue scanning children inside buffer
+      continue;
+    }
+    if (elemId === 0x1549a966 && pos + elemSz <= buf.length) {
+      // Info element
+      const infoEnd = pos + elemSz;
+      let cpos = pos;
+      let scaleNs = 1_000_000;
+      let rawDur: number | null = null;
+      while (cpos < infoEnd) {
+        const cid = readEbmlVint(buf, cpos, true);
+        if (!cid) break;
+        cpos += cid[1];
+        const csz = readEbmlVint(buf, cpos, false);
+        if (!csz) break;
+        cpos += csz[1];
+        const len = Number(csz[0]);
+        if (cpos + len > infoEnd) break;
+        if (Number(cid[0]) === 0x2ad7b1 && len >= 1 && len <= 8) {
+          let v = 0n;
+          for (let k = 0; k < len; k += 1) v = (v << 8n) | BigInt(buf[cpos + k]!);
+          if (v > 0n) scaleNs = Number(v);
+        } else if (Number(cid[0]) === 0x4489 && (len === 4 || len === 8)) {
+          rawDur = len === 4 ? buf.readFloatBE(cpos) : buf.readDoubleBE(cpos);
+        }
+        cpos += len;
+      }
+      if (rawDur !== null && Number.isFinite(rawDur) && rawDur > 0) {
+        const ms = Math.round((rawDur * scaleNs) / 1_000_000);
+        return ms > 0 ? ms : null;
+      }
+      return null;
+    }
+    if (elemSz <= 0 || pos + elemSz > buf.length) break;
+    pos += elemSz;
+  }
+  return null;
 }
 
 function probeMediaDurationMs(filePath: string): number | null {
   const ext = path.extname(filePath).slice(1).toLowerCase();
-  if (!["mp4", "m4a", "m4v", "mov", "wav", "flac"].includes(ext)) {
+  if (!SUPPORTED_EXTS.has(ext)) {
     return null;
   }
   let fd: number | null = null;
@@ -172,6 +395,18 @@ function probeMediaDurationMs(filePath: string): number | null {
     fd = fs.openSync(filePath, "r");
     if (ext === "mp4" || ext === "m4a" || ext === "m4v" || ext === "mov") {
       return probeIsoBmffDurationMs(fd, stat.size);
+    }
+    if (ext === "mkv" || ext === "webm") {
+      return probeEbmlDurationMs(fd, stat.size);
+    }
+    if (ext === "mp3") {
+      return probeMp3DurationMs(fd, stat.size);
+    }
+    if (ext === "aac") {
+      return probeAacAdtsDurationMs(fd, stat.size);
+    }
+    if (ext === "ogg" || ext === "opus") {
+      return probeOggDurationMs(fd, stat.size);
     }
     if (ext === "wav" && stat.size >= 44) {
       const riff = readExactAt(fd, 0, 12);
@@ -201,15 +436,16 @@ function probeMediaDurationMs(filePath: string): number | null {
       }
     }
     if (ext === "flac" && stat.size >= 42) {
-      const hdr = readExactAt(fd, 0, 42);
-      if (hdr && hdr.toString("latin1", 0, 4) === "fLaC" && (hdr[4] & 0x7f) === 0) {
-        const sampleRate = (hdr[18] << 12) | (hdr[19] << 4) | (hdr[20] >> 4);
+      const start = skipId3v2Tags(fd, stat.size);
+      const hdr = readExactAt(fd, start, 42);
+      if (hdr && hdr.toString("latin1", 0, 4) === "fLaC" && (hdr[4]! & 0x7f) === 0) {
+        const sampleRate = (hdr[18]! << 12) | (hdr[19]! << 4) | (hdr[20]! >> 4);
         const totalSamples =
-          (BigInt(hdr[21] & 0x0f) << 32n) |
-          (BigInt(hdr[22]) << 24n) |
-          (BigInt(hdr[23]) << 16n) |
-          (BigInt(hdr[24]) << 8n) |
-          BigInt(hdr[25]);
+          (BigInt(hdr[21]! & 0x0f) << 32n) |
+          (BigInt(hdr[22]!) << 24n) |
+          (BigInt(hdr[23]!) << 16n) |
+          (BigInt(hdr[24]!) << 8n) |
+          BigInt(hdr[25]!);
         if (sampleRate > 0 && totalSamples > 0n) {
           return Number((totalSamples * 1000n) / BigInt(sampleRate));
         }
@@ -268,18 +504,77 @@ function collectMediaInDir(
   }
 }
 
+function parseByteRange(spec: string, totalLen: number): [number, number] | null {
+  if (totalLen <= 0 || !spec.startsWith("bytes=")) return null;
+  const first = spec.slice(6).split(",")[0]?.trim() ?? "";
+  const dashIdx = first.indexOf("-");
+  if (dashIdx < 0) return null;
+  const startStr = first.slice(0, dashIdx).trim();
+  const endStr = first.slice(dashIdx + 1).trim();
+  if (startStr === "") {
+    const suffixLen = Number.parseInt(endStr, 10);
+    if (!Number.isFinite(suffixLen) || suffixLen <= 0) return null;
+    const start = Math.max(0, totalLen - suffixLen);
+    return [start, totalLen - 1];
+  }
+  const start = Number.parseInt(startStr, 10);
+  if (!Number.isFinite(start) || start < 0 || start >= totalLen) return null;
+  if (endStr === "") {
+    return [start, totalLen - 1];
+  }
+  const end = Number.parseInt(endStr, 10);
+  if (!Number.isFinite(end) || end < start) return null;
+  return [start, Math.min(totalLen - 1, end)];
+}
+
 function audoraLocalDevBridge(): Plugin {
+  const allowedDevFiles = new Set<string>();
+  const allowedDevDirs = new Set<string>();
+
+  const normalizeKey = (p: string): string =>
+    process.platform === "win32" ? p.toLowerCase() : p;
+
+  const isAllowedDevDir = (canonDir: string): boolean => {
+    const key = normalizeKey(canonDir);
+    if (allowedDevDirs.has(key)) return true;
+    for (const dir of allowedDevDirs) {
+      if (key.startsWith(dir + path.sep)) return true;
+    }
+    return false;
+  };
+
+  const resolveAllowedDevMediaFile = (rawPath: string): string | null => {
+    if (!rawPath || (!path.isAbsolute(rawPath) && !rawPath.startsWith("\\\\"))) return null;
+    try {
+      const canon = fs.realpathSync(rawPath);
+      const stat = fs.statSync(canon);
+      if (!stat.isFile()) return null;
+      const ext = path.extname(canon).slice(1).toLowerCase();
+      if (!SUPPORTED_EXTS.has(ext)) return null;
+      const key = normalizeKey(canon);
+      if (allowedDevFiles.has(key) || isAllowedDevDir(path.dirname(canon))) {
+        return canon;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
   return {
     name: "audora-local-dev-bridge",
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         if (!req.url) return next();
-        const urlObj = new URL(req.url, "http://localhost");
+        const urlObj = new URL(req.url, "http://127.0.0.1");
 
         if (urlObj.pathname.startsWith("/__audora_")) {
+          const host = String(req.headers.host ?? "").trim();
+          const validHost = /^(127\.0\.0\.1|localhost)(:\d+)?$/i.test(host);
           const secFetchSite = String(req.headers["sec-fetch-site"] ?? "").toLowerCase();
           const origin = String(req.headers.origin ?? "").trim();
           const crossSite =
+            !validHost ||
             (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") ||
             origin.toLowerCase() === "null" ||
             (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin));
@@ -294,14 +589,15 @@ function audoraLocalDevBridge(): Plugin {
         if (urlObj.pathname === "/__audora_probe_media") {
           const rawPath = urlObj.searchParams.get("path")?.trim() ?? "";
           res.setHeader("Content-Type", "application/json; charset=utf-8");
-          if (!rawPath || !path.isAbsolute(rawPath)) {
+          const allowed = resolveAllowedDevMediaFile(rawPath);
+          if (!allowed) {
             res.statusCode = 404;
-            res.end(JSON.stringify({ ok: false, duration_ms: null }));
+            res.end(JSON.stringify({ ok: false, exists: false, duration_ms: null }));
             return;
           }
-          const duration_ms = probeMediaDurationMs(rawPath);
+          const duration_ms = probeMediaDurationMs(allowed);
           res.statusCode = 200;
-          res.end(JSON.stringify({ ok: true, duration_ms }));
+          res.end(JSON.stringify({ ok: true, exists: true, duration_ms }));
           return;
         }
 
@@ -336,6 +632,7 @@ function audoraLocalDevBridge(): Plugin {
                 const stat = fs.statSync(trimmed);
                 if (stat.isFile()) {
                   const canonical = fs.realpathSync(trimmed);
+                  allowedDevFiles.add(normalizeKey(canonical));
                   files.push({
                     path: canonical,
                     name: path.basename(canonical),
@@ -416,6 +713,7 @@ function audoraLocalDevBridge(): Plugin {
             res.setHeader("Content-Type", "application/json; charset=utf-8");
             if (cleaned && fs.existsSync(cleaned) && fs.statSync(cleaned).isDirectory()) {
               const canonical = fs.realpathSync(cleaned);
+              allowedDevDirs.add(normalizeKey(canonical));
               res.end(JSON.stringify({ ok: true, cancelled: false, path: canonical }));
             } else {
               res.end(JSON.stringify({ ok: true, cancelled: true, path: null }));
@@ -441,8 +739,9 @@ function audoraLocalDevBridge(): Plugin {
               "powershell",
               [
                 "-NoProfile",
+                "-Sta",
                 "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
               ],
               (err, stdout) => {
                 sendPicked(err ? null : stdout);
@@ -463,24 +762,34 @@ function audoraLocalDevBridge(): Plugin {
 
         if (urlObj.pathname === "/__audora_scan_folder") {
           const rawPath = urlObj.searchParams.get("path")?.trim() ?? "";
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
           if (!rawPath) {
             res.statusCode = 400;
-            res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify({ ok: false, message: "Folder path is required." }));
             return;
           }
-          const target = path.resolve(rawPath);
+          let canonicalDir: string;
           try {
-            if (!fs.statSync(target).isDirectory()) {
+            canonicalDir = fs.realpathSync(path.resolve(rawPath));
+            if (!fs.statSync(canonicalDir).isDirectory()) {
               throw new Error("not dir");
             }
           } catch {
             res.statusCode = 400;
-            res.setHeader("Content-Type", "application/json");
             res.end(
               JSON.stringify({
                 ok: false,
                 message: "Folder not found or not accessible on this device.",
+              }),
+            );
+            return;
+          }
+          if (!isAllowedDevDir(canonicalDir)) {
+            res.statusCode = 403;
+            res.end(
+              JSON.stringify({
+                ok: false,
+                message: "Folder has not been authorized by the user.",
               }),
             );
             return;
@@ -491,14 +800,13 @@ function audoraLocalDevBridge(): Plugin {
             size: number;
             duration_ms: number | null;
           }> = [];
-          collectMediaInDir(target, 0, 4, 2000, files);
+          collectMediaInDir(canonicalDir, 0, 4, 2000, files);
           res.statusCode = 200;
-          res.setHeader("Content-Type", "application/json; charset=utf-8");
           res.end(
             JSON.stringify({
               ok: true,
-              folder_path: target,
-              folder_name: path.basename(target) || target,
+              folder_path: canonicalDir,
+              folder_name: path.basename(canonicalDir) || canonicalDir,
               files,
             }),
           );
@@ -507,47 +815,83 @@ function audoraLocalDevBridge(): Plugin {
 
         if (urlObj.pathname === "/__audora_media") {
           const rawPath = urlObj.searchParams.get("path")?.trim() ?? "";
-          const ext = path.extname(rawPath).slice(1).toLowerCase();
-          if (!rawPath || !path.isAbsolute(rawPath) || !SUPPORTED_EXTS.has(ext)) {
+          const allowed = resolveAllowedDevMediaFile(rawPath);
+          if (!allowed) {
             res.statusCode = 404;
             res.end();
             return;
           }
           let stat: fs.Stats;
           try {
-            stat = fs.statSync(rawPath);
+            stat = fs.statSync(allowed);
             if (!stat.isFile()) throw new Error("not file");
           } catch {
             res.statusCode = 404;
             res.end();
             return;
           }
+          const ext = path.extname(allowed).slice(1).toLowerCase();
           const total = stat.size;
           const contentType = mimeForExt(ext);
+          const isHead = req.method === "HEAD";
+          const securityHeaders = {
+            "Content-Type": contentType,
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'",
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
+          };
           const range = req.headers.range;
-          if (range && range.startsWith("bytes=") && total > 0) {
-            const [sStr, eStr] = range.slice(6).split("-");
-            const start = Math.max(0, Number.parseInt(sStr ?? "0", 10) || 0);
-            const end = eStr
-              ? Math.min(total - 1, Number.parseInt(eStr, 10) || total - 1)
-              : total - 1;
-            if (start < total && start <= end) {
-              res.writeHead(206, {
-                "Content-Type": contentType,
-                "Accept-Ranges": "bytes",
-                "Content-Range": `bytes ${start}-${end}/${total}`,
-                "Content-Length": end - start + 1,
+          if (range && total > 0) {
+            const parsed = parseByteRange(range, total);
+            if (!parsed) {
+              res.writeHead(416, {
+                ...securityHeaders,
+                "Content-Range": `bytes */${total}`,
+                "Content-Length": 0,
               });
-              fs.createReadStream(rawPath, { start, end }).pipe(res);
+              res.end();
               return;
             }
+            const [start, end] = parsed;
+            res.writeHead(206, {
+              ...securityHeaders,
+              "Content-Range": `bytes ${start}-${end}/${total}`,
+              "Content-Length": end - start + 1,
+            });
+            if (isHead) {
+              res.end();
+              return;
+            }
+            const rs = fs.createReadStream(allowed, { start, end });
+            rs.on("error", () => res.destroy());
+            rs.pipe(res);
+            return;
           }
           res.writeHead(200, {
-            "Content-Type": contentType,
-            "Accept-Ranges": "bytes",
+            ...securityHeaders,
             "Content-Length": total,
           });
-          fs.createReadStream(rawPath).pipe(res);
+          if (isHead || total === 0) {
+            res.end();
+            return;
+          }
+          const rs = fs.createReadStream(allowed);
+          rs.on("error", () => res.destroy());
+          rs.pipe(res);
+          return;
+        }
+
+        // Prevent Vite's SPA HTML fallback from returning `200 OK` on native-only `/__audora_*` routes (`C-3`).
+        if (urlObj.pathname.startsWith("/__audora_")) {
+          res.statusCode = 404;
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(
+            JSON.stringify({
+              ok: false,
+              message: "Native desktop endpoint is unavailable in browser dev mode.",
+            }),
+          );
           return;
         }
 
@@ -563,5 +907,6 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    allowedHosts: ["127.0.0.1", "localhost"],
   },
 });

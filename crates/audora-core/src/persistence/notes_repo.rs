@@ -1,6 +1,6 @@
 //! SQLite implementation of `NotesRepository`.
 
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 
 use crate::domain::{
     CreateNoteInput, LibraryFilter, Note, NoteId, NotesRepository, UpdateNoteInput,
@@ -37,7 +37,7 @@ impl SqliteNotesRepository {
 impl NotesRepository for SqliteNotesRepository {
     fn create_note(&self, id: NoteId, input: &CreateNoteInput, now_iso: &str) -> AppResult<Note> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO notes (id, media_id, position_ms, is_quick_marker, body, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -77,7 +77,7 @@ impl NotesRepository for SqliteNotesRepository {
         let trimmed = input.body.trim();
         let is_quick_marker = trimmed.is_empty();
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let affected = tx.execute(
                 "UPDATE notes
                  SET body = ?2, is_quick_marker = ?3, updated_at = ?4
@@ -100,7 +100,7 @@ impl NotesRepository for SqliteNotesRepository {
 
     fn delete_note(&self, id: &str) -> AppResult<bool> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let affected = tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(affected > 0)

@@ -15,6 +15,7 @@ import type {
   Playlist,
   ReleaseManifestDto,
   RepeatMode,
+  ThemeMode,
   TrustedSourceFolder,
   UpdateNoteInput,
   UpdatePlaylistInput,
@@ -24,11 +25,13 @@ import type {
 const STORAGE_KEY = "audora.state.v2";
 const LEGACY_STORAGE_KEY = "audora.state.v1";
 const MANIFEST_STORAGE_KEY = "audora.update.manifest.v1";
+const MAX_NOTE_BODY_CHARS = 10_000;
+const ISO_BMFF_EXTENSIONS = new Set(["mp4", "m4a", "m4v", "mov"]);
 export const DEFAULT_GITHUB_RELEASE_REPO = "smokeInCloud060201/audora";
 const BASE_APP_VERSION: string =
   (typeof import.meta !== "undefined" &&
     (import.meta.env?.VITE_APP_VERSION as string | undefined)?.trim()) ||
-  "0.1.0";
+  "1.0.3";
 
 const LEGACY_MOCK_MEDIA_IDS = new Set([
   "med_listening",
@@ -70,7 +73,10 @@ function isBrowserRuntime(): boolean {
 interface NativePlatformBootstrap {
   os?: string;
   arch?: string;
+  app_version?: string;
   data_dir?: string;
+  initial_theme?: ThemeMode;
+  initial_window_mode?: WindowMode;
   cli_files?: Array<{
     path: string;
     name: string;
@@ -87,7 +93,15 @@ function getNativeSessionToken(): string | null {
     : null;
 }
 
-function getNativePlatformInfo(): { os: string; arch: string; dataDir: string; cliFiles: NonNullable<NativePlatformBootstrap["cli_files"]> } {
+function getNativePlatformInfo(): {
+  os: string;
+  arch: string;
+  appVersion: string | null;
+  dataDir: string;
+  initialTheme: ThemeMode | null;
+  initialWindowMode: WindowMode | null;
+  cliFiles: NonNullable<NativePlatformBootstrap["cli_files"]>;
+} {
   if (typeof window !== "undefined") {
     const win = window as Window & { __AUDORA_PLATFORM__?: NativePlatformBootstrap };
     const boot = win.__AUDORA_PLATFORM__;
@@ -95,7 +109,16 @@ function getNativePlatformInfo(): { os: string; arch: string; dataDir: string; c
       return {
         os: boot.os,
         arch: boot.arch,
+        appVersion: typeof boot.app_version === "string" && boot.app_version.trim() ? boot.app_version.trim() : null,
         dataDir: boot.data_dir,
+        initialTheme:
+          boot.initial_theme === "light" || boot.initial_theme === "dark" || boot.initial_theme === "system"
+            ? boot.initial_theme
+            : null,
+        initialWindowMode:
+          boot.initial_window_mode === "minimum" || boot.initial_window_mode === "full"
+            ? boot.initial_window_mode
+            : null,
         cliFiles: Array.isArray(boot.cli_files) ? boot.cli_files : [],
       };
     }
@@ -105,7 +128,10 @@ function getNativePlatformInfo(): { os: string; arch: string; dataDir: string; c
     return {
       os: "windows",
       arch: ua.includes("arm") ? "aarch64" : "x86_64",
+      appVersion: null,
       dataDir: "%APPDATA%\\com.audora.desktop\\data",
+      initialTheme: null,
+      initialWindowMode: null,
       cliFiles: [],
     };
   }
@@ -113,16 +139,27 @@ function getNativePlatformInfo(): { os: string; arch: string; dataDir: string; c
     return {
       os: "linux",
       arch: ua.includes("aarch64") || ua.includes("arm64") ? "aarch64" : "x86_64",
+      appVersion: null,
       dataDir: "~/.local/share/com.audora.desktop",
+      initialTheme: null,
+      initialWindowMode: null,
       cliFiles: [],
     };
   }
   return {
     os: "macos",
     arch: ua.includes("x86_64") || ua.includes("intel") ? "x86_64" : "aarch64",
+    appVersion: null,
     dataDir: "~/Library/Application Support/com.audora.desktop",
+    initialTheme: null,
+    initialWindowMode: null,
     cliFiles: [],
   };
+}
+
+function isJsonResponse(res: Response): boolean {
+  const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+  return ct.includes("application/json");
 }
 
 function nativeFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -192,7 +229,27 @@ export function compareSemver(a: string, b: string): number {
   if (pa.pre === null && pb.pre === null) return 0;
   if (pa.pre !== null && pb.pre === null) return -1;
   if (pa.pre === null && pb.pre !== null) return 1;
-  return pa.pre!.localeCompare(pb.pre!);
+  const segsA = pa.pre!.split(".");
+  const segsB = pb.pre!.split(".");
+  const maxLen = Math.max(segsA.length, segsB.length);
+  for (let i = 0; i < maxLen; i += 1) {
+    const sa = segsA[i];
+    const sb = segsB[i];
+    if (sa === undefined) return -1;
+    if (sb === undefined) return 1;
+    const na = /^\d+$/.test(sa) ? Number.parseInt(sa, 10) : null;
+    const nb = /^\d+$/.test(sb) ? Number.parseInt(sb, 10) : null;
+    if (na !== null && nb !== null) {
+      if (na !== nb) return na > nb ? 1 : -1;
+    } else if (na !== null) {
+      return -1;
+    } else if (nb !== null) {
+      return 1;
+    } else if (sa !== sb) {
+      return sa > sb ? 1 : -1;
+    }
+  }
+  return 0;
 }
 
 function deterministicSha256Hex(seed: string): string {
@@ -276,7 +333,10 @@ export class AudoraIpcClient {
   private playlists: Playlist[] = [];
   private settings: AppSettings = structuredClone(INITIAL_SETTINGS);
   private stagedManifest: ReleaseManifestDto | null = null;
+  private stagedRestartVersion: string | null = null;
   private hydrationPromise: Promise<void> | null = null;
+  private folderSyncPromise: Promise<number> | null = null;
+  private durationProbePromise: Promise<boolean> | null = null;
   private cliBootProcessed = false;
   private hasNativeRelationalRpc = Boolean(getNativeSessionToken());
   private rpcQueue: Array<Record<string, unknown>> = [];
@@ -291,8 +351,47 @@ export class AudoraIpcClient {
   public constructor(useStorage = true) {
     this.useStorage = useStorage;
     if (useStorage) {
+      const boot = getNativePlatformInfo();
+      if (boot.initialTheme) {
+        this.settings.theme = boot.initialTheme;
+      }
+      if (boot.initialWindowMode) {
+        this.settings.window_mode = boot.initialWindowMode;
+      }
+      if (boot.appVersion) {
+        this.settings.installed_version = boot.appVersion;
+      }
       this.hydrateFromStorage();
+      if (isBrowserRuntime() && typeof window !== "undefined") {
+        const win = window as Window & { __AUDORA_COLLECT_QUIT_BATCH__?: () => string };
+        win.__AUDORA_COLLECT_QUIT_BATCH__ = () => JSON.stringify(this.collectPendingRpcBatchForExit());
+      }
     }
+  }
+
+  private collectPendingRpcBatchForExit(): Array<Record<string, unknown>> {
+    if (this.seekDebounceTimer !== null) {
+      clearTimeout(this.seekDebounceTimer);
+      this.seekDebounceTimer = null;
+    }
+    const batch = [...this.rpcQueue];
+    this.rpcQueue = [];
+    const active = this.media.find((m) => m.id === this.snapshot.media_id);
+    if (active) {
+      batch.push({
+        op: "update_progress",
+        media_id: active.id,
+        last_position_ms: active.last_position_ms,
+        completed: active.completed,
+        session: this.buildSessionDto(),
+      });
+    } else {
+      batch.push({
+        op: "save_session",
+        session: this.buildSessionDto(),
+      });
+    }
+    return batch;
   }
 
   public isPersistedRuntime(): boolean {
@@ -321,7 +420,7 @@ export class AudoraIpcClient {
       isBrowserRuntime() &&
       (window.location.hostname === "127.0.0.1" ||
         window.location.hostname === "localhost") &&
-      (rawPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(rawPath))
+      (rawPath.startsWith("/") || rawPath.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(rawPath))
     ) {
       const tok = getNativeSessionToken();
       const tokenParam = tok ? `&token=${encodeURIComponent(tok)}` : "";
@@ -487,6 +586,7 @@ export class AudoraIpcClient {
       }
       this.notes = filteredNotes;
     }
+    const fallbackIso = new Date().toISOString();
     if (Array.isArray(parsed.playlists)) {
       this.playlists = parsed.playlists.map((pl) => ({
         id: pl.id,
@@ -495,8 +595,8 @@ export class AudoraIpcClient {
         item_ids: Array.isArray(pl.item_ids)
           ? Array.from(new Set(pl.item_ids)).filter((id) => validMediaIds.has(id))
           : [],
-        created_at: pl.created_at || "Just now",
-        updated_at: pl.updated_at || "Just now",
+        created_at: pl.created_at || fallbackIso,
+        updated_at: pl.updated_at || fallbackIso,
       }));
     } else {
       this.playlists = [];
@@ -505,19 +605,22 @@ export class AudoraIpcClient {
       strippedLegacyMock = true;
     }
     if (parsed.settings) {
+      const runtimeBase = getNativePlatformInfo().appVersion ?? BASE_APP_VERSION;
       const persistedInstalled = parsed.settings.installed_version;
       const effectiveInstalled =
-        persistedInstalled && compareSemver(persistedInstalled, BASE_APP_VERSION) > 0
+        !getNativeSessionToken() &&
+        persistedInstalled &&
+        compareSemver(persistedInstalled, runtimeBase) > 0
           ? persistedInstalled
-          : BASE_APP_VERSION;
+          : runtimeBase;
       const normalizedFolders = Array.isArray(parsed.settings.source_folders)
         ? parsed.settings.source_folders.map((f) => ({
             id: f.id,
             path: f.path,
             label: f.label || (f.path.split(/[\\/]/).pop() ?? f.path),
             enabled: f.enabled !== false,
-            added_at: f.added_at || "Just now",
-            last_scanned_at: f.last_scanned_at || "Just now",
+            added_at: f.added_at || fallbackIso,
+            last_scanned_at: f.last_scanned_at || fallbackIso,
             media_count: this.media.filter((m) => m.source_folder_id === f.id).length,
           }))
         : [];
@@ -656,24 +759,32 @@ export class AudoraIpcClient {
     }
     try {
       const res = await nativeFetch("/__audora_state", { method: "GET" });
-      if (res.ok) {
-        this.hasNativeRelationalRpc = true;
+      if (res.ok && isJsonResponse(res)) {
         const text = await res.text();
         const trimmed = text.trim();
-        if (trimmed.startsWith("{") && trimmed !== "{}") {
-          // `audora.sqlite` relational tables are the authoritative source of truth (`C-6`).
-          const parsed = JSON.parse(trimmed) as Partial<PersistedState>;
-          this.applyPersistedState(parsed);
-        } else if (this.media.length > 0 || this.notes.length > 0 || this.playlists.length > 0) {
-          // One-time seed of empty SQLite relational tables from existing localStorage state.
-          this.enqueueNativeStateSave(this.serializePersistedState());
-        }
-        try {
-          if (typeof window !== "undefined" && window.localStorage) {
-            window.localStorage.removeItem(STORAGE_KEY);
+        let parsedObj: Partial<PersistedState> | null = null;
+        if (trimmed.startsWith("{")) {
+          const candidate: unknown = JSON.parse(trimmed);
+          if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+            parsedObj = candidate as Partial<PersistedState>;
           }
-        } catch {
-          // Ignore storage cleanup errors in restricted webviews.
+        }
+        if (parsedObj !== null) {
+          this.hasNativeRelationalRpc = true;
+          if (trimmed !== "{}") {
+            // `audora.sqlite` relational tables are the authoritative source of truth (`C-6`).
+            this.applyPersistedState(parsedObj);
+          } else if (this.media.length > 0 || this.notes.length > 0 || this.playlists.length > 0) {
+            // One-time seed of empty SQLite relational tables from existing localStorage state.
+            this.enqueueNativeStateSave(this.serializePersistedState());
+          }
+          try {
+            if (typeof window !== "undefined" && window.localStorage) {
+              window.localStorage.removeItem(STORAGE_KEY);
+            }
+          } catch {
+            // Ignore storage cleanup errors in restricted webviews.
+          }
         }
       }
     } catch {
@@ -837,15 +948,22 @@ export class AudoraIpcClient {
       return true;
     }
 
-    // Coalesce consecutive `update_progress` or `save_session` RPCs in the queue
+    // Coalesce consecutive `update_progress` ONLY for the same `media_id` (preserving `session`),
+    // or consecutive `save_session` RPCs (`C-8`).
     const opName = opPayload.op;
-    if (opName === "update_progress" || opName === "save_session") {
-      const lastIdx = this.rpcQueue.length - 1;
-      if (lastIdx >= 0 && this.rpcQueue[lastIdx]?.op === opName) {
-        this.rpcQueue[lastIdx] = opPayload;
-      } else {
-        this.rpcQueue.push(opPayload);
-      }
+    const lastIdx = this.rpcQueue.length - 1;
+    const prev = lastIdx >= 0 ? this.rpcQueue[lastIdx] : undefined;
+    if (
+      opName === "update_progress" &&
+      prev?.op === "update_progress" &&
+      prev.media_id === opPayload.media_id
+    ) {
+      this.rpcQueue[lastIdx] = {
+        ...opPayload,
+        session: opPayload.session ?? prev.session,
+      };
+    } else if (opName === "save_session" && prev?.op === "save_session") {
+      this.rpcQueue[lastIdx] = opPayload;
     } else {
       this.rpcQueue.push(opPayload);
     }
@@ -856,11 +974,21 @@ export class AudoraIpcClient {
         try {
           while (this.rpcQueue.length > 0) {
             const next = this.rpcQueue.shift()!;
-            await nativeFetch("/__audora_rpc", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(next),
-            }).catch(() => {});
+            const sendOnce = async (): Promise<boolean> => {
+              try {
+                const res = await nativeFetch("/__audora_rpc", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(next),
+                });
+                return res.ok;
+              } catch {
+                return false;
+              }
+            };
+            if (!(await sendOnce())) {
+              await sendOnce();
+            }
           }
         } finally {
           this.isFlushingRpc = false;
@@ -919,7 +1047,10 @@ export class AudoraIpcClient {
       this.seekDebounceTimer = null;
     }
     if (this.hasNativeRelationalRpc) {
-      this.persistProgressAndSession({ immediate: true, keepalive: true });
+      const batch = this.collectPendingRpcBatchForExit();
+      if (batch.length > 0) {
+        this.dispatchRelationalRpc({ op: "batch", ops: batch }, { keepalive: true });
+      }
       return;
     }
     const serialized = this.serializePersistedState();
@@ -938,7 +1069,11 @@ export class AudoraIpcClient {
   }
 
   public updateSettings(next: AppSettings): AppSettings {
-    if (next.default_playback_speed < 0.5 || next.default_playback_speed > 2.0) {
+    if (
+      !Number.isFinite(next.default_playback_speed) ||
+      next.default_playback_speed < 0.5 ||
+      next.default_playback_speed > 2.0
+    ) {
       throw this.makeError(
         "AV-301",
         "ValidationFailed",
@@ -946,7 +1081,11 @@ export class AudoraIpcClient {
         "Speed must be between 0.5x and 2.0x.",
       );
     }
+    const prevDefaultSpeed = this.settings.default_playback_speed;
     this.settings = structuredClone(next);
+    if (this.snapshot.media_id === null || this.snapshot.rate === prevDefaultSpeed) {
+      this.snapshot.rate = this.settings.default_playback_speed;
+    }
     if (!this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
       this.persistToStorage();
     }
@@ -1030,7 +1169,9 @@ export class AudoraIpcClient {
         break;
       }
       case "set_rate":
-        this.snapshot.rate = cmd.rate;
+        this.snapshot.rate = Number.isFinite(cmd.rate)
+          ? Math.max(0.5, Math.min(2.0, cmd.rate))
+          : 1.0;
         this.persistProgressAndSession();
         break;
       case "set_volume":
@@ -1071,6 +1212,14 @@ export class AudoraIpcClient {
             this.selectMediaById(this.snapshot.queue[this.snapshot.queue.length - 1]!, {
               autoPlay: wasPlaying,
             });
+          } else {
+            // Restart Track 1 from `0ms` even under 3s (`M-5` parity with `audora-core`).
+            this.snapshot.position_ms = 0;
+            const active = this.media.find((m) => m.id === this.snapshot.media_id);
+            if (active) {
+              active.last_position_ms = 0;
+            }
+            this.persistProgressAndSession();
           }
         }
         break;
@@ -1114,18 +1263,49 @@ export class AudoraIpcClient {
    */
   public syncMediaElementPosition(positionMs: number, durationMs?: number): PlaybackSnapshot {
     const active = this.media.find((m) => m.id === this.snapshot.media_id);
+    const activeExt = active?.path
+      ? (active.path.split(".").pop()?.toLowerCase() ?? "")
+      : "";
+    const isIsoBmff = ISO_BMFF_EXTENSIONS.has(activeExt);
     const hasAuthoritativeDuration = Boolean(
       active?.duration_probed && active.duration_ms && active.duration_ms > 0,
     );
-    if (!hasAuthoritativeDuration && durationMs && durationMs > 0) {
-      this.snapshot.duration_ms = Math.round(durationMs);
+    if (!hasAuthoritativeDuration && durationMs && Number.isFinite(durationMs) && durationMs > 0) {
+      const roundedDur = Math.round(durationMs);
+      const changed = this.snapshot.duration_ms !== roundedDur;
+      this.snapshot.duration_ms = roundedDur;
+      if (active && (active.duration_ms !== roundedDur || !active.duration_probed)) {
+        active.duration_ms = roundedDur;
+        active.duration_probed = true;
+        if (
+          changed &&
+          !this.dispatchRelationalRpc({
+            op: "upsert_media_batch",
+            items: [this.stripStreamUrl(active)],
+          })
+        ) {
+          this.persistToStorage({ debounceNativeMs: 400 });
+        }
+      }
+    } else if (
+      !isIsoBmff &&
+      durationMs &&
+      Number.isFinite(durationMs) &&
+      durationMs > 0 &&
+      this.snapshot.duration_ms !== null &&
+      Math.round(durationMs) > this.snapshot.duration_ms
+    ) {
+      // Allow real decoded VBR MP3/AAC duration to expand if CBR/ADTS estimate was slightly lower (`M-6`).
+      const expanded = Math.round(durationMs);
+      this.snapshot.duration_ms = expanded;
       if (active) {
-        active.duration_ms = this.snapshot.duration_ms;
+        active.duration_ms = expanded;
       }
     }
     const effectiveDuration = this.snapshot.duration_ms;
     const roundedPos = Math.max(0, Math.round(positionMs));
     if (
+      isIsoBmff &&
       hasAuthoritativeDuration &&
       effectiveDuration !== null &&
       effectiveDuration > 0 &&
@@ -1242,16 +1422,20 @@ export class AudoraIpcClient {
         item.stream_url = freshUrl;
       }
     }
+    const hadActiveMedia = this.snapshot.media_id !== null;
     this.snapshot.generation += 1;
     this.snapshot.media_id = item.id;
     this.snapshot.duration_ms = item.duration_ms;
     this.snapshot.position_ms =
       this.settings.resume_where_left_off && !item.completed ? item.last_position_ms : 0;
-    this.snapshot.rate = this.settings.default_playback_speed;
+    if (!hadActiveMedia || !Number.isFinite(this.snapshot.rate) || this.snapshot.rate < 0.5 || this.snapshot.rate > 2.0) {
+      this.snapshot.rate = this.settings.default_playback_speed;
+    }
     this.snapshot.state = options?.autoPlay ? "playing" : "paused";
     this.snapshot.error = null;
-    item.last_opened_at = "Just now";
-    item.last_seen_at = "Just now";
+    const nowIso = new Date().toISOString();
+    item.last_opened_at = nowIso;
+    item.last_seen_at = nowIso;
     if (!this.snapshot.queue.includes(item.id)) {
       this.snapshot.queue.push(item.id);
     }
@@ -1300,7 +1484,7 @@ export class AudoraIpcClient {
           "AV-301",
           "ValidationFailed",
           "Remote URLs are not permitted",
-          "Audora only opens local files on your device and makes zero network requests.",
+          "Audora only opens local files on your device; remote media URLs are not permitted.",
         );
       }
     }
@@ -1326,6 +1510,7 @@ export class AudoraIpcClient {
       throw payload;
     }
 
+    const nowIso = new Date().toISOString();
     const streamUrl = this.computeLocalStreamUrl(trimmed, options?.streamUrl);
     const probedDur =
       options?.durationMs && options.durationMs > 0
@@ -1345,14 +1530,17 @@ export class AudoraIpcClient {
         file_size_bytes: options?.size ?? null,
         fingerprint: null,
         availability: "available",
-        added_at: "Just now",
-        last_opened_at: "Just now",
-        last_seen_at: "Just now",
+        added_at: nowIso,
+        last_opened_at: nowIso,
+        last_seen_at: nowIso,
         note_count: 0,
         stream_url: streamUrl,
       };
       this.media.unshift(item);
     } else {
+      if (options?.streamUrl && item.stream_url && item.stream_url !== options.streamUrl) {
+        revokeIfBlobUrl(item.stream_url);
+      }
       if (!this.isBareFileName(trimmed) && this.isBareFileName(item.path)) {
         item.path = trimmed;
       }
@@ -1367,7 +1555,7 @@ export class AudoraIpcClient {
         }
       }
       item.availability = "available";
-      item.last_seen_at = "Just now";
+      item.last_seen_at = nowIso;
       if (!this.isBareFileName(item.path)) {
         item.stream_url =
           this.computeLocalStreamUrl(item.path) ??
@@ -1480,12 +1668,25 @@ export class AudoraIpcClient {
     const visibleMedia = this.media.filter(
       (m) => !m.source_folder_id || !disabledFolderIds.has(m.source_folder_id),
     );
-    const visibleIds = new Set(visibleMedia.map((m) => m.id));
+    const visibleById = new Map<string, MediaItem>();
+    for (const m of visibleMedia) {
+      visibleById.set(m.id, m);
+    }
+
+    const notesByMedia = new Map<string, Note[]>();
+    for (const n of this.notes) {
+      let arr = notesByMedia.get(n.media_id);
+      if (!arr) {
+        arr = [];
+        notesByMedia.set(n.media_id, arr);
+      }
+      arr.push(n);
+    }
 
     const mediaItems = visibleMedia
       .map((m) => ({
         ...m,
-        note_count: this.notes.filter((n) => n.media_id === m.id).length,
+        note_count: notesByMedia.get(m.id)?.length ?? 0,
       }))
       .filter((m) => {
         if (filter !== "all" && m.media_kind !== filter) {
@@ -1494,18 +1695,17 @@ export class AudoraIpcClient {
         if (!q) {
           return true;
         }
-        const titleMatches = m.display_name.toLowerCase().includes(q);
-        const noteMatches = this.notes.some(
-          (n) => n.media_id === m.id && n.body.toLowerCase().includes(q),
-        );
-        return titleMatches || noteMatches;
+        if (m.display_name.toLowerCase().includes(q)) {
+          return true;
+        }
+        const mediaNotes = notesByMedia.get(m.id);
+        return mediaNotes ? mediaNotes.some((n) => n.body.toLowerCase().includes(q)) : false;
       });
 
     const matchingNotes = q
       ? this.notes
           .filter((n) => {
-            if (!visibleIds.has(n.media_id)) return false;
-            const parent = visibleMedia.find((m) => m.id === n.media_id);
+            const parent = visibleById.get(n.media_id);
             if (!parent) return false;
             if (filter !== "all" && parent.media_kind !== filter) return false;
             return (
@@ -1540,6 +1740,14 @@ export class AudoraIpcClient {
         "Enter note text or check 'Save as quick marker' before saving.",
       );
     }
+    if (trimmed.length > MAX_NOTE_BODY_CHARS) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Note text too long",
+        `Note text must not exceed ${MAX_NOTE_BODY_CHARS.toLocaleString()} characters.`,
+      );
+    }
     const media = this.media.find((m) => m.id === input.media_id);
     const rounded =
       this.settings.timestamp_precision === "nearest_second"
@@ -1550,14 +1758,15 @@ export class AudoraIpcClient {
         ? Math.min(rounded, media.duration_ms)
         : rounded;
 
+    const nowIso = new Date().toISOString();
     const note: Note = {
       id: `note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       media_id: input.media_id,
       position_ms: clamped,
       is_quick_marker: !trimmed && input.is_quick_marker,
       body: trimmed,
-      created_at: "Just now",
-      updated_at: "Just now",
+      created_at: nowIso,
+      updated_at: nowIso,
     };
     this.notes.push(note);
     if (!this.dispatchRelationalRpc({ op: "upsert_note", note })) {
@@ -1576,6 +1785,14 @@ export class AudoraIpcClient {
         "Note text cannot be empty.",
       );
     }
+    if (trimmed.length > MAX_NOTE_BODY_CHARS) {
+      throw this.makeError(
+        "AV-301",
+        "ValidationFailed",
+        "Note text too long",
+        `Note text must not exceed ${MAX_NOTE_BODY_CHARS.toLocaleString()} characters.`,
+      );
+    }
     const note = this.notes.find((n) => n.id === input.id);
     if (!note) {
       throw this.makeError(
@@ -1587,7 +1804,7 @@ export class AudoraIpcClient {
     }
     note.body = trimmed;
     note.is_quick_marker = false;
-    note.updated_at = "Just now";
+    note.updated_at = new Date().toISOString();
     if (!this.dispatchRelationalRpc({ op: "upsert_note", note })) {
       this.persistToStorage();
     }
@@ -1799,7 +2016,7 @@ export class AudoraIpcClient {
     }
     target.stream_url = this.computeLocalStreamUrl(trimmed);
     target.availability = "available";
-    target.last_seen_at = "Just now";
+    target.last_seen_at = new Date().toISOString();
     if (this.snapshot.media_id === target.id) {
       this.snapshot.duration_ms = target.duration_ms;
       if (target.duration_ms !== null && this.snapshot.position_ms > target.duration_ms) {
@@ -1890,6 +2107,7 @@ export class AudoraIpcClient {
       normalizedPath.split(/[\\/]/).filter(Boolean).pop() ||
       normalizedPath;
 
+    const nowIso = new Date().toISOString();
     const folders = this.settings.source_folders ?? [];
     let folder = folders.find(
       (f) => f.path.toLowerCase() === normalizedPath.toLowerCase(),
@@ -1900,15 +2118,15 @@ export class AudoraIpcClient {
         path: normalizedPath,
         label: inferredLabel,
         enabled: true,
-        added_at: "Just now",
-        last_scanned_at: "Just now",
+        added_at: nowIso,
+        last_scanned_at: nowIso,
         media_count: 0,
       };
       folders.push(folder);
       this.settings.source_folders = folders;
     } else {
       folder.enabled = true;
-      folder.last_scanned_at = "Just now";
+      folder.last_scanned_at = nowIso;
       if (explicitLabel?.trim()) {
         folder.label = explicitLabel.trim();
       }
@@ -1950,9 +2168,9 @@ export class AudoraIpcClient {
           file_size_bytes: f.size ?? null,
           fingerprint: null,
           availability: "available",
-          added_at: "Just now",
+          added_at: nowIso,
           last_opened_at: null,
-          last_seen_at: "Just now",
+          last_seen_at: nowIso,
           note_count: 0,
           source_folder_id: folder.id,
           stream_url: streamUrl,
@@ -1985,7 +2203,7 @@ export class AudoraIpcClient {
           existing.source_folder_id = folder.id;
         }
         existing.availability = "available";
-        existing.last_seen_at = "Just now";
+        existing.last_seen_at = nowIso;
         if (streamUrl) {
           existing.stream_url = streamUrl;
         }
@@ -2206,62 +2424,140 @@ export class AudoraIpcClient {
     }
   }
 
-  public async refreshMediaContainerDurations(): Promise<boolean> {
-    if (
-      !isBrowserRuntime() ||
-      (window.location.hostname !== "127.0.0.1" &&
-        window.location.hostname !== "localhost")
-    ) {
-      return false;
-    }
-    const mutatedItems: MediaItem[] = [];
-    for (const item of this.media) {
-      if (item.duration_probed || this.isBareFileName(item.path)) {
-        continue;
-      }
-      try {
-        const res = await nativeFetch(
-          `/__audora_probe_media?path=${encodeURIComponent(item.path)}`,
-        );
-        if (!res.ok) continue;
-        const text = await res.text();
-        if (!text.trim().startsWith("{")) continue;
-        const parsed = JSON.parse(text) as {
-          ok?: boolean;
-          duration_ms?: number | null;
-        };
-        if (parsed.ok && parsed.duration_ms && parsed.duration_ms > 0) {
-          const dur = Math.round(parsed.duration_ms);
-          if (item.duration_ms !== dur || !item.duration_probed) {
-            item.duration_ms = dur;
-            item.duration_probed = true;
-            if (item.last_position_ms > dur) {
-              item.last_position_ms = 0;
-            }
-            if (this.snapshot.media_id === item.id) {
-              this.snapshot.duration_ms = dur;
-              if (this.snapshot.position_ms > dur) {
-                this.snapshot.position_ms = 0;
-              }
-            }
-            mutatedItems.push(item);
+  public async ingestNativeDroppedPaths(rawPaths: string[]): Promise<{
+    openedItems: MediaItem[];
+    importedFolderCount: number;
+  }> {
+    const supportedExts = new Set([
+      "mp4",
+      "m4v",
+      "mov",
+      "webm",
+      "mkv",
+      "wav",
+      "flac",
+      "ogg",
+      "opus",
+      "mp3",
+      "m4a",
+      "aac",
+    ]);
+    const fileDescriptors: LocalFileDescriptor[] = [];
+    let importedFolderCount = 0;
+
+    for (const raw of rawPaths) {
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      const name = trimmed.split(/[\\/]/).pop() ?? trimmed;
+      const ext = name.includes(".") ? (name.split(".").pop()?.toLowerCase() ?? "") : "";
+      if (supportedExts.has(ext)) {
+        const probed = await this.probeNativeMediaDuration(trimmed);
+        fileDescriptors.push({
+          name,
+          path: trimmed,
+          size: 0,
+          durationMs: probed?.durationMs,
+        });
+      } else {
+        try {
+          const folderRes = await this.scanAndAddSourceFolderPath(trimmed);
+          importedFolderCount += folderRes.importedCount;
+        } catch {
+          // If not a folder either and no valid files exist, let openLocalFiles throw AV-104 if alone
+          if (rawPaths.length === 1) {
+            this.openMediaPath(trimmed);
           }
         }
-      } catch {
-        // Ignore probe failures when running without native bridge
       }
     }
-    if (mutatedItems.length > 0) {
-      if (
-        !this.dispatchRelationalRpc({
-          op: "upsert_media_batch",
-          items: mutatedItems.map((m) => this.stripStreamUrl(m)),
-        })
-      ) {
-        this.persistToStorage();
-      }
+
+    const openedItems =
+      fileDescriptors.length > 0 ? this.openLocalFiles(fileDescriptors) : [];
+    return { openedItems, importedFolderCount };
+  }
+
+  public markPlaybackDecodeFailed(mediaId: string): PlaybackSnapshot {
+    const item = this.media.find((m) => m.id === mediaId);
+    const label = item?.display_name ?? "this media file";
+    const err = this.makeError(
+      "AV-104",
+      "MediaUnsupported",
+      "This format isn’t supported",
+      `Audora couldn’t decode ${label}. The file exists on disk, so your library entry and notes were preserved.`,
+    );
+    if (this.snapshot.media_id === mediaId) {
+      this.snapshot.state = "paused";
+      this.snapshot.error = err;
     }
-    return mutatedItems.length > 0;
+    return structuredClone(this.snapshot);
+  }
+
+  public async refreshMediaContainerDurations(): Promise<boolean> {
+    if (this.durationProbePromise) {
+      return this.durationProbePromise;
+    }
+    this.durationProbePromise = (async () => {
+      try {
+        if (
+          !isBrowserRuntime() ||
+          (window.location.hostname !== "127.0.0.1" &&
+            window.location.hostname !== "localhost")
+        ) {
+          return false;
+        }
+        const mutatedItems: MediaItem[] = [];
+        for (const item of this.media) {
+          if (item.duration_probed || this.isBareFileName(item.path)) {
+            continue;
+          }
+          try {
+            const res = await nativeFetch(
+              `/__audora_probe_media?path=${encodeURIComponent(item.path)}`,
+            );
+            if (!res.ok || !isJsonResponse(res)) continue;
+            const text = await res.text();
+            if (!text.trim().startsWith("{")) continue;
+            const parsed = JSON.parse(text) as {
+              ok?: boolean;
+              duration_ms?: number | null;
+            };
+            if (parsed.ok && parsed.duration_ms && parsed.duration_ms > 0) {
+              const dur = Math.round(parsed.duration_ms);
+              if (item.duration_ms !== dur || !item.duration_probed) {
+                item.duration_ms = dur;
+                item.duration_probed = true;
+                if (item.last_position_ms > dur) {
+                  item.last_position_ms = 0;
+                }
+                if (this.snapshot.media_id === item.id) {
+                  this.snapshot.duration_ms = dur;
+                  if (this.snapshot.position_ms > dur) {
+                    this.snapshot.position_ms = 0;
+                  }
+                }
+                mutatedItems.push(item);
+              }
+            }
+          } catch {
+            // Ignore probe failures when running without native bridge
+          }
+        }
+        if (mutatedItems.length > 0) {
+          if (
+            !this.dispatchRelationalRpc({
+              op: "upsert_media_batch",
+              items: mutatedItems.map((m) => this.stripStreamUrl(m)),
+            })
+          ) {
+            this.persistToStorage();
+          }
+        }
+        return mutatedItems.length > 0;
+      } finally {
+        this.durationProbePromise = null;
+      }
+    })();
+    return this.durationProbePromise;
   }
 
   public async rescanSourceFolder(
@@ -2282,19 +2578,29 @@ export class AudoraIpcClient {
   }
 
   public async syncEnabledSourceFolders(): Promise<number> {
-    const enabledFolders = (this.settings.source_folders ?? []).filter(
-      (f) => f.enabled,
-    );
-    let totalImported = 0;
-    for (const folder of enabledFolders) {
-      try {
-        const res = await this.scanAndAddSourceFolderPath(folder.path);
-        totalImported += res.importedCount;
-      } catch {
-        // Ignore temporarily disconnected external drives during startup sync.
-      }
+    if (this.folderSyncPromise) {
+      return this.folderSyncPromise;
     }
-    return totalImported;
+    this.folderSyncPromise = (async () => {
+      try {
+        const enabledFolders = (this.settings.source_folders ?? []).filter(
+          (f) => f.enabled,
+        );
+        let totalImported = 0;
+        for (const folder of enabledFolders) {
+          try {
+            const res = await this.scanAndAddSourceFolderPath(folder.path);
+            totalImported += res.importedCount;
+          } catch {
+            // Ignore temporarily disconnected external drives during startup sync.
+          }
+        }
+        return totalImported;
+      } finally {
+        this.folderSyncPromise = null;
+      }
+    })();
+    return this.folderSyncPromise;
   }
 
   public toggleSourceFolder(
@@ -2396,6 +2702,7 @@ export class AudoraIpcClient {
         preservedNotedCount += 1;
         return true;
       }
+      revokeIfBlobUrl(m.stream_url);
       removedIds.add(m.id);
       removedMediaCount += 1;
       return false;
@@ -2583,13 +2890,14 @@ export class AudoraIpcClient {
       (id) => validIds.has(id),
     );
 
+    const nowIso = new Date().toISOString();
     const created: Playlist = {
       id: `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       name: trimmedName,
       description: trimmedDesc,
       item_ids: dedupedInitial,
-      created_at: "Just now",
-      updated_at: "Just now",
+      created_at: nowIso,
+      updated_at: nowIso,
     };
     this.playlists.unshift(created);
     if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: created })) {
@@ -2637,7 +2945,7 @@ export class AudoraIpcClient {
     }
     target.name = trimmedName;
     target.description = trimmedDesc;
-    target.updated_at = "Just now";
+    target.updated_at = new Date().toISOString();
     if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
       this.persistToStorage();
     }
@@ -2688,7 +2996,7 @@ export class AudoraIpcClient {
         target.item_ids.push(id);
       }
     }
-    target.updated_at = "Just now";
+    target.updated_at = new Date().toISOString();
     if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
       this.persistToStorage();
     }
@@ -2706,7 +3014,7 @@ export class AudoraIpcClient {
       );
     }
     target.item_ids = target.item_ids.filter((id) => id !== mediaId);
-    target.updated_at = "Just now";
+    target.updated_at = new Date().toISOString();
     if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
       this.persistToStorage();
     }
@@ -2732,7 +3040,7 @@ export class AudoraIpcClient {
       target.item_ids.splice(currIdx, 1);
       const bounded = Math.max(0, Math.min(targetIndex, target.item_ids.length));
       target.item_ids.splice(bounded, 0, mediaId);
-      target.updated_at = "Just now";
+      target.updated_at = new Date().toISOString();
       if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
         this.persistToStorage();
       }
@@ -2864,11 +3172,19 @@ export class AudoraIpcClient {
   }
 
   public getCurrentVersion(): string {
+    const bootVersion = getNativePlatformInfo().appVersion;
+    if (getNativeSessionToken() && bootVersion) {
+      if (this.stagedRestartVersion && compareSemver(this.stagedRestartVersion, bootVersion) > 0) {
+        return this.stagedRestartVersion;
+      }
+      return bootVersion;
+    }
+    const base = bootVersion ?? BASE_APP_VERSION;
     const installed = this.settings.installed_version;
-    if (installed && compareSemver(installed, BASE_APP_VERSION) > 0) {
+    if (installed && compareSemver(installed, base) > 0) {
       return installed;
     }
-    return BASE_APP_VERSION;
+    return base;
   }
 
   public stageUpdateManifest(
@@ -2920,7 +3236,7 @@ export class AudoraIpcClient {
           ? [".deb", ".appimage", ".tar.gz"]
           : [".app.tar.gz", ".dmg"];
 
-    let chosen: { url: string; size: number; sha: string } | null = null;
+    let chosen: { url: string; size: number; sha: string; score: number } | null = null;
     let fallback: { url: string; size: number; sha: string } | null = null;
 
     for (const asset of parsed.assets ?? []) {
@@ -2941,15 +3257,14 @@ export class AudoraIpcClient {
       if (!fallback) {
         fallback = { url, size, sha: assetSha };
       }
-      if (osSuffixes.some((ext) => name.endsWith(ext))) {
+      const suffixIdx = osSuffixes.findIndex((ext) => name.endsWith(ext));
+      if (suffixIdx >= 0) {
         const matchesArch =
           name.includes(plat.arch) || (!name.includes("aarch64") && !name.includes("x86_64"));
-        if (matchesArch) {
-          chosen = { url, size, sha: assetSha };
-          break;
-        }
-        if (!chosen) {
-          chosen = { url, size, sha: assetSha };
+        // Higher score wins: arch match (+100) + earlier suffix priority (`.app.tar.gz` > `.dmg`) (`C-5`).
+        const score = (matchesArch ? 100 : 0) + (osSuffixes.length - suffixIdx);
+        if (!chosen || score > chosen.score) {
+          chosen = { url, size, sha: assetSha, score };
         }
       }
     }
@@ -3112,21 +3427,44 @@ export class AudoraIpcClient {
               download_url: preCheck.download_url,
             }),
           });
-          const text = await res.text();
-          if (text.trim().startsWith("{")) {
-            const payload = JSON.parse(text) as { ok?: boolean; message?: string };
-            handledByNativeBridge = true;
-            if (!payload.ok) {
-              throw this.makeError(
-                "AV-301",
-                "ValidationFailed",
-                "Update verification failed",
-                payload.message ?? "Native update integrity check failed.",
-              );
-            }
-            const status = this.installUpdate(clean);
-            if (payload.message) {
-              return { status, message: payload.message };
+          if (isJsonResponse(res)) {
+            const text = await res.text();
+            if (text.trim().startsWith("{")) {
+              const payload = JSON.parse(text) as {
+                ok?: boolean;
+                status?: string;
+                message?: string;
+              };
+              if (res.status !== 404 || payload.status) {
+                handledByNativeBridge = true;
+                if (!payload.ok) {
+                  throw this.makeError(
+                    "AV-301",
+                    "ValidationFailed",
+                    "Update verification failed",
+                    payload.message ?? "Native update integrity check failed.",
+                  );
+                }
+                if (payload.status === "restarting") {
+                  this.stagedRestartVersion = clean;
+                  const status = this.installUpdate(clean);
+                  return {
+                    status,
+                    message:
+                      payload.message ??
+                      `Audora v${clean} verified and restarting…`,
+                  };
+                }
+                return {
+                  status: {
+                    ...preCheck,
+                    staged_for_restart: false,
+                  },
+                  message:
+                    payload.message ??
+                    `Opened Audora v${clean} installer. Complete installation manually.`,
+                };
+              }
             }
           }
         } catch (err) {
@@ -3208,6 +3546,8 @@ export class AudoraIpcClient {
     this.media = [];
     this.notes = [];
     this.playlists = [];
+    this.rpcQueue = [];
+    this.stagedRestartVersion = null;
     this.settings = structuredClone(INITIAL_SETTINGS);
     this.snapshot = createIdleSnapshot(INITIAL_SETTINGS.default_playback_speed);
     this.stagedManifest = null;
@@ -3215,6 +3555,76 @@ export class AudoraIpcClient {
     return {
       removed_paths: removedPaths,
       bytes_reclaimed: 262_144,
+    };
+  }
+
+  public async cleanupApplicationDataNative(): Promise<CleanupSummaryDto> {
+    const plat = getNativePlatformInfo();
+    const sep = plat.os === "windows" ? "\\" : "/";
+    let removedPaths = [
+      `${plat.dataDir}${sep}audora.sqlite`,
+      `${plat.dataDir}${sep}updates${sep}release-manifest.json`,
+    ];
+    let bytesReclaimed = 0;
+
+    for (const m of this.media) {
+      revokeIfBlobUrl(m.stream_url);
+    }
+    this.rpcQueue = [];
+    if (this.seekDebounceTimer !== null) {
+      clearTimeout(this.seekDebounceTimer);
+      this.seekDebounceTimer = null;
+    }
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.removeItem(STORAGE_KEY);
+        window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+        window.localStorage.removeItem(`${STORAGE_KEY}.manual.bak`);
+        window.localStorage.removeItem(MANIFEST_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+
+    if (
+      this.useStorage &&
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost")
+    ) {
+      try {
+        const res = await nativeFetch("/__audora_state", { method: "DELETE" });
+        if (res.ok && isJsonResponse(res)) {
+          const parsed = (await res.json()) as {
+            ok?: boolean;
+            removed_paths?: string[];
+            bytes_reclaimed?: number;
+          };
+          if (parsed.ok) {
+            if (Array.isArray(parsed.removed_paths) && parsed.removed_paths.length > 0) {
+              removedPaths = parsed.removed_paths;
+            }
+            if (typeof parsed.bytes_reclaimed === "number") {
+              bytesReclaimed = parsed.bytes_reclaimed;
+            }
+          }
+        }
+      } catch {
+        // Ignore when native server is not running.
+      }
+    }
+
+    this.media = [];
+    this.notes = [];
+    this.playlists = [];
+    this.stagedRestartVersion = null;
+    this.settings = structuredClone(INITIAL_SETTINGS);
+    this.snapshot = createIdleSnapshot(INITIAL_SETTINGS.default_playback_speed);
+    this.stagedManifest = null;
+    postNativeIpcMessage("window_mode:full");
+    return {
+      removed_paths: removedPaths,
+      bytes_reclaimed: bytesReclaimed,
     };
   }
 

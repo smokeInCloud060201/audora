@@ -1,6 +1,6 @@
 //! SQLite implementation of `PlaylistRepository`.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::domain::{
     CreatePlaylistInput, MediaId, Playlist, PlaylistId, PlaylistRepository, UpdatePlaylistInput,
@@ -71,7 +71,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         now_iso: &str,
     ) -> AppResult<Playlist> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO playlists (id, name, description, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -147,7 +147,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
 
     fn update_playlist(&self, input: &UpdatePlaylistInput, now_iso: &str) -> AppResult<Playlist> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let affected = tx.execute(
                 "UPDATE playlists SET name = ?1, description = ?2, updated_at = ?3 WHERE id = ?4",
                 params![input.name, input.description, now_iso, input.id],
@@ -163,7 +163,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
 
     fn delete_playlist(&self, id: &str) -> AppResult<bool> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let affected = tx.execute("DELETE FROM playlists WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(affected > 0)
@@ -177,7 +177,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         now_iso: &str,
     ) -> AppResult<Playlist> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let exists: Option<i64> = tx
                 .query_row(
                     "SELECT 1 FROM playlists WHERE id = ?1",
@@ -234,7 +234,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         now_iso: &str,
     ) -> AppResult<Playlist> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "DELETE FROM playlist_items WHERE playlist_id = ?1 AND media_id = ?2",
                 params![playlist_id, media_id],
@@ -265,7 +265,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
         now_iso: &str,
     ) -> AppResult<Playlist> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut current = load_playlist_items(&tx, playlist_id)?;
             if let Some(curr_idx) = current.iter().position(|id| id == media_id) {
                 let item = current.remove(curr_idx);

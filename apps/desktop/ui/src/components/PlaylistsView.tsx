@@ -1,12 +1,14 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type {
   AppErrorPayload,
   LibraryFilter,
   MediaItem,
   Playlist,
+  TimestampPrecision,
 } from "../types/domain";
 import { formatDurationMs } from "../utils/format";
+import { useModalFocusTrap } from "../utils/useModalFocusTrap";
 import {
   IconArrowDown,
   IconArrowUp,
@@ -21,6 +23,15 @@ import {
   IconShuffle,
   IconTrash,
 } from "./Icons";
+
+function activePlaylistSafe(
+  playlists: Playlist[],
+  selectedPlaylistId: string | null,
+): Playlist | null {
+  return selectedPlaylistId
+    ? (playlists.find((p) => p.id === selectedPlaylistId) ?? null)
+    : null;
+}
 
 interface PlaylistsViewProps {
   playlists: Playlist[];
@@ -37,9 +48,10 @@ interface PlaylistsViewProps {
   onPlaylistsMutated: (toastMessage?: string) => void;
   onPlaylistDeleted: (deleted: Playlist) => void;
   onCollapse: () => void;
+  timestampPrecision: TimestampPrecision;
 }
 
-export function PlaylistsView({
+export const PlaylistsView = React.memo(function PlaylistsView({
   playlists,
   allMedia,
   activeMediaId,
@@ -51,6 +63,7 @@ export function PlaylistsView({
   onPlaylistsMutated,
   onPlaylistDeleted,
   onCollapse,
+  timestampPrecision,
 }: PlaylistsViewProps): React.ReactElement {
   const [sidebarFilter, setSidebarFilter] = useState<string>("");
 
@@ -65,6 +78,13 @@ export function PlaylistsView({
   const [pickerSearch, setPickerSearch] = useState<string>("");
   const [pickerFilter, setPickerFilter] = useState<LibraryFilter>("all");
   const [selectedMediaIds, setSelectedMediaIds] = useState<string[]>([]);
+
+  const composerDialogRef = useRef<HTMLFormElement | null>(null);
+  const composerNameRef = useRef<HTMLInputElement | null>(null);
+  const addMediaDialogRef = useRef<HTMLDivElement | null>(null);
+  const addMediaSearchRef = useRef<HTMLInputElement | null>(null);
+  useModalFocusTrap(Boolean(composerMode), composerDialogRef, composerNameRef);
+  useModalFocusTrap(isAddMediaOpen && Boolean(activePlaylistSafe(playlists, selectedPlaylistId)), addMediaDialogRef, addMediaSearchRef);
 
   useEffect(() => {
     if (!composerMode && !isAddMediaOpen) return undefined;
@@ -353,7 +373,9 @@ export function PlaylistsView({
                           <div className="playlist-nav-meta tabular-nums">
                             {pl.item_ids.length}{" "}
                             {pl.item_ids.length === 1 ? "item" : "items"}
-                            {plDuration > 0 ? ` · ${formatDurationMs(plDuration)}` : ""}
+                            {plDuration > 0
+                              ? ` · ${formatDurationMs(plDuration, timestampPrecision)}`
+                              : ""}
                           </div>
                         </div>
                       </button>
@@ -413,7 +435,9 @@ export function PlaylistsView({
               <div className="playlist-nav-meta tabular-nums">
                 {activePlaylistItems.length}{" "}
                 {activePlaylistItems.length === 1 ? "item" : "items"}
-                {totalDurationMs > 0 ? ` · ${formatDurationMs(totalDurationMs)}` : ""}
+                {totalDurationMs > 0
+                  ? ` · ${formatDurationMs(totalDurationMs, timestampPrecision)}`
+                  : ""}
               </div>
 
               <div className="playlist-drawer-actions">
@@ -557,7 +581,7 @@ export function PlaylistsView({
                             style={{ fontSize: 11, color: "var(--text-tertiary)" }}
                           >
                             {item.media_kind === "video" ? "Video" : "Audio"} ·{" "}
-                            {formatDurationMs(item.duration_ms)}
+                            {formatDurationMs(item.duration_ms, timestampPrecision)}
                             {isMissing ? " · Missing" : ""}
                           </div>
                         </button>
@@ -617,7 +641,7 @@ export function PlaylistsView({
           aria-label={composerMode === "create" ? "Create playlist" : "Edit playlist"}
           data-testid="playlist-composer-modal"
         >
-          <form className="modal-dialog" onSubmit={handleSaveComposer}>
+          <form ref={composerDialogRef} className="modal-dialog" onSubmit={handleSaveComposer}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <h2 style={{ margin: 0, fontSize: 17 }}>
                 {composerMode === "create" ? "New playlist" : "Edit playlist details"}
@@ -641,9 +665,9 @@ export function PlaylistsView({
                 Name
               </label>
               <input
+                ref={composerNameRef}
                 id="playlist-name-input"
                 type="text"
-                autoFocus
                 placeholder="e.g. Sound Design Masterclass"
                 value={nameDraft}
                 onChange={(e) => setNameDraft(e.target.value)}
@@ -712,7 +736,7 @@ export function PlaylistsView({
           aria-label="Add media from library"
           data-testid="playlist-add-media-modal"
         >
-          <div className="source-picker-dialog" style={{ width: 540 }}>
+          <div ref={addMediaDialogRef} className="source-picker-dialog" style={{ width: 540 }}>
             <div className="source-picker-header">
               <div>
                 <h2 style={{ margin: 0, fontSize: 16 }}>
@@ -735,6 +759,7 @@ export function PlaylistsView({
 
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <input
+                ref={addMediaSearchRef}
                 type="search"
                 aria-label="Search library items"
                 placeholder="Search library…"
@@ -793,7 +818,7 @@ export function PlaylistsView({
                           style={{ fontSize: 11, color: "var(--text-tertiary)" }}
                         >
                           {item.media_kind.toUpperCase()} ·{" "}
-                          {formatDurationMs(item.duration_ms)}
+                          {formatDurationMs(item.duration_ms, timestampPrecision)}
                         </div>
                       </div>
                       <span
@@ -835,4 +860,4 @@ export function PlaylistsView({
       )}
     </>
   );
-}
+});

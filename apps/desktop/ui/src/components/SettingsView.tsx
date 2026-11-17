@@ -43,7 +43,7 @@ interface SettingsViewProps {
   onSetUpdateStatus: React.Dispatch<React.SetStateAction<AppUpdateStatusDto | null>>;
 }
 
-export function SettingsView({
+export const SettingsView = React.memo(function SettingsView({
   settings,
   onUpdateSettings,
   settingsTab,
@@ -757,8 +757,9 @@ export function SettingsView({
                   color: "var(--text-tertiary)",
                 }}
               >
-                Licensed under Apache License 2.0 · Dynamically linked GStreamer 1.28.1
-                (LGPL-2.1+)
+                Licensed under Apache License 2.0 · Native OS WebView media playback &amp;
+                pure-Rust container prober (optional GStreamer LGPL-2.1+ CLI discovery on
+                Linux)
               </div>
             </section>
           )}
@@ -766,4 +767,4 @@ export function SettingsView({
       </div>
     </div>
   );
-}
+});

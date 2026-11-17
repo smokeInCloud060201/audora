@@ -706,24 +706,24 @@ Properties:
         let db_path = temp.path().join("audora.sqlite");
         let dispatcher = build_production_dispatcher(&db_path).expect("dispatcher");
 
-        // 1. Initial check reports 0.1.0 with no update available and default GitHub repo.
+        // 1. Initial check reports 1.0.3 with no update available and default GitHub repo.
         let initial = dispatcher.check_for_updates().expect("initial check");
-        assert_eq!(initial.current_version, "0.1.0");
+        assert_eq!(initial.current_version, "1.0.3");
         assert_eq!(initial.github_repo, "smokeInCloud060201/audora");
         assert!(!initial.update_available);
         assert!(initial.verified);
 
-        // 2. Stage a GitHub Releases `/releases/latest` JSON payload for v0.2.0.
+        // 2. Stage a GitHub Releases `/releases/latest` JSON payload for v1.1.0.
         let github_json = r#"{
-            "tag_name": "v0.2.0",
-            "name": "Audora 0.2.0 — Signed & Notarized Release",
+            "tag_name": "v1.1.0",
+            "name": "Audora 1.1.0 — Signed & Notarized Release",
             "body": "- Added macOS Developer ID & ad-hoc bundle signing\n- Added native self-updater",
             "published_at": "2026-11-12T10:00:00Z",
-            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v0.2.0",
+            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v1.1.0",
             "assets": [
                 {
-                    "name": "Audora_0.2.0_macos-aarch64.dmg",
-                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v0.2.0/Audora_0.2.0_macos-aarch64.dmg",
+                    "name": "Audora_1.1.0_macos-aarch64.dmg",
+                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.1.0/Audora_1.1.0_macos-aarch64.dmg",
                     "size": 18452992,
                     "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 }
@@ -734,25 +734,25 @@ Properties:
             .stage_github_release_json(github_json)
             .expect("stage github release json");
         assert!(staged.update_available);
-        assert_eq!(staged.latest_version, "0.2.0");
+        assert_eq!(staged.latest_version, "1.1.0");
         assert!(staged.verified);
         assert_eq!(
             staged.sha256_checksum,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
 
-        // 3. Dismissing v0.2.0 suppresses `update_available` on automatic startup checks,
+        // 3. Dismissing v1.1.0 suppresses `update_available` on automatic startup checks,
         //    while manual checks (`include_dismissed = true`) still surface it.
-        let dismissed = dispatcher.dismiss_update("0.2.0").expect("dismiss update");
+        let dismissed = dispatcher.dismiss_update("1.1.0").expect("dismiss update");
         assert!(!dismissed.update_available);
         let manual_check = dispatcher
             .check_for_updates_with_options(true)
             .expect("manual check including dismissed");
         assert!(manual_check.update_available);
 
-        // 4. Installing v0.2.0 marks `current_version = 0.2.0` and `staged_for_restart = true`.
-        let installed = dispatcher.install_update("0.2.0").expect("install update");
-        assert_eq!(installed.current_version, "0.2.0");
+        // 4. Installing v1.1.0 marks `current_version = 1.1.0` and `staged_for_restart = true`.
+        let installed = dispatcher.install_update("1.1.0").expect("install update");
+        assert_eq!(installed.current_version, "1.1.0");
         assert!(!installed.update_available);
         assert!(installed.staged_for_restart);
 
@@ -1018,11 +1018,11 @@ Properties:
 
         // Missing digest must NOT fabricate a fake SHA-256 (`verified == false`).
         let unverified_json = r#"{
-            "tag_name": "v0.3.0",
-            "name": "Audora 0.3.0",
+            "tag_name": "v1.2.0",
+            "name": "Audora 1.2.0",
             "body": "Unsigned test payload",
             "published_at": "2026-11-16T00:00:00Z",
-            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v0.3.0",
+            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v1.2.0",
             "assets": [
                 {
                     "name": "release-manifest-macos-aarch64.json",
@@ -1031,8 +1031,8 @@ Properties:
                     "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                 },
                 {
-                    "name": "Audora_0.3.0_macos-aarch64.dmg",
-                    "browser_download_url": "https://example.com/Audora_0.3.0_macos-aarch64.dmg",
+                    "name": "Audora_1.2.0_macos-aarch64.dmg",
+                    "browser_download_url": "https://example.com/Audora_1.2.0_macos-aarch64.dmg",
                     "size": 20000000,
                     "digest": null
                 }
@@ -1061,7 +1061,7 @@ Properties:
             .expect("stage unverified");
         assert!(!status.verified);
         assert!(!status.update_available);
-        assert!(dispatcher.install_update("0.3.0").is_err());
+        assert!(dispatcher.install_update("1.2.0").is_err());
     }
 
     #[test]
@@ -1260,5 +1260,204 @@ Properties:
         let session = exported.playback_session.expect("session");
         assert_eq!(session.active_media_id.as_deref(), Some("med_legacy_1"));
         assert!(session.shuffle);
+    }
+
+    #[test]
+    fn v3_blob_merges_when_media_table_populated_reconciles_ids_and_clears_folder_id() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora_cli_plus_v3.sqlite");
+
+        // 1. Simulate v3 DB where CLI already inserted `med_cli_1` into `media` AND UI saved a v2 blob
+        //    containing another item, a float timestamp, a missing `note_count`, AND a malformed entry!
+        let v3_migrations = &crate::persistence::db::BUILTIN_MIGRATIONS[..3];
+        let v3_db = Database::open_with_migrations(&db_path, v3_migrations).expect("open v3");
+        v3_db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO media (id, path, display_name, media_kind, last_position_ms, completed, availability, added_at, last_seen_at)
+                     VALUES ('med_cli_1', '/tmp/shared_talk.mp4', 'shared_talk.mp4', 'video', 0, 0, 'available', '1700000000', '1700000000');",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO notes (id, media_id, position_ms, is_quick_marker, body, created_at, updated_at)
+                     VALUES ('note_cli_1', 'med_cli_1', 3000, 0, 'CLI note preserved across ID reconciliation', '1700000000', '1700000000');",
+                    [],
+                )?;
+                let blob = r#"{
+                    "media": [
+                        {
+                            "id": "med_ui_shared",
+                            "path": "/tmp/shared_talk.mp4",
+                            "display_name": "shared_talk.mp4",
+                            "media_kind": "video",
+                            "duration_ms": 120000.4,
+                            "last_position_ms": 42000.7,
+                            "availability": "available",
+                            "source_folder_id": "src_keep"
+                        },
+                        { "malformed": true },
+                        {
+                            "id": "med_ui_2",
+                            "path": "/tmp/second.mp3",
+                            "media_kind": "audio",
+                            "availability": "available"
+                        }
+                    ],
+                    "notes": [{
+                        "id": "note_ui_1",
+                        "media_id": "med_ui_shared",
+                        "position_ms": 15500.2,
+                        "body": "UI note on reconciled ID"
+                    }],
+                    "playlists": [{
+                        "id": "pl_ui_1",
+                        "name": "Study Queue",
+                        "item_ids": ["med_ui_shared", "med_ui_2"]
+                    }]
+                }"#;
+                conn.execute(
+                    "INSERT INTO app_ui_state (key, payload_json, updated_at) VALUES ('v2', ?1, '1');",
+                    [blob],
+                )?;
+                Ok(())
+            })
+            .expect("seed v3");
+        drop(v3_db);
+
+        // 2. Upgrade to v4 -> both CLI note and UI note survive under `med_ui_shared`, `med_ui_2` survives!
+        let (_, v4_db) = build_production_dispatcher_with_db(&db_path).expect("upgrade v4");
+        let state = v4_db
+            .export_relational_state()
+            .expect("export")
+            .expect("state");
+        assert_eq!(state.media.len(), 2);
+        assert_eq!(state.notes.len(), 2);
+        assert!(state.notes.iter().all(|n| n.media_id == "med_ui_shared"));
+        assert_eq!(state.playlists[0].item_ids.len(), 2);
+
+        // 3. Clearing `source_folder_id = None` via `rpc_upsert_media_batch` sets SQLite column to NULL (`H-2`)!
+        let mut detached = state
+            .media
+            .iter()
+            .find(|m| m.id == "med_ui_shared")
+            .expect("shared")
+            .clone();
+        assert_eq!(detached.source_folder_id.as_deref(), Some("src_keep"));
+        detached.source_folder_id = None;
+        v4_db
+            .rpc_upsert_media_batch(&[detached])
+            .expect("clear folder id");
+
+        let after_clear = v4_db
+            .export_relational_state()
+            .expect("export after clear")
+            .expect("state");
+        let reloaded = after_clear
+            .media
+            .iter()
+            .find(|m| m.id == "med_ui_shared")
+            .expect("reloaded");
+        assert_eq!(reloaded.source_folder_id, None);
+
+        // 4. Domain validation rejects remote URLs and oversized notes in `rpc_*` (`H-6`).
+        let mut bad_item = reloaded.clone();
+        bad_item.path = "https://evil.example/stream.mp4".to_owned();
+        assert!(v4_db.rpc_upsert_media_batch(&[bad_item]).is_err());
+    }
+
+    #[test]
+    fn prober_handles_aac_adts_mp3_cover_art_ogg_payload_rf64_wav_and_semver_rc10() {
+        use crate::adapters::probe_container_duration_ms;
+        use crate::services::{compare_semver, parse_github_release_json};
+        use std::cmp::Ordering;
+
+        assert_eq!(
+            compare_semver("1.0.3-rc.10", "1.0.3-rc.2"),
+            Ordering::Greater
+        );
+
+        // `.app.tar.gz` must win over `.dmg` on macOS even when `.dmg` appears first (`C-5`).
+        #[cfg(target_os = "macos")]
+        {
+            let release_json = r#"{
+                "tag_name": "v2.0.0",
+                "assets": [
+                    {
+                        "name": "Audora_2.0.0_macos-aarch64.dmg",
+                        "browser_download_url": "https://example.com/Audora.dmg",
+                        "size": 100,
+                        "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    {
+                        "name": "Audora_2.0.0_macos-aarch64.app.tar.gz",
+                        "browser_download_url": "https://example.com/Audora.app.tar.gz",
+                        "size": 90,
+                        "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    }
+                ]
+            }"#;
+            let manifest = parse_github_release_json(release_json).expect("parse");
+            assert!(manifest.download_url.ends_with(".app.tar.gz"));
+            assert_eq!(
+                manifest.sha256,
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            );
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+
+        // 1. AAC ADTS stream (3 frames of 128 bytes at 48kHz -> 3 * 1024 / 48000 = 64 ms)
+        let mut aac = Vec::new();
+        for _ in 0..3 {
+            let mut frame = vec![0_u8; 128];
+            frame[0] = 0xFF;
+            frame[1] = 0xF1; // MPEG-4, Layer 00, no CRC
+            frame[2] = 0x4C; // LC profile, sf_idx = 3 (48000 Hz)
+            frame[3] = 0x80; // stereo, frame_len = 128 -> bits: 128 << 5 = 0x1000 -> byte4 = 0x10, byte5 = 0x00
+            frame[4] = 0x10;
+            frame[5] = 0x00;
+            frame[6] = 0xFC; // 1 raw data block (0)
+            aac.extend_from_slice(&frame);
+        }
+        let aac_path = create_dummy_media_file(&temp, "clip.aac", &aac);
+        assert_eq!(probe_container_duration_ms(&aac_path), Some(64));
+
+        // 2. MP3 with embedded JPEG APP2 false sync `0xFF 0xE2 0x12 0x00` followed by 2 valid CBR 128kbps 44.1kHz frames (417 bytes each)
+        let mut mp3 = vec![0_u8; 16 + 417 * 2];
+        mp3[0..4].copy_from_slice(&[0xFF, 0xE2, 0x12, 0x00]); // false sync must be skipped!
+        mp3[16..20].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // valid frame 1 (frame_size = 417)
+        mp3[16 + 417..16 + 421].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // valid frame 2
+        let mp3_path = create_dummy_media_file(&temp, "cover_sync.mp3", &mp3);
+        // 834 audio bytes at 128 kbps -> (834 * 8) / 128 = 52 ms (NOT 2+ hours from 8kbps false sync!)
+        assert_eq!(probe_container_duration_ms(&mp3_path), Some(52));
+
+        // 3. Ogg Opus with fake `"OggS\x00"` bytes inside compressed payload must still read real page header
+        let mut opus = Vec::new();
+        opus.extend_from_slice(b"OggS\x00\x02");
+        opus.extend_from_slice(&0_u64.to_le_bytes());
+        opus.extend_from_slice(&42_u32.to_le_bytes()); // serial = 42
+        opus.extend_from_slice(&0_u32.to_le_bytes());
+        opus.extend_from_slice(&0_u32.to_le_bytes());
+        opus.push(1);
+        opus.push(19);
+        opus.extend_from_slice(b"OpusHead\x01\x02");
+        opus.extend_from_slice(&0_u16.to_le_bytes());
+        opus.extend_from_slice(&48_000_u32.to_le_bytes());
+        opus.extend_from_slice(&[0, 0, 0]);
+        // Page 2 with serial 42, granule = 240_000 (5_000 ms), and fake `OggS\x00` inside its 32-byte payload!
+        opus.extend_from_slice(b"OggS\x00\x04");
+        opus.extend_from_slice(&240_000_u64.to_le_bytes());
+        opus.extend_from_slice(&42_u32.to_le_bytes());
+        opus.extend_from_slice(&1_u32.to_le_bytes());
+        opus.extend_from_slice(&0_u32.to_le_bytes());
+        opus.push(1);
+        opus.push(32);
+        let mut fake_payload = [0_u8; 32];
+        fake_payload[0..5].copy_from_slice(b"OggS\x00");
+        fake_payload[6..14].copy_from_slice(&999_999_999_u64.to_le_bytes());
+        fake_payload[14..18].copy_from_slice(&42_u32.to_le_bytes());
+        opus.extend_from_slice(&fake_payload);
+        let opus_path = create_dummy_media_file(&temp, "tricky.opus", &opus);
+        assert_eq!(probe_container_duration_ms(&opus_path), Some(5_000));
     }
 }

@@ -6,44 +6,61 @@ import type {
   PlaybackSnapshot,
   TimestampPrecision,
 } from "../types/domain";
-import { formatDurationMs, progressPercent } from "../utils/format";
+import {
+  formatAriaTimestamp,
+  formatDurationMs,
+  progressPercent,
+} from "../utils/format";
 import { AudoraLogo } from "./AudoraLogo";
 import { IconExpandMode, IconHelpCircle, IconPause, IconPlay } from "./Icons";
 
 interface MinimumPlayerWindowProps {
   activeMedia: MediaItem | null;
   snapshot: PlaybackSnapshot;
+  displayPositionMs: number;
   timestampPrecision: TimestampPrecision;
   isHelpOpen: boolean;
   onToggleHelp: () => void;
   onCloseHelp: () => void;
   onUpdateSettings: (next: AppSettings) => void;
   onUpdateSnapshot: (next: PlaybackSnapshot) => void;
+  onScrubPointerDown: () => void;
+  onScrubChange: (posMs: number) => void;
+  onScrubCommit: (posMs: number) => void;
   onOpenMediaPicker: () => void;
   onDropFiles: (files: FileList | null) => void;
 }
 
-export function MinimumPlayerWindow({
+export const MinimumPlayerWindow = React.memo(function MinimumPlayerWindow({
   activeMedia,
   snapshot,
+  displayPositionMs,
   timestampPrecision,
   isHelpOpen,
   onToggleHelp,
   onCloseHelp,
   onUpdateSettings,
   onUpdateSnapshot,
+  onScrubPointerDown,
+  onScrubChange,
+  onScrubCommit,
   onOpenMediaPicker,
   onDropFiles,
 }: MinimumPlayerWindowProps): React.ReactElement {
-  const pct = progressPercent(snapshot.position_ms, snapshot.duration_ms);
+  const pct = progressPercent(displayPositionMs, snapshot.duration_ms);
 
   return (
     <div
       className="minimum-mode-shell"
       data-testid="minimum-mode-shell"
       data-node-id="2:103"
-      onDragOver={(e) => e.preventDefault()}
+      onDragOver={(e) => {
+        if (Array.from(e.dataTransfer?.types ?? []).includes("Files")) {
+          e.preventDefault();
+        }
+      }}
       onDrop={(e) => {
+        if (!Array.from(e.dataTransfer?.types ?? []).includes("Files")) return;
         e.preventDefault();
         onDropFiles(e.dataTransfer?.files ?? null);
       }}
@@ -150,7 +167,7 @@ export function MinimumPlayerWindow({
           <div className="minimum-time-column">
             <div className="minimum-time-row">
               <span className="minimum-time-current tabular-nums" data-node-id="20:15">
-                {formatDurationMs(snapshot.position_ms, timestampPrecision)}
+                {formatDurationMs(displayPositionMs, timestampPrecision)}
               </span>
               <span className="minimum-time-total tabular-nums" data-node-id="20:16">
                 /{" "}
@@ -164,22 +181,19 @@ export function MinimumPlayerWindow({
               <input
                 type="range"
                 aria-label="Seek timeline"
+                aria-valuetext={formatAriaTimestamp(displayPositionMs)}
                 className="minimum-scrubber"
                 disabled={!activeMedia}
                 min={0}
                 max={snapshot.duration_ms ?? 100}
-                value={snapshot.position_ms}
+                value={displayPositionMs}
                 style={{
                   background: `linear-gradient(to right, var(--min-accent) 0%, var(--min-accent) ${pct}%, var(--min-track-bg) ${pct}%, var(--min-track-bg) 100%)`,
                 }}
-                onChange={(e) =>
-                  onUpdateSnapshot(
-                    ipcClient.playbackCommand({
-                      action: "seek",
-                      position_ms: Number(e.target.value),
-                    }),
-                  )
-                }
+                onPointerDown={onScrubPointerDown}
+                onChange={(e) => onScrubChange(Number(e.target.value))}
+                onPointerUp={(e) => onScrubCommit(Number(e.currentTarget.value))}
+                onPointerCancel={(e) => onScrubCommit(Number(e.currentTarget.value))}
               />
             </div>
           </div>
@@ -187,4 +201,4 @@ export function MinimumPlayerWindow({
       </div>
     </div>
   );
-}
+});

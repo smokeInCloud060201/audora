@@ -1,6 +1,6 @@
 //! SQLite implementation of `SettingsRepository`.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::domain::{AppSettings, SettingsRepository};
 use crate::error::{AppError, AppResult};
@@ -45,7 +45,7 @@ impl SettingsRepository for SqliteSettingsRepository {
             .map_err(|e| AppError::internal(format!("Failed to serialize settings: {e}")))?;
 
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO settings (key, value_json, updated_at)
                  VALUES (?1, ?2, ?3)
@@ -57,5 +57,9 @@ impl SettingsRepository for SqliteSettingsRepository {
             tx.commit()?;
             Ok(())
         })
+    }
+
+    fn schema_version(&self) -> AppResult<i64> {
+        self.db.schema_version()
     }
 }

@@ -80,9 +80,9 @@ Download the latest signed/verified package for your platform from [**GitHub Rel
 
 | Platform | Package | Installation |
 | :--- | :--- | :--- |
-| **macOS** *(macOS 13+, Apple Silicon & Intel)* | `Audora_<version>_macos-aarch64.dmg` | Open the `.dmg` and drag **Audora.app** to **Applications**. |
+| **macOS** *(macOS 13+, Apple Silicon `aarch64`; Intel `x86_64` from source)* | `Audora_<version>_macos-aarch64.dmg` | Open the `.dmg` and drag **Audora.app** to **Applications**. |
 | **Linux** *(Ubuntu / Debian x86_64)* | `Audora_<version>_linux-x86_64.deb`<br>`Audora_<version>_linux-x86_64.tar.gz` | `sudo apt install ./Audora_<version>_linux-x86_64.deb` (or extract the portable `.tar.gz`). |
-| **Windows** *(Windows 10/11 x86_64)* | `Audora_<version>_windows-x86_64-setup.zip`<br>`Audora_<version>_windows-x86_64.exe` | Extract the archive and launch `Audora.exe`. |
+| **Windows** *(Windows 10/11 x86_64)* | `Audora_<version>_windows-x86_64-setup.exe`<br>`Audora_<version>_windows-x86_64-portable.zip` | Run the `-setup.exe` installer (or extract `-portable.zip` and launch `Audora.exe`). |
 
 ### Build from Source
 

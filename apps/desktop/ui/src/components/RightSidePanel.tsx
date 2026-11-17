@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useMemo, useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type {
   MediaItem,
@@ -7,7 +7,7 @@ import type {
   SidePanelTab,
   TimestampPrecision,
 } from "../types/domain";
-import { formatDurationMs } from "../utils/format";
+import { formatDurationMs, formatHumanDate } from "../utils/format";
 import {
   IconArrowRight,
   IconClose,
@@ -40,7 +40,7 @@ interface RightSidePanelProps {
   timestampPrecision: TimestampPrecision;
 }
 
-export function RightSidePanel({
+export const RightSidePanel = React.memo(function RightSidePanel({
   sideTab,
   onSelectSideTab,
   snapshot,
@@ -60,6 +60,15 @@ export function RightSidePanel({
   onCollapse,
   timestampPrecision,
 }: RightSidePanelProps): React.ReactElement {
+  const [noteMenuPlacement, setNoteMenuPlacement] = useState<"down" | "up">("down");
+  const mediaById = useMemo(() => {
+    const map = new Map<string, MediaItem>();
+    for (const m of allMedia) {
+      map.set(m.id, m);
+    }
+    return map;
+  }, [allMedia]);
+
   return (
     <aside className="side-panel" aria-label="Queue and notes" data-testid="side-panel">
       <div className="panel-tabs" role="tablist">
@@ -125,7 +134,12 @@ export function RightSidePanel({
                 Click any timestamp to jump to that moment
               </div>
             </div>
-            <button type="button" className="btn-primary" onClick={onOpenAddNoteModal}>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!activeMedia}
+              onClick={onOpenAddNoteModal}
+            >
               <IconPlus size={13} />
               <span>New</span>
             </button>
@@ -206,31 +220,26 @@ export function RightSidePanel({
                           type="button"
                           className="jump-link-btn"
                           aria-label={`More actions for note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
-                          onClick={() =>
+                          aria-expanded={openNoteMenuId === note.id}
+                          onClick={(e) => {
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const shouldFlipUp =
+                              typeof window !== "undefined" &&
+                              window.innerHeight - rect.bottom < 140 &&
+                              rect.top > 140;
+                            setNoteMenuPlacement(shouldFlipUp ? "up" : "down");
                             onSetOpenNoteMenuId((prev) =>
                               prev === note.id ? null : note.id,
-                            )
-                          }
+                            );
+                          }}
                         >
                           <IconMoreHorizontal size={15} />
                         </button>
                         {openNoteMenuId === note.id && (
                           <div
-                            style={{
-                              position: "absolute",
-                              right: 0,
-                              top: 20,
-                              background: "var(--bg-dialog)",
-                              border: "1px solid var(--border-control)",
-                              borderRadius: 8,
-                              boxShadow: "var(--shadow-modal)",
-                              padding: 6,
-                              display: "flex",
-                              flexDirection: "column",
-                              gap: 4,
-                              zIndex: 50,
-                              minWidth: 110,
-                            }}
+                            className={`note-row-menu ${
+                              noteMenuPlacement === "up" ? "open-up" : "open-down"
+                            }`}
                           >
                             <button
                               type="button"
@@ -266,7 +275,7 @@ export function RightSidePanel({
                     </p>
                     <div className="note-card-footer">
                       <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                        Added {note.created_at}
+                        Added {formatHumanDate(note.created_at)}
                       </span>
                       <button
                         type="button"
@@ -339,7 +348,7 @@ export function RightSidePanel({
 
           <div className="panel-scroll-list">
             {snapshot.queue.map((id, idx) => {
-              const qItem = allMedia.find((m) => m.id === id);
+              const qItem = mediaById.get(id);
               if (!qItem) return null;
               const isCurrent = qItem.id === snapshot.media_id;
               return (
@@ -400,7 +409,7 @@ export function RightSidePanel({
                       <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>
                         {qItem.media_kind === "video" ? "Video" : "Audio"} ·{" "}
                         <span className="tabular-nums">
-                          {formatDurationMs(qItem.duration_ms)}
+                          {formatDurationMs(qItem.duration_ms, timestampPrecision)}
                         </span>
                       </div>
                     </button>
@@ -422,4 +431,4 @@ export function RightSidePanel({
       )}
     </aside>
   );
-}
+});

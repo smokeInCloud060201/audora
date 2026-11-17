@@ -10,10 +10,34 @@ use rusqlite::{
 };
 
 use crate::domain::{
+    current_iso8601_utc, normalize_persisted_timestamp, validate_local_media_path_str,
+    validate_note_body, validate_playback_rate, validate_playlist_fields, validate_volume,
     AppSettings, Availability, MediaItem, MediaKind, Note, PersistedPlaybackSession, Playlist,
     RelationalAppStateDto,
 };
 use crate::error::{redact_path, AppError, AppResult};
+
+fn set_private_dir_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn set_private_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.is_file() {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
 
 /// Embedded SQL for migration `0001_initial.sql`.
 pub const MIGRATION_0001_INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
@@ -84,12 +108,12 @@ impl Database {
     pub fn open_or_recover(path: impl AsRef<Path>) -> AppResult<Self> {
         let db_path = path.as_ref().to_path_buf();
         match Self::open_internal(&db_path, BUILTIN_MIGRATIONS) {
-            Ok(db) => match db.verify_integrity() {
+            Ok(db) => match db.quick_check_healthy() {
                 Ok(true) => return Ok(db),
                 Ok(false) => {
                     tracing::warn!(
                         path = %redact_path(&db_path),
-                        "Database integrity_check failed; preserving corrupt file before recovery"
+                        "Database quick_check failed; preserving corrupt file before recovery"
                     );
                 }
                 Err(err) => return Err(err),
@@ -119,6 +143,7 @@ impl Database {
                         "Database file appears damaged and could not be backed up safely.",
                     )
                 })?;
+                set_private_file_permissions(&corrupt_bak);
             }
             let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
             let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
@@ -206,11 +231,27 @@ impl Database {
         })
     }
 
-    /// Runs `PRAGMA integrity_check` to verify SQLite B-tree and page consistency.
+    /// Runs `PRAGMA integrity_check` to verify SQLite B-tree and page consistency,
+    /// treating `SQLITE_CORRUPT` / `SQLITE_NOTADB` errors as `Ok(false)` (`H-4`).
     pub fn verify_integrity(&self) -> AppResult<bool> {
         self.with_conn(|conn| {
-            let status: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
-            Ok(status.eq_ignore_ascii_case("ok"))
+            match conn.query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0)) {
+                Ok(status) => Ok(status.eq_ignore_ascii_case("ok")),
+                Err(e) if Self::is_sqlite_corruption_error(&e) => Ok(false),
+                Err(e) => Err(AppError::from(e)),
+            }
+        })
+    }
+
+    /// Runs fast `PRAGMA quick_check(1)` on startup so 50,000-row databases boot rapidly while still
+    /// catching interior-page corruption (`H-4`).
+    fn quick_check_healthy(&self) -> AppResult<bool> {
+        self.with_conn(|conn| {
+            match conn.query_row("PRAGMA quick_check(1);", [], |row| row.get::<_, String>(0)) {
+                Ok(status) => Ok(status.eq_ignore_ascii_case("ok")),
+                Err(e) if Self::is_sqlite_corruption_error(&e) => Ok(false),
+                Err(e) => Err(AppError::from(e)),
+            }
         })
     }
 
@@ -231,6 +272,7 @@ impl Database {
                 .to_str()
                 .is_some_and(|s| conn.execute("VACUUM INTO ?1;", [s]).is_ok());
             if vacuum_ok {
+                set_private_file_permissions(&tmp_backup);
                 fs::rename(&tmp_backup, &backup_path).map_err(|io_err| {
                     let _ = fs::remove_file(&tmp_backup);
                     tracing::error!(
@@ -249,6 +291,7 @@ impl Database {
                     AppError::persistence("Failed to create manual database backup.")
                 })?;
             }
+            set_private_file_permissions(&backup_path);
             Ok(())
         })?;
         Ok(Some(backup_path))
@@ -290,6 +333,7 @@ impl Database {
                         false,
                     )
                 })?;
+                set_private_dir_permissions(parent);
             }
         }
 
@@ -297,10 +341,13 @@ impl Database {
             let corrupt = Self::is_sqlite_corruption_error(&e);
             (AppError::from(e), corrupt)
         })?;
+        set_private_file_permissions(&db_path);
         if let Err(e) = Self::configure_base_pragmas(&conn) {
             let corrupt = Self::is_sqlite_corruption_error(&e);
             return Err((AppError::from(e), corrupt));
         }
+        set_private_file_permissions(&PathBuf::from(format!("{}-wal", db_path.display())));
+        set_private_file_permissions(&PathBuf::from(format!("{}-shm", db_path.display())));
         if let Err(e) = Self::ensure_migrations_table(&conn) {
             let corrupt = Self::is_sqlite_corruption_error(&e);
             return Err((AppError::from(e), corrupt));
@@ -333,6 +380,7 @@ impl Database {
                     false,
                 )
             })?;
+            set_private_file_permissions(&backup_path);
             last_backup_path = Some(backup_path);
         }
 
@@ -341,10 +389,15 @@ impl Database {
             db_path: Some(db_path),
             last_backup_path,
         };
-        db.apply_migrations(migrations).map_err(|e| (e, false))?;
+        db.apply_migrations(migrations)?;
         db.enable_foreign_keys().map_err(|e| (e, false))?;
         if db.schema_version().unwrap_or(0) >= 4 {
-            let _ = db.migrate_legacy_ui_state_blob();
+            if let Err(err) = db.migrate_legacy_ui_state_blob() {
+                tracing::warn!(
+                    code = err.code().as_str(),
+                    "Deferred legacy app_ui_state migration; preserving blob for retry"
+                );
+            }
         }
         Ok(db)
     }
@@ -359,7 +412,8 @@ impl Database {
             db_path: None,
             last_backup_path: None,
         };
-        db.apply_migrations(BUILTIN_MIGRATIONS)?;
+        db.apply_migrations(BUILTIN_MIGRATIONS)
+            .map_err(|(e, _)| e)?;
         db.enable_foreign_keys()?;
         Ok(db)
     }
@@ -415,6 +469,145 @@ impl Database {
         self.reset_all_user_data()
     }
 
+    fn parse_lenient_state_object(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> (
+        AppSettings,
+        Vec<MediaItem>,
+        Vec<Note>,
+        Vec<Playlist>,
+        Option<PersistedPlaybackSession>,
+    ) {
+        let mut base_settings_val =
+            serde_json::to_value(AppSettings::default()).unwrap_or(serde_json::Value::Null);
+        if let (Some(target_map), Some(src_map)) = (
+            base_settings_val.as_object_mut(),
+            obj.get("settings").and_then(serde_json::Value::as_object),
+        ) {
+            for (k, v) in src_map {
+                target_map.insert(k.clone(), v.clone());
+            }
+        }
+        let mut settings: AppSettings =
+            serde_json::from_value(base_settings_val).unwrap_or_default();
+        if !(crate::domain::MIN_PLAYBACK_RATE..=crate::domain::MAX_PLAYBACK_RATE)
+            .contains(&settings.default_playback_speed)
+            || !settings.default_playback_speed.is_finite()
+        {
+            settings.default_playback_speed = 1.0;
+        }
+        let now_iso = current_iso8601_utc();
+        settings.source_folders.retain_mut(|f| {
+            let Ok(clean) = validate_local_media_path_str(&f.path) else {
+                return false;
+            };
+            let clean_owned = clean.to_owned();
+            if f.label.trim().is_empty() {
+                f.label = Path::new(&clean_owned)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&clean_owned)
+                    .to_owned();
+            }
+            f.path = clean_owned;
+            f.added_at = normalize_persisted_timestamp(&f.added_at, &now_iso);
+            f.last_scanned_at = normalize_persisted_timestamp(&f.last_scanned_at, &now_iso);
+            true
+        });
+
+        let mut media = Vec::new();
+        if let Some(arr) = obj.get("media").and_then(serde_json::Value::as_array) {
+            for elem in arr {
+                match serde_json::from_value::<MediaItem>(elem.clone()) {
+                    Ok(mut m) => {
+                        if m.id.trim().is_empty() || validate_local_media_path_str(&m.path).is_err()
+                        {
+                            continue;
+                        }
+                        if m.display_name.trim().is_empty() {
+                            m.display_name = Path::new(&m.path)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&m.path)
+                                .to_owned();
+                        }
+                        m.added_at = normalize_persisted_timestamp(&m.added_at, &now_iso);
+                        m.last_seen_at = normalize_persisted_timestamp(&m.last_seen_at, &now_iso);
+                        m.last_opened_at = m
+                            .last_opened_at
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| normalize_persisted_timestamp(s, &now_iso));
+                        media.push(m);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping malformed media item during state import: {e}");
+                    }
+                }
+            }
+        }
+
+        let mut notes = Vec::new();
+        if let Some(arr) = obj.get("notes").and_then(serde_json::Value::as_array) {
+            for elem in arr {
+                match serde_json::from_value::<Note>(elem.clone()) {
+                    Ok(mut n) => {
+                        if n.id.trim().is_empty() || n.media_id.trim().is_empty() {
+                            continue;
+                        }
+                        n.created_at = normalize_persisted_timestamp(&n.created_at, &now_iso);
+                        n.updated_at = normalize_persisted_timestamp(&n.updated_at, &now_iso);
+                        notes.push(n);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping malformed note during state import: {e}");
+                    }
+                }
+            }
+        }
+
+        let mut playlists = Vec::new();
+        if let Some(arr) = obj.get("playlists").and_then(serde_json::Value::as_array) {
+            for elem in arr {
+                match serde_json::from_value::<Playlist>(elem.clone()) {
+                    Ok(mut pl) => {
+                        if pl.id.trim().is_empty() || pl.name.trim().is_empty() {
+                            continue;
+                        }
+                        pl.created_at = normalize_persisted_timestamp(&pl.created_at, &now_iso);
+                        pl.updated_at = normalize_persisted_timestamp(&pl.updated_at, &now_iso);
+                        playlists.push(pl);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping malformed playlist during state import: {e}");
+                    }
+                }
+            }
+        }
+
+        let playback_session: Option<PersistedPlaybackSession> = obj
+            .get("playback_session")
+            .and_then(|v| serde_json::from_value::<PersistedPlaybackSession>(v.clone()).ok())
+            .map(|mut s| {
+                if !s.volume.is_finite() {
+                    s.volume = 1.0;
+                } else {
+                    s.volume = s.volume.clamp(0.0, 1.0);
+                }
+                if !s.rate.is_finite() {
+                    s.rate = 1.0;
+                } else {
+                    s.rate = s.rate.clamp(
+                        crate::domain::MIN_PLAYBACK_RATE,
+                        crate::domain::MAX_PLAYBACK_RATE,
+                    );
+                }
+                s
+            });
+
+        (settings, media, notes, playlists, playback_session)
+    }
+
     fn migrate_legacy_ui_state_blob(&self) -> AppResult<bool> {
         let legacy_raw: Option<String> = self.with_conn(|conn| {
             let val = conn
@@ -429,15 +622,126 @@ impl Database {
         let Some(raw) = legacy_raw else {
             return Ok(false);
         };
-        let media_count: i64 = self.with_conn(|conn| {
-            let cnt = conn.query_row("SELECT COUNT(*) FROM media;", [], |r| r.get(0))?;
-            Ok(cnt)
-        })?;
-        if media_count == 0 && raw.trim().starts_with('{') && raw.trim() != "{}" {
-            self.import_relational_state_json(&raw)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "{}" {
+            self.with_conn(|conn| {
+                conn.execute("DELETE FROM app_ui_state;", [])?;
+                Ok(())
+            })?;
+            return Ok(true);
         }
+
+        let raw_val: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+            AppError::validation(format!("Legacy app_ui_state JSON parse failed: {e}"))
+        })?;
+        let Some(obj) = raw_val.as_object() else {
+            return Err(AppError::validation(
+                "Legacy app_ui_state root is not a JSON object",
+            ));
+        };
+
+        let (settings, media, notes, playlists, playback_session) =
+            Self::parse_lenient_state_object(obj);
+        let settings_json = serde_json::to_string(&settings)
+            .map_err(|e| AppError::internal(format!("Settings serialize failed: {e}")))?;
+        let session_json = playback_session
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
+
+        // Non-destructively merge legacy `v2` blob onto any existing relational rows (e.g. CLI opens)
+        // and purge `app_ui_state` inside the exact same `IMMEDIATE` transaction (`C-1`).
         self.with_conn(|conn| {
-            conn.execute("DELETE FROM app_ui_state;", [])?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for m in &media {
+                Self::reconcile_upsert_media_in_tx(&tx, m, false)?;
+            }
+            for n in &notes {
+                let exists: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM media WHERE id = ?1",
+                        params![n.media_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if exists.is_some() {
+                    tx.execute(
+                        "INSERT INTO notes (id, media_id, position_ms, is_quick_marker, body, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(id) DO UPDATE SET
+                           media_id = excluded.media_id,
+                           position_ms = excluded.position_ms,
+                           is_quick_marker = excluded.is_quick_marker,
+                           body = excluded.body,
+                           updated_at = excluded.updated_at;",
+                        params![
+                            n.id,
+                            n.media_id,
+                            i64::try_from(n.position_ms).unwrap_or(0),
+                            i64::from(n.is_quick_marker),
+                            n.body,
+                            n.created_at,
+                            n.updated_at,
+                        ],
+                    )?;
+                }
+            }
+            for pl in &playlists {
+                tx.execute(
+                    "INSERT INTO playlists (id, name, description, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(id) DO UPDATE SET
+                       name = excluded.name,
+                       description = excluded.description,
+                       updated_at = excluded.updated_at;",
+                    params![pl.id, pl.name, pl.description, pl.created_at, pl.updated_at],
+                )?;
+                tx.execute(
+                    "DELETE FROM playlist_items WHERE playlist_id = ?1",
+                    params![pl.id],
+                )?;
+                let mut seen_pl_items = std::collections::HashSet::new();
+                let mut pos = 0_i64;
+                for mid in &pl.item_ids {
+                    if !seen_pl_items.insert(mid.clone()) {
+                        continue;
+                    }
+                    let exists: Option<i64> = tx
+                        .query_row("SELECT 1 FROM media WHERE id = ?1", params![mid], |r| {
+                            r.get(0)
+                        })
+                        .optional()?;
+                    if exists.is_some() {
+                        tx.execute(
+                            "INSERT INTO playlist_items (playlist_id, media_id, position, added_at)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![pl.id, mid, pos, pl.updated_at],
+                        )?;
+                        pos = pos.saturating_add(1);
+                    }
+                }
+            }
+            if obj.contains_key("settings") {
+                tx.execute(
+                    "INSERT INTO settings (key, value_json, updated_at)
+                     VALUES ('app_preferences_v1', ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                     ON CONFLICT(key) DO UPDATE SET
+                       value_json = excluded.value_json,
+                       updated_at = excluded.updated_at;",
+                    params![settings_json],
+                )?;
+            }
+            if let Some(ref s_json) = session_json {
+                tx.execute(
+                    "INSERT INTO settings (key, value_json, updated_at)
+                     VALUES ('playback_session_v1', ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                     ON CONFLICT(key) DO UPDATE SET
+                       value_json = excluded.value_json,
+                       updated_at = excluded.updated_at;",
+                    params![s_json],
+                )?;
+            }
+            tx.execute("DELETE FROM app_ui_state;", [])?;
+            tx.commit()?;
             Ok(())
         })?;
         Ok(true)
@@ -453,7 +757,7 @@ impl Database {
                         m.last_seen_at, m.source_folder_id,
                         (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
                  FROM media m
-                 ORDER BY COALESCE(m.last_opened_at, m.added_at) DESC, m.display_name ASC",
+                 ORDER BY COALESCE(m.last_opened_at, m.added_at) DESC, m.rowid DESC, m.display_name ASC",
             )?;
             let media_rows = media_stmt.query_map([], |row| {
                 let kind_str: String = row.get("media_kind")?;
@@ -492,7 +796,7 @@ impl Database {
             let mut note_stmt = conn.prepare(
                 "SELECT id, media_id, position_ms, is_quick_marker, body, created_at, updated_at
                  FROM notes
-                 ORDER BY position_ms ASC, created_at ASC",
+                 ORDER BY position_ms ASC, created_at ASC, id ASC",
             )?;
             let note_rows = note_stmt.query_map([], |row| {
                 let pos_i64: i64 = row.get("position_ms")?;
@@ -515,7 +819,7 @@ impl Database {
             let mut pl_stmt = conn.prepare(
                 "SELECT id, name, description, created_at, updated_at
                  FROM playlists
-                 ORDER BY updated_at DESC, created_at DESC",
+                 ORDER BY updated_at DESC, created_at DESC, rowid DESC, id ASC",
             )?;
             let pl_rows = pl_stmt.query_map([], |row| {
                 Ok((
@@ -597,34 +901,8 @@ impl Database {
             return Err(AppError::validation("State JSON root must be an object"));
         };
 
-        let mut base_settings_val = serde_json::to_value(AppSettings::default())
-            .map_err(|e| AppError::internal(format!("Default settings serialize failed: {e}")))?;
-        if let (Some(target_map), Some(src_map)) = (
-            base_settings_val.as_object_mut(),
-            obj.get("settings").and_then(serde_json::Value::as_object),
-        ) {
-            for (k, v) in src_map {
-                target_map.insert(k.clone(), v.clone());
-            }
-        }
-        let settings: AppSettings =
-            serde_json::from_value(base_settings_val).unwrap_or_else(|_| AppSettings::default());
-
-        let media: Vec<MediaItem> = obj
-            .get("media")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let notes: Vec<Note> = obj
-            .get("notes")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let playlists: Vec<Playlist> = obj
-            .get("playlists")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let playback_session: Option<PersistedPlaybackSession> = obj
-            .get("playback_session")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let (settings, media, notes, playlists, playback_session) =
+            Self::parse_lenient_state_object(obj);
 
         let settings_json = serde_json::to_string(&settings)
             .map_err(|e| AppError::internal(format!("Settings serialize failed: {e}")))?;
@@ -643,10 +921,9 @@ impl Database {
             let mut valid_media_ids = std::collections::HashSet::with_capacity(media.len());
             let mut seen_paths = std::collections::HashSet::with_capacity(media.len());
             for m in &media {
-                if !seen_paths.insert(m.path.clone()) {
+                if !seen_paths.insert(m.path.clone()) || !valid_media_ids.insert(m.id.clone()) {
                     continue;
                 }
-                valid_media_ids.insert(m.id.clone());
                 tx.execute(
                     "INSERT INTO media (
                         id, path, display_name, media_kind, duration_ms, duration_probed,
@@ -731,6 +1008,8 @@ impl Database {
                        updated_at = excluded.updated_at;",
                     params![s_json],
                 )?;
+            } else {
+                tx.execute("DELETE FROM settings WHERE key = 'playback_session_v1';", [])?;
             }
 
             tx.commit()?;
@@ -742,90 +1021,243 @@ impl Database {
     // O(1) Indexed Relational RPC Operations (Scales to 50,000+ Tracks & Notes)
     // =========================================================================
 
+    pub(crate) fn reconcile_upsert_media_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item: &MediaItem,
+        authoritative_folder: bool,
+    ) -> AppResult<()> {
+        if item.id.trim().is_empty() {
+            return Err(AppError::validation("Media item ID must not be empty"));
+        }
+        let clean_path = validate_local_media_path_str(&item.path)?.to_owned();
+        let display_name = if item.display_name.trim().is_empty() {
+            Path::new(&clean_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&clean_path)
+                .to_owned()
+        } else {
+            item.display_name.trim().to_owned()
+        };
+        let now_iso = current_iso8601_utc();
+        let added_at = normalize_persisted_timestamp(&item.added_at, &now_iso);
+        let last_seen_at = normalize_persisted_timestamp(&item.last_seen_at, &now_iso);
+        let last_opened_at = item
+            .last_opened_at
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| normalize_persisted_timestamp(s, &now_iso));
+
+        let existing_by_id: Option<String> = tx
+            .query_row(
+                "SELECT path FROM media WHERE id = ?1",
+                params![item.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        type ExistingPathRow = (
+            String,
+            Option<i64>,
+            i64,
+            Option<i64>,
+            String,
+            Option<String>,
+        );
+        let existing_by_path: Option<ExistingPathRow> =
+            tx.query_row(
+                "SELECT id, duration_ms, duration_probed, file_size_bytes, added_at, source_folder_id
+                 FROM media WHERE path = ?1",
+                params![clean_path],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2).unwrap_or(0),
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get::<_, Option<String>>(5).unwrap_or(None),
+                    ))
+                },
+            )
+            .optional()?;
+
+        let dur_param = item.duration_ms.and_then(|v| i64::try_from(v).ok());
+        let size_param = item.file_size_bytes.and_then(|v| i64::try_from(v).ok());
+        let pos_param = i64::try_from(item.last_position_ms).unwrap_or(0);
+
+        if let Some((other_id, other_dur, other_probed, other_size, other_added, other_folder)) =
+            existing_by_path
+        {
+            if other_id != item.id {
+                if existing_by_id.is_some() {
+                    // `item.id` already exists at an old path and is being upgraded/relinked onto `clean_path`
+                    // which was held by `other_id` -> re-home children onto `item.id` and remove `other_id` (`C-2`).
+                    tx.execute(
+                        "UPDATE notes SET media_id = ?1 WHERE media_id = ?2",
+                        params![item.id, other_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE OR IGNORE playlist_items SET media_id = ?1 WHERE media_id = ?2",
+                        params![item.id, other_id],
+                    )?;
+                    tx.execute("DELETE FROM media WHERE id = ?1", params![other_id])?;
+                } else {
+                    // `other_id` held `clean_path` (e.g. CLI open) while UI generated `item.id` ->
+                    // move `other_id` path aside, insert `item.id`, re-home children, and remove `other_id` (`C-2`).
+                    let temp_path = format!("__rehome__{}__{}", other_id, item.id);
+                    tx.execute(
+                        "UPDATE media SET path = ?2 WHERE id = ?1",
+                        params![other_id, temp_path],
+                    )?;
+                    let merged_dur = dur_param.or(other_dur);
+                    let merged_probed = i64::from(item.duration_probed || other_probed != 0);
+                    let merged_size = size_param.or(other_size);
+                    let merged_folder = if authoritative_folder {
+                        item.source_folder_id.clone()
+                    } else {
+                        item.source_folder_id.clone().or(other_folder)
+                    };
+                    tx.execute(
+                        "INSERT INTO media (
+                            id, path, display_name, media_kind, duration_ms, duration_probed,
+                            last_position_ms, completed, file_size_bytes, fingerprint, availability,
+                            added_at, last_opened_at, last_seen_at, source_folder_id
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        params![
+                            item.id,
+                            clean_path,
+                            display_name,
+                            item.media_kind.as_str(),
+                            merged_dur,
+                            merged_probed,
+                            pos_param,
+                            i64::from(item.completed),
+                            merged_size,
+                            item.fingerprint,
+                            item.availability.as_str(),
+                            other_added,
+                            last_opened_at,
+                            last_seen_at,
+                            merged_folder,
+                        ],
+                    )?;
+                    tx.execute(
+                        "UPDATE notes SET media_id = ?1 WHERE media_id = ?2",
+                        params![item.id, other_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE OR IGNORE playlist_items SET media_id = ?1 WHERE media_id = ?2",
+                        params![item.id, other_id],
+                    )?;
+                    tx.execute("DELETE FROM media WHERE id = ?1", params![other_id])?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if existing_by_id.is_some() {
+            if authoritative_folder {
+                // `H-2`: Authoritative RPC updates allow clearing `source_folder_id` to `NULL`.
+                tx.execute(
+                    "UPDATE media
+                     SET path = ?2,
+                         display_name = ?3,
+                         media_kind = ?4,
+                         duration_ms = COALESCE(?5, duration_ms),
+                         duration_probed = CASE WHEN ?6 != 0 THEN 1 ELSE duration_probed END,
+                         last_position_ms = ?7,
+                         completed = ?8,
+                         file_size_bytes = COALESCE(?9, file_size_bytes),
+                         availability = ?10,
+                         last_opened_at = COALESCE(?11, last_opened_at),
+                         last_seen_at = ?12,
+                         source_folder_id = ?13
+                     WHERE id = ?1",
+                    params![
+                        item.id,
+                        clean_path,
+                        display_name,
+                        item.media_kind.as_str(),
+                        dur_param,
+                        i64::from(item.duration_probed),
+                        pos_param,
+                        i64::from(item.completed),
+                        size_param,
+                        item.availability.as_str(),
+                        last_opened_at,
+                        last_seen_at,
+                        item.source_folder_id,
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE media
+                     SET path = ?2,
+                         display_name = ?3,
+                         media_kind = ?4,
+                         duration_ms = COALESCE(?5, duration_ms),
+                         duration_probed = CASE WHEN ?6 != 0 THEN 1 ELSE duration_probed END,
+                         last_position_ms = ?7,
+                         completed = ?8,
+                         file_size_bytes = COALESCE(?9, file_size_bytes),
+                         availability = ?10,
+                         last_opened_at = COALESCE(?11, last_opened_at),
+                         last_seen_at = ?12,
+                         source_folder_id = COALESCE(?13, source_folder_id)
+                     WHERE id = ?1",
+                    params![
+                        item.id,
+                        clean_path,
+                        display_name,
+                        item.media_kind.as_str(),
+                        dur_param,
+                        i64::from(item.duration_probed),
+                        pos_param,
+                        i64::from(item.completed),
+                        size_param,
+                        item.availability.as_str(),
+                        last_opened_at,
+                        last_seen_at,
+                        item.source_folder_id,
+                    ],
+                )?;
+            }
+            return Ok(());
+        }
+
+        tx.execute(
+            "INSERT INTO media (
+                id, path, display_name, media_kind, duration_ms, duration_probed,
+                last_position_ms, completed, file_size_bytes, fingerprint, availability,
+                added_at, last_opened_at, last_seen_at, source_folder_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                item.id,
+                clean_path,
+                display_name,
+                item.media_kind.as_str(),
+                dur_param,
+                i64::from(item.duration_probed),
+                pos_param,
+                i64::from(item.completed),
+                size_param,
+                item.fingerprint,
+                item.availability.as_str(),
+                added_at,
+                last_opened_at,
+                last_seen_at,
+                item.source_folder_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Upserts one or more media records transactionally without touching notes or playlists.
     pub fn rpc_upsert_media_batch(&self, items: &[MediaItem]) -> AppResult<()> {
         self.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for item in items {
-                let existing_path: Option<String> = tx
-                    .query_row(
-                        "SELECT path FROM media WHERE id = ?1",
-                        params![item.id],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if let Some(old_path) = existing_path {
-                    if old_path != item.path {
-                        tx.execute(
-                            "UPDATE media
-                             SET path = ?2,
-                                 display_name = ?3,
-                                 media_kind = ?4,
-                                 duration_ms = ?5,
-                                 duration_probed = ?6,
-                                 last_position_ms = ?7,
-                                 completed = ?8,
-                                 file_size_bytes = ?9,
-                                 availability = ?10,
-                                 last_opened_at = ?11,
-                                 last_seen_at = ?12,
-                                 source_folder_id = ?13
-                             WHERE id = ?1",
-                            params![
-                                item.id,
-                                item.path,
-                                item.display_name,
-                                item.media_kind.as_str(),
-                                item.duration_ms.and_then(|v| i64::try_from(v).ok()),
-                                i64::from(item.duration_probed),
-                                i64::try_from(item.last_position_ms).unwrap_or(0),
-                                i64::from(item.completed),
-                                item.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
-                                item.availability.as_str(),
-                                item.last_opened_at,
-                                item.last_seen_at,
-                                item.source_folder_id,
-                            ],
-                        )?;
-                        continue;
-                    }
-                }
-                tx.execute(
-                    "INSERT INTO media (
-                        id, path, display_name, media_kind, duration_ms, duration_probed,
-                        last_position_ms, completed, file_size_bytes, fingerprint, availability,
-                        added_at, last_opened_at, last_seen_at, source_folder_id
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                    ON CONFLICT(path) DO UPDATE SET
-                        display_name = excluded.display_name,
-                        media_kind = excluded.media_kind,
-                        duration_ms = COALESCE(excluded.duration_ms, media.duration_ms),
-                        duration_probed = CASE WHEN excluded.duration_probed != 0 THEN 1 ELSE media.duration_probed END,
-                        last_position_ms = excluded.last_position_ms,
-                        completed = excluded.completed,
-                        file_size_bytes = COALESCE(excluded.file_size_bytes, media.file_size_bytes),
-                        availability = excluded.availability,
-                        last_opened_at = COALESCE(excluded.last_opened_at, media.last_opened_at),
-                        last_seen_at = excluded.last_seen_at,
-                        source_folder_id = COALESCE(excluded.source_folder_id, media.source_folder_id)",
-                    params![
-                        item.id,
-                        item.path,
-                        item.display_name,
-                        item.media_kind.as_str(),
-                        item.duration_ms.and_then(|v| i64::try_from(v).ok()),
-                        i64::from(item.duration_probed),
-                        i64::try_from(item.last_position_ms).unwrap_or(0),
-                        i64::from(item.completed),
-                        item.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
-                        item.fingerprint,
-                        item.availability.as_str(),
-                        item.added_at,
-                        item.last_opened_at,
-                        item.last_seen_at,
-                        item.source_folder_id,
-                    ],
-                )?;
+                Self::reconcile_upsert_media_in_tx(&tx, item, true)?;
             }
             tx.commit()?;
             Ok(())
@@ -840,29 +1272,44 @@ impl Database {
         completed: bool,
         session: Option<&PersistedPlaybackSession>,
     ) -> AppResult<()> {
-        let session_json = session.and_then(|s| serde_json::to_string(s).ok());
+        if media_id.trim().is_empty() {
+            return Err(AppError::validation("media_id must not be empty"));
+        }
+        let session_json =
+            match session {
+                Some(s) => {
+                    validate_playback_rate(s.rate)?;
+                    validate_volume(s.volume)?;
+                    Some(serde_json::to_string(s).map_err(|e| {
+                        AppError::internal(format!("Session serialize failed: {e}"))
+                    })?)
+                }
+                None => None,
+            };
+        let now_iso = current_iso8601_utc();
         self.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "UPDATE media
                  SET last_position_ms = ?2,
                      completed = ?3,
-                     last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     last_seen_at = ?4
                  WHERE id = ?1",
                 params![
                     media_id,
                     i64::try_from(last_position_ms).unwrap_or(0),
-                    i64::from(completed)
+                    i64::from(completed),
+                    now_iso,
                 ],
             )?;
             if let Some(ref s_json) = session_json {
                 tx.execute(
                     "INSERT INTO settings (key, value_json, updated_at)
-                     VALUES ('playback_session_v1', ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                     VALUES ('playback_session_v1', ?1, ?2)
                      ON CONFLICT(key) DO UPDATE SET
                        value_json = excluded.value_json,
                        updated_at = excluded.updated_at;",
-                    params![s_json],
+                    params![s_json, now_iso],
                 )?;
             }
             tx.commit()?;
@@ -884,13 +1331,38 @@ impl Database {
         })
     }
 
-    /// O(1) indexed note upsert.
+    /// O(1) indexed note upsert with domain validation and foreign-key pre-check (`C-2` / `H-6`).
     pub fn rpc_upsert_note(&self, note: &Note) -> AppResult<()> {
+        if note.id.trim().is_empty() || note.media_id.trim().is_empty() {
+            return Err(AppError::validation(
+                "Note ID and media_id must not be empty",
+            ));
+        }
+        let clean_body = validate_note_body(&note.body, note.is_quick_marker)?.to_owned();
+        let now_iso = current_iso8601_utc();
+        let created_at = normalize_persisted_timestamp(&note.created_at, &now_iso);
+        let updated_at = normalize_persisted_timestamp(&note.updated_at, &now_iso);
+        let is_qm = clean_body.is_empty() && note.is_quick_marker;
+
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let media_exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM media WHERE id = ?1",
+                    params![note.media_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if media_exists.is_none() {
+                return Err(AppError::validation(
+                    "Referenced media item does not exist",
+                ));
+            }
+            tx.execute(
                 "INSERT INTO notes (id, media_id, position_ms, is_quick_marker, body, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
+                   media_id = excluded.media_id,
                    position_ms = excluded.position_ms,
                    is_quick_marker = excluded.is_quick_marker,
                    body = excluded.body,
@@ -899,26 +1371,43 @@ impl Database {
                     note.id,
                     note.media_id,
                     i64::try_from(note.position_ms).unwrap_or(0),
-                    i64::from(note.is_quick_marker),
-                    note.body,
-                    note.created_at,
-                    note.updated_at,
+                    i64::from(is_qm),
+                    clean_body,
+                    created_at,
+                    updated_at,
                 ],
             )?;
+            tx.commit()?;
             Ok(())
         })
     }
 
     /// O(1) indexed note deletion.
     pub fn rpc_delete_note(&self, note_id: &str) -> AppResult<bool> {
+        if note_id.trim().is_empty() {
+            return Err(AppError::validation("Note ID must not be empty"));
+        }
         self.with_conn(|conn| {
-            let n = conn.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let n = tx.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
+            tx.commit()?;
             Ok(n > 0)
         })
     }
 
-    /// Single-playlist transactional upsert (`playlists` + ordered `playlist_items`).
+    /// Single-playlist transactional upsert (`playlists` + ordered `playlist_items`) with domain validation.
     pub fn rpc_upsert_playlist(&self, playlist: &Playlist) -> AppResult<()> {
+        if playlist.id.trim().is_empty() {
+            return Err(AppError::validation("Playlist ID must not be empty"));
+        }
+        let (clean_name, clean_desc) =
+            validate_playlist_fields(&playlist.name, &playlist.description)?;
+        let clean_name = clean_name.to_owned();
+        let clean_desc = clean_desc.to_owned();
+        let now_iso = current_iso8601_utc();
+        let created_at = normalize_persisted_timestamp(&playlist.created_at, &now_iso);
+        let updated_at = normalize_persisted_timestamp(&playlist.updated_at, &now_iso);
+
         self.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
@@ -928,13 +1417,7 @@ impl Database {
                    name = excluded.name,
                    description = excluded.description,
                    updated_at = excluded.updated_at;",
-                params![
-                    playlist.id,
-                    playlist.name,
-                    playlist.description,
-                    playlist.created_at,
-                    playlist.updated_at
-                ],
+                params![playlist.id, clean_name, clean_desc, created_at, updated_at],
             )?;
             tx.execute(
                 "DELETE FROM playlist_items WHERE playlist_id = ?1",
@@ -955,7 +1438,7 @@ impl Database {
                     tx.execute(
                         "INSERT INTO playlist_items (playlist_id, media_id, position, added_at)
                          VALUES (?1, ?2, ?3, ?4)",
-                        params![playlist.id, mid, pos, playlist.updated_at],
+                        params![playlist.id, mid, pos, updated_at],
                     )?;
                     pos = pos.saturating_add(1);
                 }
@@ -967,44 +1450,153 @@ impl Database {
 
     /// O(1) indexed playlist deletion (`ON DELETE CASCADE` cleans up `playlist_items`).
     pub fn rpc_delete_playlist(&self, playlist_id: &str) -> AppResult<bool> {
+        if playlist_id.trim().is_empty() {
+            return Err(AppError::validation("Playlist ID must not be empty"));
+        }
         self.with_conn(|conn| {
-            let n = conn.execute("DELETE FROM playlists WHERE id = ?1", params![playlist_id])?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let n = tx.execute("DELETE FROM playlists WHERE id = ?1", params![playlist_id])?;
+            tx.commit()?;
             Ok(n > 0)
         })
     }
 
-    /// O(1) settings upsert.
+    /// O(1) settings upsert with playback-rate and folder-path validation (`H-6`).
     pub fn rpc_save_settings(&self, settings: &AppSettings) -> AppResult<()> {
-        let json = serde_json::to_string(settings)
+        validate_playback_rate(settings.default_playback_speed)?;
+        let now_iso = current_iso8601_utc();
+        let mut normalized = settings.clone();
+        for folder in &mut normalized.source_folders {
+            let clean = validate_local_media_path_str(&folder.path)?.to_owned();
+            folder.path = clean;
+            folder.added_at = normalize_persisted_timestamp(&folder.added_at, &now_iso);
+            folder.last_scanned_at =
+                normalize_persisted_timestamp(&folder.last_scanned_at, &now_iso);
+        }
+        let json = serde_json::to_string(&normalized)
             .map_err(|e| AppError::internal(format!("Settings serialize failed: {e}")))?;
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "INSERT INTO settings (key, value_json, updated_at)
-                 VALUES ('app_preferences_v1', ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 VALUES ('app_preferences_v1', ?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET
                    value_json = excluded.value_json,
                    updated_at = excluded.updated_at;",
-                params![json],
+                params![json, now_iso],
             )?;
+            tx.commit()?;
             Ok(())
         })
     }
 
-    /// O(1) playback session upsert.
+    /// O(1) playback session upsert with rate and volume validation (`H-6`).
     pub fn rpc_save_playback_session(&self, session: &PersistedPlaybackSession) -> AppResult<()> {
+        validate_playback_rate(session.rate)?;
+        validate_volume(session.volume)?;
+        let now_iso = current_iso8601_utc();
         let json = serde_json::to_string(session)
             .map_err(|e| AppError::internal(format!("Playback session serialize failed: {e}")))?;
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "INSERT INTO settings (key, value_json, updated_at)
-                 VALUES ('playback_session_v1', ?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 VALUES ('playback_session_v1', ?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET
                    value_json = excluded.value_json,
                    updated_at = excluded.updated_at;",
-                params![json],
+                params![json, now_iso],
             )?;
+            tx.commit()?;
             Ok(())
         })
+    }
+
+    /// Executes an ordered batch of relational RPC operations (`C-8` unload / shutdown flush).
+    pub fn rpc_execute_batch(&self, ops: &[serde_json::Value]) -> AppResult<()> {
+        for op_val in ops {
+            let op = op_val
+                .get("op")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match op {
+                "update_progress" => {
+                    if let Some(mid) = op_val.get("media_id").and_then(serde_json::Value::as_str) {
+                        let pos = op_val
+                            .get("last_position_ms")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        let comp = op_val
+                            .get("completed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let sess: Option<PersistedPlaybackSession> = op_val
+                            .get("session")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        self.rpc_update_progress(mid, pos, comp, sess.as_ref())?;
+                    }
+                }
+                "upsert_media_batch" => {
+                    if let Some(items) = op_val
+                        .get("items")
+                        .and_then(|v| serde_json::from_value::<Vec<MediaItem>>(v.clone()).ok())
+                    {
+                        self.rpc_upsert_media_batch(&items)?;
+                    }
+                }
+                "delete_media_ids" => {
+                    if let Some(ids) = op_val
+                        .get("ids")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                    {
+                        self.rpc_delete_media_ids(&ids)?;
+                    }
+                }
+                "upsert_note" => {
+                    if let Some(note) = op_val
+                        .get("note")
+                        .and_then(|v| serde_json::from_value::<Note>(v.clone()).ok())
+                    {
+                        self.rpc_upsert_note(&note)?;
+                    }
+                }
+                "delete_note" => {
+                    if let Some(id) = op_val.get("id").and_then(serde_json::Value::as_str) {
+                        self.rpc_delete_note(id)?;
+                    }
+                }
+                "upsert_playlist" => {
+                    if let Some(pl) = op_val
+                        .get("playlist")
+                        .and_then(|v| serde_json::from_value::<Playlist>(v.clone()).ok())
+                    {
+                        self.rpc_upsert_playlist(&pl)?;
+                    }
+                }
+                "delete_playlist" => {
+                    if let Some(id) = op_val.get("id").and_then(serde_json::Value::as_str) {
+                        self.rpc_delete_playlist(id)?;
+                    }
+                }
+                "save_settings" => {
+                    if let Some(s) = op_val
+                        .get("settings")
+                        .and_then(|v| serde_json::from_value::<AppSettings>(v.clone()).ok())
+                    {
+                        self.rpc_save_settings(&s)?;
+                    }
+                }
+                "save_session" => {
+                    if let Some(s) = op_val.get("session").and_then(|v| {
+                        serde_json::from_value::<PersistedPlaybackSession>(v.clone()).ok()
+                    }) {
+                        self.rpc_save_playback_session(&s)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Wipes all user records across relational tables and `app_ui_state`, then checkpoints WAL.
@@ -1057,32 +1649,55 @@ impl Database {
         Ok(version.unwrap_or(0))
     }
 
-    fn apply_migrations(&mut self, migrations: &[MigrationSpec]) -> AppResult<()> {
-        self.with_conn(|conn| {
-            let current = Self::current_schema_version(conn)?;
-            for migration in migrations {
-                if migration.version <= current {
-                    continue;
-                }
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                if let Err(err) = tx.execute_batch(migration.sql) {
-                    tracing::error!(
-                        version = migration.version,
-                        name = migration.name,
-                        "Schema migration failed; rolling back transaction: {err}"
-                    );
-                    return Err(AppError::persistence(format!(
+    fn apply_migrations(&mut self, migrations: &[MigrationSpec]) -> Result<(), (AppError, bool)> {
+        let mut guard = self.conn.lock().map_err(|_| {
+            (
+                AppError::internal("Database connection mutex poisoned"),
+                false,
+            )
+        })?;
+        let current = Self::current_schema_version(&guard).map_err(|e| {
+            let corrupt = Self::is_sqlite_corruption_error(&e);
+            (AppError::from(e), corrupt)
+        })?;
+        for migration in migrations {
+            if migration.version <= current {
+                continue;
+            }
+            let tx = guard
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| {
+                    let corrupt = Self::is_sqlite_corruption_error(&e);
+                    (AppError::from(e), corrupt)
+                })?;
+            if let Err(err) = tx.execute_batch(migration.sql) {
+                let is_corrupt = Self::is_sqlite_corruption_error(&err);
+                tracing::error!(
+                    version = migration.version,
+                    name = migration.name,
+                    "Schema migration failed; rolling back transaction: {err}"
+                );
+                return Err((
+                    AppError::persistence(format!(
                         "Schema migration {} ({}) failed; changes were rolled back and backup preserved.",
                         migration.version, migration.name
-                    )));
-                }
-                tx.execute(
-                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
-                    rusqlite::params![migration.version, migration.name],
-                )?;
-                tx.commit()?;
+                    )),
+                    is_corrupt,
+                ));
             }
-            Ok(())
-        })
+            tx.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .map_err(|e| {
+                let corrupt = Self::is_sqlite_corruption_error(&e);
+                (AppError::from(e), corrupt)
+            })?;
+            tx.commit().map_err(|e| {
+                let corrupt = Self::is_sqlite_corruption_error(&e);
+                (AppError::from(e), corrupt)
+            })?;
+        }
+        Ok(())
     }
 }

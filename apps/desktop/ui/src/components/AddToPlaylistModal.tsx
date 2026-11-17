@@ -1,6 +1,7 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type { AppErrorPayload, MediaItem, Playlist } from "../types/domain";
+import { useModalFocusTrap } from "../utils/useModalFocusTrap";
 import { IconCheck, IconClose, IconPlus } from "./Icons";
 
 interface AddToPlaylistModalProps {
@@ -18,6 +19,9 @@ export function AddToPlaylistModal({
 }: AddToPlaylistModalProps): React.ReactElement {
   const [newPlaylistName, setNewPlaylistName] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  useModalFocusTrap(true, dialogRef, nameInputRef);
 
   const handleToggleMembership = (playlist: Playlist) => {
     setErrorMessage(null);
@@ -60,7 +64,7 @@ export function AddToPlaylistModal({
       aria-label="Add media to playlist"
       data-testid="add-to-playlist-modal"
     >
-      <div className="modal-dialog" style={{ width: 460 }}>
+      <div ref={dialogRef} className="modal-dialog" style={{ width: 460 }}>
         <div
           style={{
             display: "flex",
@@ -97,6 +101,7 @@ export function AddToPlaylistModal({
 
         <form onSubmit={handleCreateWithItem} style={{ display: "flex", gap: 8 }}>
           <input
+            ref={nameInputRef}
             type="text"
             aria-label="New playlist name"
             placeholder="New playlist name…"

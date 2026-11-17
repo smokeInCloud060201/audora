@@ -124,24 +124,6 @@
   }
 }
 
-.audora-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background-color: var(--accent-primary);
-}
-
-.audora-mark span {
-  display: block;
-  width: 2px;
-  background-color: var(--accent-on-primary);
-  border-radius: 1px;
-}
-
 .brand-title {
   font-size: 17px;
   font-weight: 600;
@@ -837,6 +819,11 @@
   cursor: pointer;
 }
 
+.play-circle-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* 365px Right Side Panel: Queue | Notes (Frame 2:63 & 4:609) */
 .side-panel {
   display: flex;
@@ -1080,6 +1067,44 @@
   bottom: calc(100% - 6px);
 }
 
+.library-title-btn {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.library-title-btn:hover {
+  color: var(--accent-text);
+}
+
+.note-row-menu {
+  position: absolute;
+  right: 0;
+  background-color: var(--bg-dialog);
+  border: 1px solid var(--border-control);
+  border-radius: 8px;
+  box-shadow: var(--shadow-modal);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 50;
+  min-width: 118px;
+}
+
+.note-row-menu.open-down {
+  top: 22px;
+}
+
+.note-row-menu.open-up {
+  bottom: 22px;
+}
+
 /* Modal Overlay (Frame 4:88) */
 .modal-backdrop {
   position: fixed;
@@ -1122,11 +1147,11 @@
   --min-card-border: #35403c;
   --min-divider: #242c29;
   --min-title-color: #f2f4f6;
-  --min-subtitle-color: #6f7a76;
-  --min-help-icon: #87918d;
+  --min-subtitle-color: #8f9b97;
+  --min-help-icon: #96a29e;
   --min-expand-icon: #a5afab;
   --min-time-current: #f4f6f5;
-  --min-time-total: #77817e;
+  --min-time-total: #8f9b97;
   --min-track-bg: #303735;
   --min-accent: #79d7bf;
   --min-play-fg: #092019;
@@ -1146,14 +1171,14 @@
   --min-card-border: #d3ddd9;
   --min-divider: #dfe7e4;
   --min-title-color: #13201c;
-  --min-subtitle-color: #60706a;
-  --min-help-icon: #55645e;
+  --min-subtitle-color: #4f5e59;
+  --min-help-icon: #495853;
   --min-expand-icon: #2d3c37;
   --min-time-current: #101816;
-  --min-time-total: #687671;
+  --min-time-total: #52615c;
   --min-track-bg: #d1dcd8;
-  --min-accent: #2ea98c;
-  --min-play-fg: #f5f8f7;
+  --min-accent: #127864;
+  --min-play-fg: #ffffff;
 }
 
 .minimum-player-card {
@@ -1373,10 +1398,20 @@
   cursor: pointer;
 }
 
-.toast-banner {
+.toast-stack {
   position: fixed;
   bottom: 24px;
   right: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  z-index: 60;
+  pointer-events: none;
+}
+
+.toast-banner {
+  pointer-events: auto;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -1386,7 +1421,7 @@
   border: 1px solid var(--accent-primary);
   color: var(--text-primary);
   font-size: 13px;
-  z-index: 60;
+  box-shadow: var(--shadow-modal);
 }
 
 /* Audio-Only Canvas (Frame 4:3) */
@@ -1658,29 +1693,7 @@
   background-color: rgba(245, 244, 240, 0.9);
 }
 
-/* Software Update Dialog & Header Indicator */
-.titlebar-update-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 32px;
-  padding: 0 12px;
-  border-radius: var(--radius-badge);
-  border: 1px solid var(--accent-primary);
-  background-color: var(--accent-badge-bg);
-  color: var(--accent-text);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.titlebar-update-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background-color: var(--accent-primary);
-}
-
+/* Software Update Dialog */
 .update-dialog-card {
   position: relative;
   width: 440px;

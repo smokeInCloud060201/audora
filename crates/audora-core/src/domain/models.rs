@@ -2,7 +2,228 @@
 //!
 //! All persisted timestamps use non-negative integer milliseconds (`u64`).
 
-use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::error::{AppError, AppResult};
+
+/// Maximum safe millisecond timestamp stored in SQLite (`i64::MAX`).
+pub const MAX_SAFE_DURATION_MS: u64 = i64::MAX as u64;
+
+fn deserialize_u64_lenient<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(val) = opt else {
+        return Ok(0);
+    };
+    match val {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Ok(u.min(MAX_SAFE_DURATION_MS))
+            } else if let Some(i) = n.as_i64() {
+                Ok(u64::try_from(i.max(0))
+                    .unwrap_or(0)
+                    .min(MAX_SAFE_DURATION_MS))
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f > 0.0 {
+                    let clamped = f.round().min(MAX_SAFE_DURATION_MS as f64);
+                    Ok(clamped as u64)
+                } else {
+                    Ok(0)
+                }
+            } else {
+                Ok(0)
+            }
+        }
+        _ => Ok(0),
+    }
+}
+
+fn deserialize_opt_u64_lenient<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(val) = opt else {
+        return Ok(None);
+    };
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Ok(Some(u.min(MAX_SAFE_DURATION_MS)))
+            } else if let Some(i) = n.as_i64() {
+                if i < 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some((i as u64).min(MAX_SAFE_DURATION_MS)))
+                }
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f >= 0.0 {
+                    let clamped = f.round().min(MAX_SAFE_DURATION_MS as f64);
+                    Ok(Some(clamped as u64))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Formats a Unix millisecond timestamp as an ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+#[must_use]
+pub fn format_unix_ms_iso8601(unix_ms: u128) -> String {
+    let total_secs = (unix_ms / 1_000) as i64;
+    let millis = (unix_ms % 1_000) as u32;
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400) as u32;
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    // Civil calendar conversion (Howard Hinnant's algorithm)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Returns the current wall-clock time as an ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+#[must_use]
+pub fn current_iso8601_utc() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format_unix_ms_iso8601(millis)
+}
+
+/// Normalizes persisted timestamp strings (`""`, `"Just now"`, `"Yesterday"`, or raw epoch seconds)
+/// into sortable UTC ISO-8601 strings so SQLite `ORDER BY ... DESC` is always chronological (`H-3`).
+#[must_use]
+pub fn normalize_persisted_timestamp(raw: &str, fallback_iso: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("just now") {
+        return fallback_iso.to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("yesterday") {
+        let yesterday_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis().saturating_sub(86_400_000))
+            .unwrap_or(0);
+        return format_unix_ms_iso8601(yesterday_ms);
+    }
+    if trimmed.len() >= 9 && trimmed.len() <= 13 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(num) = trimmed.parse::<u128>() {
+            let ms = if trimmed.len() <= 10 {
+                num.saturating_mul(1_000)
+            } else {
+                num
+            };
+            return format_unix_ms_iso8601(ms);
+        }
+    }
+    if trimmed.len() >= 10
+        && trimmed.as_bytes().get(4) == Some(&b'-')
+        && trimmed.as_bytes().get(7) == Some(&b'-')
+    {
+        return trimmed.to_owned();
+    }
+    fallback_iso.to_owned()
+}
+
+/// Validates a local media or folder path against empty strings, control characters, and remote schemes (`H-6`).
+pub fn validate_local_media_path_str(raw_path: &str) -> AppResult<&str> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::validation("Media file path must not be empty"));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(AppError::validation(
+            "Media file path contains invalid control characters",
+        ));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for forbidden_scheme in [
+        "http://", "https://", "rtsp://", "rtsps://", "ftp://", "sftp://", "ws://", "wss://",
+        "mms://",
+    ] {
+        if lower.starts_with(forbidden_scheme) {
+            return Err(AppError::validation(
+                "Audora only opens local files on your device; remote network URLs are not permitted.",
+            ));
+        }
+    }
+    Ok(trimmed)
+}
+
+/// Validates note text and quick-marker rules (`MAX_NOTE_BODY_CHARS`).
+pub fn validate_note_body(body: &str, is_quick_marker: bool) -> AppResult<&str> {
+    let trimmed = body.trim();
+    if trimmed.chars().count() > MAX_NOTE_BODY_CHARS {
+        return Err(AppError::validation(format!(
+            "Note text exceeds maximum length of {MAX_NOTE_BODY_CHARS} characters"
+        )));
+    }
+    if trimmed.is_empty() && !is_quick_marker {
+        return Err(AppError::validation(
+            "Enter note text or check 'Save as quick marker' before saving.",
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Validates playlist name and description character bounds.
+pub fn validate_playlist_fields<'a>(name: &'a str, desc: &'a str) -> AppResult<(&'a str, &'a str)> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(AppError::validation("Playlist name must not be empty"));
+    }
+    if trimmed_name.chars().count() > MAX_PLAYLIST_NAME_CHARS {
+        return Err(AppError::validation(format!(
+            "Playlist name must not exceed {MAX_PLAYLIST_NAME_CHARS} characters"
+        )));
+    }
+    let trimmed_desc = desc.trim();
+    if trimmed_desc.chars().count() > MAX_PLAYLIST_DESCRIPTION_CHARS {
+        return Err(AppError::validation(format!(
+            "Playlist description must not exceed {MAX_PLAYLIST_DESCRIPTION_CHARS} characters"
+        )));
+    }
+    Ok((trimmed_name, trimmed_desc))
+}
+
+/// Validates playback speed bounds (`0.5x..=2.0x`).
+pub fn validate_playback_rate(rate: f64) -> AppResult<f64> {
+    if !rate.is_finite() || !(MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&rate) {
+        return Err(AppError::validation(format!(
+            "Playback speed must be between {MIN_PLAYBACK_RATE}x and {MAX_PLAYBACK_RATE}x"
+        )));
+    }
+    Ok(rate)
+}
+
+/// Validates audio volume bounds (`0.0..=1.0`).
+pub fn validate_volume(volume: f64) -> AppResult<f64> {
+    if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+        return Err(AppError::validation("Volume must be between 0.0 and 1.0"));
+    }
+    Ok(volume)
+}
 
 /// Maximum UTF-8 character count allowed for a note body.
 pub const MAX_NOTE_BODY_CHARS: usize = 10_000;
@@ -94,19 +315,29 @@ impl Availability {
 pub struct MediaItem {
     pub id: MediaId,
     pub path: String,
+    #[serde(default)]
     pub display_name: String,
     pub media_kind: MediaKind,
+    #[serde(default, deserialize_with = "deserialize_opt_u64_lenient")]
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub duration_probed: bool,
+    #[serde(default, deserialize_with = "deserialize_u64_lenient")]
     pub last_position_ms: u64,
+    #[serde(default)]
     pub completed: bool,
+    #[serde(default, deserialize_with = "deserialize_opt_u64_lenient")]
     pub file_size_bytes: Option<u64>,
+    #[serde(default)]
     pub fingerprint: Option<String>,
     pub availability: Availability,
+    #[serde(default)]
     pub added_at: String,
+    #[serde(default)]
     pub last_opened_at: Option<String>,
+    #[serde(default)]
     pub last_seen_at: String,
+    #[serde(default)]
     pub note_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_folder_id: Option<String>,
@@ -223,10 +454,15 @@ pub enum BackendEvent {
 pub struct Note {
     pub id: NoteId,
     pub media_id: MediaId,
+    #[serde(default, deserialize_with = "deserialize_u64_lenient")]
     pub position_ms: u64,
+    #[serde(default)]
     pub is_quick_marker: bool,
+    #[serde(default)]
     pub body: String,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
 }
 
@@ -294,15 +530,26 @@ fn default_true() -> bool {
     true
 }
 
+fn default_one_f64() -> f64 {
+    1.0
+}
+
+fn default_off_repeat() -> RepeatMode {
+    RepeatMode::Off
+}
+
 /// A local folder configured by the user as a trusted source of audio/video files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedSourceFolder {
     pub id: String,
     pub path: String,
+    #[serde(default)]
     pub label: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
     pub added_at: String,
+    #[serde(default)]
     pub last_scanned_at: String,
     #[serde(default)]
     pub media_count: usize,
@@ -353,12 +600,19 @@ impl Default for AppSettings {
 /// Persisted playback queue and transport session state stored in `settings` (`playback_session_v1`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedPlaybackSession {
+    #[serde(default)]
     pub active_media_id: Option<MediaId>,
+    #[serde(default)]
     pub queue: Vec<MediaId>,
+    #[serde(default = "default_one_f64")]
     pub volume: f64,
+    #[serde(default)]
     pub muted: bool,
+    #[serde(default = "default_one_f64")]
     pub rate: f64,
+    #[serde(default = "default_off_repeat")]
     pub repeat_mode: RepeatMode,
+    #[serde(default)]
     pub shuffle: bool,
 }
 
@@ -433,9 +687,13 @@ pub struct CleanupSummaryDto {
 pub struct Playlist {
     pub id: PlaylistId,
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub item_ids: Vec<MediaId>,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
 }
 

@@ -57,6 +57,7 @@ pub struct RelinkMediaRecord<'a> {
     pub display_name: &'a str,
     pub media_kind: MediaKind,
     pub duration_ms: Option<u64>,
+    pub duration_probed: bool,
     pub file_size_bytes: Option<u64>,
     pub updated_at: &'a str,
 }
@@ -98,6 +99,9 @@ pub trait NotesRepository: Send + Sync {
 pub trait SettingsRepository: Send + Sync {
     fn load_settings(&self) -> AppResult<AppSettings>;
     fn save_settings(&self, settings: &AppSettings, now_iso: &str) -> AppResult<()>;
+    fn schema_version(&self) -> AppResult<i64> {
+        Ok(4)
+    }
 }
 
 /// Persistence contract for user playlists and ordered playlist items.

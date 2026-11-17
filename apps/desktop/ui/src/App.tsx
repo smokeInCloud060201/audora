@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ipcClient } from "./api/ipc";
 import { AddToPlaylistModal } from "./components/AddToPlaylistModal";
 import { AudoraLogo } from "./components/AudoraLogo";
@@ -42,7 +42,12 @@ import type {
   SidePanelTab,
   TrustedSourceFolder,
 } from "./types/domain";
-import { formatDurationMs, shouldSuppressGlobalShortcut } from "./utils/format";
+import {
+  formatAriaTimestamp,
+  formatDurationMs,
+  shouldSuppressGlobalShortcut,
+} from "./utils/format";
+import { useModalFocusTrap } from "./utils/useModalFocusTrap";
 
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const WAVEFORM_BAR_HEIGHTS = [24, 42, 68, 52, 88, 60, 34, 76, 94, 64, 46, 82, 58, 38, 72, 50, 32, 22];
@@ -120,27 +125,112 @@ export function App(): React.ReactElement {
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const noteDialogRef = useRef<HTMLDivElement | null>(null);
+  const mismatchDialogRef = useRef<HTMLDivElement | null>(null);
+  const saveQueueDialogRef = useRef<HTMLFormElement | null>(null);
+  const saveQueueInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaElementRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
 
-  // Hydrate persisted native state, sync enabled trusted source folders, and check for updates on launch if enabled
+  const userNavigatedRef = useRef<boolean>(false);
+  const seekGenerationRef = useRef<number>(0);
+  const appliedSeekGenRef = useRef<number>(0);
+  const isPointerScrubbingRef = useRef<boolean>(false);
+  const lastLiveSeekMsRef = useRef<number>(0);
+  const [scrubPreviewMs, setScrubPreviewMs] = useState<number | null>(null);
+
+  useModalFocusTrap(isNoteModalOpen, noteDialogRef, noteTextareaRef);
+  useModalFocusTrap(Boolean(pendingMismatchRelink), mismatchDialogRef);
+  useModalFocusTrap(isSaveQueueModalOpen, saveQueueDialogRef, saveQueueInputRef);
+
+  const navigateSection = useCallback((target: PrimarySection) => {
+    userNavigatedRef.current = true;
+    setSection(target);
+  }, []);
+
+  const bumpExplicitSeek = useCallback(() => {
+    seekGenerationRef.current += 1;
+  }, []);
+
+  const handleScrubPointerDown = useCallback(() => {
+    isPointerScrubbingRef.current = true;
+  }, []);
+
+  const handleScrubChange = useCallback(
+    (nextPosMs: number) => {
+      const clamped = Math.max(
+        0,
+        snapshot.duration_ms != null ? Math.min(nextPosMs, snapshot.duration_ms) : nextPosMs,
+      );
+      if (isPointerScrubbingRef.current) {
+        setScrubPreviewMs(clamped);
+        const now = Date.now();
+        if (now - lastLiveSeekMsRef.current >= 120) {
+          lastLiveSeekMsRef.current = now;
+          const el = mediaElementRef.current;
+          if (el) {
+            try {
+              el.currentTime = clamped / 1000;
+            } catch {
+              // Ignore seek before ready state
+            }
+          }
+        }
+        return;
+      }
+      setScrubPreviewMs(null);
+      bumpExplicitSeek();
+      setSnapshot(ipcClient.playbackCommand({ action: "seek", position_ms: clamped }));
+    },
+    [snapshot.duration_ms, bumpExplicitSeek],
+  );
+
+  const handleScrubCommit = useCallback(
+    (finalPosMs: number) => {
+      if (!isPointerScrubbingRef.current && scrubPreviewMs === null) {
+        return;
+      }
+      isPointerScrubbingRef.current = false;
+      const targetPos = scrubPreviewMs ?? finalPosMs;
+      setScrubPreviewMs(null);
+      bumpExplicitSeek();
+      setSnapshot(ipcClient.playbackCommand({ action: "seek", position_ms: targetPos }));
+    },
+    [scrubPreviewMs, bumpExplicitSeek],
+  );
+
+  // Hydrate persisted native state IMMEDIATELY (`C-6`), then sync enabled folders & probe container durations in background
   useEffect(() => {
     let cancelled = false;
     const init = async () => {
       await ipcClient.ensureHydratedFromNative();
-      await ipcClient.syncEnabledSourceFolders();
-      await ipcClient.refreshMediaContainerDurations();
       if (cancelled) return;
-      const loadedSettings = ipcClient.getSettings();
-      const loadedSnapshot = ipcClient.getPlaybackSnapshot();
-      setSettings(loadedSettings);
-      ipcClient.syncNativeWindowMode(loadedSettings.window_mode);
-      setSnapshot(loadedSnapshot);
-      if (loadedSnapshot.media_id) {
+
+      const hydratedSettings = ipcClient.getSettings();
+      const hydratedSnapshot = ipcClient.getPlaybackSnapshot();
+      setSettings(hydratedSettings);
+      ipcClient.syncNativeWindowMode(hydratedSettings.window_mode);
+      setSnapshot(hydratedSnapshot);
+      if (hydratedSnapshot.media_id && !userNavigatedRef.current) {
         setSection("now_playing");
       }
       setLibraryVersion((v) => v + 1);
-      if (loadedSettings.auto_check_updates !== false) {
+
+      const importedCount = await ipcClient.syncEnabledSourceFolders();
+      const probedAny = await ipcClient.refreshMediaContainerDurations();
+      if (cancelled) return;
+      if (importedCount > 0 || probedAny) {
+        const refreshedSettings = ipcClient.getSettings();
+        const refreshedSnapshot = ipcClient.getPlaybackSnapshot();
+        setSettings(refreshedSettings);
+        setSnapshot(refreshedSnapshot);
+        if (refreshedSnapshot.media_id && !hydratedSnapshot.media_id && !userNavigatedRef.current) {
+          setSection("now_playing");
+        }
+        setLibraryVersion((v) => v + 1);
+      }
+
+      if (ipcClient.getSettings().auto_check_updates !== false) {
         const status = await ipcClient.checkForUpdatesOnline(false);
         if (!cancelled) {
           setUpdateStatus(status);
@@ -152,6 +242,47 @@ export function App(): React.ReactElement {
       cancelled = true;
     };
   }, []);
+
+  // Subscribe to native `wry` OS drag-and-drop hooks (`H-9`)
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const win = window as Window & {
+      __AUDORA_ON_DRAG_STATE__?: (dragging: boolean) => void;
+      __AUDORA_ON_NATIVE_DROP__?: (paths: string[]) => void;
+    };
+    win.__AUDORA_ON_DRAG_STATE__ = (dragging: boolean) => {
+      setIsDraggingFiles(Boolean(dragging));
+    };
+    win.__AUDORA_ON_NATIVE_DROP__ = (paths: string[]) => {
+      setIsDraggingFiles(false);
+      if (!Array.isArray(paths) || paths.length === 0) return;
+      void (async () => {
+        try {
+          const res = await ipcClient.ingestNativeDroppedPaths(paths);
+          if (res.openedItems.length > 0 || res.importedFolderCount > 0) {
+            setUnsupportedError(null);
+            setMissingMediaTarget(null);
+            setSettings(ipcClient.getSettings());
+            bumpExplicitSeek();
+            setSnapshot(ipcClient.getPlaybackSnapshot());
+            setLibraryVersion((v) => v + 1);
+            setSection("now_playing");
+          }
+        } catch (err) {
+          const payload = err as AppErrorPayload;
+          if (payload.code === "AV-104") {
+            const rawFirst = paths[0]?.split(/[\\/]/).pop() ?? "Unknown file";
+            setUnsupportedError({ fileName: rawFirst, payload });
+            setSection("now_playing");
+          }
+        }
+      })();
+    };
+    return () => {
+      delete win.__AUDORA_ON_DRAG_STATE__;
+      delete win.__AUDORA_ON_NATIVE_DROP__;
+    };
+  }, [bumpExplicitSeek]);
 
   // Apply Dark / Light / System theme tokens to `<html data-theme="...">`
   useEffect(() => {
@@ -180,7 +311,7 @@ export function App(): React.ReactElement {
     return undefined;
   }, [settings.theme]);
 
-  // Listen for audio output device changes (`Pause when headphones disconnect`)
+  // Listen for audio output device disconnects (`M-6`: avoid false pauses when plugging devices IN)
   useEffect(() => {
     if (
       typeof navigator === "undefined" ||
@@ -189,15 +320,52 @@ export function App(): React.ReactElement {
     ) {
       return undefined;
     }
+    let knownOutputs: Set<string> | null = null;
+    const refreshKnownOutputs = async (): Promise<Set<string> | null> => {
+      if (typeof navigator.mediaDevices.enumerateDevices !== "function") {
+        return null;
+      }
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const outputs = devices
+          .filter((d) => d.kind === "audiooutput")
+          .map((d, idx) => d.deviceId || `out_${idx}`);
+        return outputs.length > 0 ? new Set(outputs) : null;
+      } catch {
+        return null;
+      }
+    };
+    void refreshKnownOutputs().then((initial) => {
+      knownOutputs = initial;
+    });
+
     const onDeviceChange = () => {
-      setSnapshot(ipcClient.handleAudioRouteDisconnected());
+      void (async () => {
+        const nextOutputs = await refreshKnownOutputs();
+        if (knownOutputs && nextOutputs) {
+          let removedAny = false;
+          for (const prevId of knownOutputs) {
+            if (!nextOutputs.has(prevId)) {
+              removedAny = true;
+              break;
+            }
+          }
+          knownOutputs = nextOutputs;
+          if (!removedAny) {
+            return;
+          }
+        } else if (nextOutputs) {
+          knownOutputs = nextOutputs;
+        }
+        setSnapshot(ipcClient.handleAudioRouteDisconnected());
+      })();
     };
     navigator.mediaDevices.addEventListener("devicechange", onDeviceChange);
     return () =>
       navigator.mediaDevices.removeEventListener("devicechange", onDeviceChange);
   }, []);
 
-  // Flush playback position & state immediately on window close / page hide (`C-9`)
+  // Flush playback position & state immediately on window close / page hide (`C-8`)
   useEffect(() => {
     const flush = () => {
       ipcClient.flushPendingPersistence();
@@ -222,7 +390,6 @@ export function App(): React.ReactElement {
       return undefined;
     }
     if (ipcClient.isPersistedRuntime() && currentMedia) {
-      // A persisted bare filename lost its session blob URL; prompt user to locate the file on disk (`C-9`).
       const marked = ipcClient.markMediaMissing(currentMedia.id);
       setSnapshot(ipcClient.getPlaybackSnapshot());
       setMissingMediaTarget(marked);
@@ -238,7 +405,7 @@ export function App(): React.ReactElement {
     return () => window.clearInterval(interval);
   }, [snapshot.state, snapshot.media_id, snapshot.rate]);
 
-  // Sync HTML5 `<video>` / `<audio>` element when a real media stream is active
+  // Sync HTML5 `<video>` / `<audio>` element when a real media stream is active (`H-8`)
   useEffect(() => {
     const el = mediaElementRef.current;
     if (!el) return;
@@ -248,12 +415,17 @@ export function App(): React.ReactElement {
     }
     el.volume = snapshot.volume;
     el.muted = snapshot.muted;
-    const targetSec = snapshot.position_ms / 1000;
-    if (Number.isFinite(el.currentTime) && Math.abs(el.currentTime - targetSec) > 0.65) {
-      try {
-        el.currentTime = targetSec;
-      } catch {
-        // Element metadata not ready yet; `onLoadedMetadata` will sync position.
+    const hasExplicitSeek = appliedSeekGenRef.current !== seekGenerationRef.current;
+    if (!isPointerScrubbingRef.current) {
+      const targetSec = snapshot.position_ms / 1000;
+      const drift = Number.isFinite(el.currentTime) ? Math.abs(el.currentTime - targetSec) : 0;
+      if (hasExplicitSeek || drift > 1.25) {
+        appliedSeekGenRef.current = seekGenerationRef.current;
+        try {
+          el.currentTime = targetSec;
+        } catch {
+          // Element metadata not ready yet; `onLoadedMetadata` will sync position.
+        }
       }
     }
     if (snapshot.state === "playing" && el.paused) {
@@ -278,15 +450,17 @@ export function App(): React.ReactElement {
     ipcClient.syncNativeWindowMode(settings.window_mode);
   }, [settings.window_mode]);
 
-  const libraryResult = useMemo(
-    () => ipcClient.searchLibrary(searchQuery, libraryFilter),
-    [searchQuery, libraryFilter, isNoteModalOpen, deletedNoteToast, libraryVersion, settings],
-  );
-
   const allMedia = useMemo(
     () => ipcClient.searchLibrary("", "all").media_items,
-    [isNoteModalOpen, deletedNoteToast, missingMediaTarget, libraryVersion, settings],
+    [libraryVersion, settings.source_folders],
   );
+
+  const libraryResult = useMemo(() => {
+    if (!searchQuery.trim() && libraryFilter === "all") {
+      return { media_items: allMedia, matching_notes: [] };
+    }
+    return ipcClient.searchLibrary(searchQuery, libraryFilter);
+  }, [allMedia, searchQuery, libraryFilter, libraryVersion]);
 
   const activeMedia = useMemo(
     () => allMedia.find((m) => m.id === snapshot.media_id) ?? null,
@@ -295,7 +469,7 @@ export function App(): React.ReactElement {
 
   const activeNotes = useMemo(
     () => (activeMedia ? ipcClient.listNotes(activeMedia.id) : []),
-    [activeMedia, isNoteModalOpen, deletedNoteToast, libraryVersion],
+    [activeMedia, libraryVersion],
   );
 
   const missingTargetNotes = useMemo(
@@ -305,7 +479,7 @@ export function App(): React.ReactElement {
 
   const playlists = useMemo(
     () => ipcClient.listPlaylists(),
-    [settings, libraryVersion, deletedPlaylistToast],
+    [settings.source_folders, libraryVersion],
   );
 
   const showPlaylistsBar = settings.show_playlists_bar !== false;
@@ -345,16 +519,18 @@ export function App(): React.ReactElement {
     const inputType = target instanceof HTMLInputElement ? target.type : null;
 
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      if (isAnyModalOpen) return;
       e.preventDefault();
       if (settings.window_mode === "minimum") {
         setSettings(ipcClient.setWindowMode("full"));
       }
-      setSection("library");
+      navigateSection("library");
       setTimeout(() => searchInputRef.current?.focus(), 20);
       return;
     }
 
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+      if (isAnyModalOpen) return;
       e.preventDefault();
       triggerOpenMediaPicker();
       return;
@@ -389,6 +565,10 @@ export function App(): React.ReactElement {
         setOpenLibraryMenuId(null);
         return;
       }
+      if (isMinHelpOpen) {
+        setIsMinHelpOpen(false);
+        return;
+      }
       if (settings.window_mode === "minimum") {
         setSettings(ipcClient.setWindowMode("full"));
         return;
@@ -411,9 +591,11 @@ export function App(): React.ReactElement {
       setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
     } else if (e.key === "ArrowLeft") {
       e.preventDefault();
+      bumpExplicitSeek();
       setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: -5000 }));
     } else if (e.key === "ArrowRight") {
       e.preventDefault();
+      bumpExplicitSeek();
       setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: 5000 }));
     } else if (e.key.toLowerCase() === "n" && e.shiftKey) {
       e.preventDefault();
@@ -760,10 +942,24 @@ export function App(): React.ReactElement {
         ipcClient.openLocalFiles(descriptors);
         setUnsupportedError(null);
         setMissingMediaTarget(null);
+        bumpExplicitSeek();
         setSnapshot(ipcClient.getPlaybackSnapshot());
         setLibraryVersion((v) => v + 1);
         setSection("now_playing");
       } catch (err) {
+        for (const d of descriptors) {
+          if (
+            d.streamUrl?.startsWith("blob:") &&
+            typeof URL !== "undefined" &&
+            typeof URL.revokeObjectURL === "function"
+          ) {
+            try {
+              URL.revokeObjectURL(d.streamUrl);
+            } catch {
+              // Ignore revoke errors
+            }
+          }
+        }
         const payload = err as AppErrorPayload;
         if (payload.code === "AV-104") {
           setUnsupportedError({
@@ -892,16 +1088,19 @@ export function App(): React.ReactElement {
   };
 
   const handleCleanupAppData = () => {
-    const summary = ipcClient.cleanupApplicationData();
-    setSettings(ipcClient.getSettings());
-    setSnapshot(ipcClient.getPlaybackSnapshot());
-    setUpdateStatus(ipcClient.checkForUpdates(false));
-    setDiagnosticReport(null);
-    setMissingMediaTarget(null);
-    setLibraryVersion((v) => v + 1);
-    setBackupStatusMessage(
-      `Cleaned up local database & update cache (${summary.removed_paths.length} paths) — media files on disk untouched`,
-    );
+    void (async () => {
+      const summary = await ipcClient.cleanupApplicationDataNative();
+      setSettings(ipcClient.getSettings());
+      setSnapshot(ipcClient.getPlaybackSnapshot());
+      setUpdateStatus(ipcClient.checkForUpdates(false));
+      setDiagnosticReport(null);
+      setMissingMediaTarget(null);
+      setUnsupportedError(null);
+      setLibraryVersion((v) => v + 1);
+      setBackupStatusMessage(
+        `Cleaned up local database & update cache (${summary.removed_paths.length} paths) — media files on disk untouched`,
+      );
+    })();
   };
 
   const sourceFolders = useMemo(
@@ -979,6 +1178,7 @@ export function App(): React.ReactElement {
     try {
       const prevMediaId = snapshot.media_id;
       const nextSnap = ipcClient.activateNote(noteId);
+      bumpExplicitSeek();
       setSnapshot(nextSnap);
       setSection("now_playing");
       const el = mediaElementRef.current;
@@ -1012,20 +1212,41 @@ export function App(): React.ReactElement {
   };
 
   const handleMediaStreamError = () => {
-    if (!activeMedia) return;
-    const marked = ipcClient.markMediaMissing(activeMedia.id);
-    setSnapshot(ipcClient.getPlaybackSnapshot());
-    setLibraryVersion((v) => v + 1);
-    if (settings.window_mode === "minimum") {
-      setSettings(ipcClient.setWindowMode("full"));
-    }
-    setMissingMediaTarget(marked);
-    setRelinkPathDraft(marked.path);
-    setRelinkError(null);
-    setSection("library");
+    const failedMedia = activeMedia;
+    if (!failedMedia) return;
+    void (async () => {
+      const probe = await ipcClient.probeNativeMediaDuration(failedMedia.path);
+      if (probe && probe.exists) {
+        // File exists on disk (`C-7`): surface `AV-104` decode failure instead of marking missing!
+        const nextSnap = ipcClient.markPlaybackDecodeFailed(failedMedia.id);
+        setSnapshot(nextSnap);
+        if (settings.window_mode === "minimum") {
+          setSettings(ipcClient.setWindowMode("full"));
+        }
+        if (nextSnap.error) {
+          setUnsupportedError({
+            fileName: failedMedia.display_name,
+            payload: nextSnap.error,
+          });
+        }
+        setSection("now_playing");
+        return;
+      }
+      const marked = ipcClient.markMediaMissing(failedMedia.id);
+      setSnapshot(ipcClient.getPlaybackSnapshot());
+      setLibraryVersion((v) => v + 1);
+      if (settings.window_mode === "minimum") {
+        setSettings(ipcClient.setWindowMode("full"));
+      }
+      setMissingMediaTarget(marked);
+      setRelinkPathDraft(marked.path);
+      setRelinkError(null);
+      setSection("library");
+    })();
   };
 
   const handleMediaEndedSync = () => {
+    bumpExplicitSeek();
     setSnapshot(ipcClient.handleMediaEnded());
     setLibraryVersion((v) => v + 1);
   };
@@ -1065,6 +1286,7 @@ export function App(): React.ReactElement {
   };
 
   const isMinimumMode = settings.window_mode === "minimum";
+  const displayPositionMs = scrubPreviewMs ?? snapshot.position_ms;
 
   return (
     <>
@@ -1086,7 +1308,11 @@ export function App(): React.ReactElement {
         multiple
         accept="audio/*,video/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.flac,.ogg,.opus,.m4a,.aac"
         style={{ display: "none" }}
-        onChange={(e) => handleNativeFilesSelected(e.target.files)}
+        onChange={(e) => {
+          const selected = e.currentTarget.files;
+          handleNativeFilesSelected(selected);
+          e.currentTarget.value = "";
+        }}
       />
 
       {/* Minimum mode · 360×168 view (Figma Frame 2:103 / 20:2) */}
@@ -1094,12 +1320,16 @@ export function App(): React.ReactElement {
         <MinimumPlayerWindow
           activeMedia={activeMedia}
           snapshot={snapshot}
+          displayPositionMs={displayPositionMs}
           timestampPrecision={timestampPrecision}
           isHelpOpen={isMinHelpOpen}
           onToggleHelp={() => setIsMinHelpOpen((prev) => !prev)}
           onCloseHelp={() => setIsMinHelpOpen(false)}
           onUpdateSettings={setSettings}
           onUpdateSnapshot={setSnapshot}
+          onScrubPointerDown={handleScrubPointerDown}
+          onScrubChange={handleScrubChange}
+          onScrubCommit={handleScrubCommit}
           onOpenMediaPicker={triggerOpenMediaPicker}
           onDropFiles={handleNativeFilesSelected}
         />
@@ -1111,11 +1341,17 @@ export function App(): React.ReactElement {
         aria-hidden={isMinimumMode || undefined}
         style={isMinimumMode ? { display: "none" } : undefined}
         onDragOver={(e) => {
+          if (!Array.from(e.dataTransfer?.types ?? []).includes("Files")) return;
           e.preventDefault();
           setIsDraggingFiles(true);
         }}
-        onDragLeave={() => setIsDraggingFiles(false)}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+            setIsDraggingFiles(false);
+          }
+        }}
         onDrop={(e) => {
+          if (!Array.from(e.dataTransfer?.types ?? []).includes("Files")) return;
           e.preventDefault();
           setIsDraggingFiles(false);
           handleNativeFilesSelected(e.dataTransfer?.files ?? null);
@@ -1184,7 +1420,7 @@ export function App(): React.ReactElement {
               aria-current={section === "library" ? "page" : undefined}
               onClick={() => {
                 setMissingMediaTarget(null);
-                setSection("library");
+                navigateSection("library");
               }}
             >
               <span className="nav-rail-icon" aria-hidden="true">
@@ -1196,7 +1432,7 @@ export function App(): React.ReactElement {
               type="button"
               className="nav-rail-btn"
               aria-current={section === "now_playing" ? "page" : undefined}
-              onClick={() => setSection("now_playing")}
+              onClick={() => navigateSection("now_playing")}
             >
               <span className="nav-rail-icon" aria-hidden="true">
                 <IconPlay size={18} />
@@ -1226,7 +1462,7 @@ export function App(): React.ReactElement {
               type="button"
               className="nav-rail-btn"
               aria-current={section === "settings" ? "page" : undefined}
-              onClick={() => setSection("settings")}
+              onClick={() => navigateSection("settings")}
             >
               <span className="nav-rail-icon" aria-hidden="true">
                 <IconSettings size={18} />
@@ -1278,15 +1514,127 @@ export function App(): React.ReactElement {
                 }}
                 onPlaylistDeleted={handlePlaylistDeleted}
                 onCollapse={togglePlaylistsBar}
+                timestampPrecision={timestampPrecision}
               />
             )}
 
-              <div className="player-column">
-                {unsupportedError ? (
-                  /* Unsupported Format Error Card (Frame 4:399) */
+              <div className="player-column" style={{ position: "relative" }}>
+                {activeMedia?.media_kind === "audio" ? (
+                  /* Dedicated Audio-Only Canvas (Frame 4:3) */
                   <div
-                    className="media-canvas"
-                    style={{ alignItems: "center", justifyContent: "center" }}
+                    className={`audio-canvas ${snapshot.state === "playing" ? "is-playing" : ""}`}
+                    data-testid="audio-only-canvas"
+                  >
+                    <div className="audio-ring-outer" aria-hidden="true" />
+                    <div className="audio-ring-inner" aria-hidden="true" />
+                    <div className="audio-artwork-card">
+                      <div
+                        className={`waveform-bars ${snapshot.state === "playing" ? "is-playing" : ""}`}
+                        aria-hidden="true"
+                      >
+                        {WAVEFORM_BAR_HEIGHTS.map((h, idx) => (
+                          <span
+                            key={idx}
+                            className="waveform-bar"
+                            style={
+                              {
+                                height: `${h}px`,
+                                opacity: snapshot.state === "playing" ? 0.95 : 0.55,
+                                "--wave-dur": `${700 + ((idx * 137) % 460)}ms`,
+                                "--wave-delay": `-${(idx * 95) % 820}ms`,
+                              } as React.CSSProperties
+                            }
+                          />
+                        ))}
+                      </div>
+                      <span
+                        style={{
+                          marginTop: 18,
+                          fontSize: 10,
+                          fontWeight: 600,
+                          letterSpacing: "0.1em",
+                          color: "var(--text-tertiary)",
+                        }}
+                      >
+                        LOCAL AUDIO
+                      </span>
+                    </div>
+                    <h1 className="canvas-headline" style={{ zIndex: 1 }}>
+                      {activeMedia.display_name}
+                    </h1>
+                    <p className="canvas-subtitle" style={{ zIndex: 1 }}>
+                      Local audio · {formatDurationMs(snapshot.duration_ms, timestampPrecision)}
+                    </p>
+                  </div>
+                ) : (
+                  /* Video Playback Canvas & Empty Player State (Frame 2:31) — kept mounted beneath unsupportedError overlay (`M-6`) */
+                  <div
+                    className={`media-canvas ${activeMedia?.stream_url ? "has-video-stream" : ""}`}
+                    data-testid="video-canvas"
+                  >
+                    {activeMedia?.stream_url && (
+                      <video
+                        ref={mediaElementRef as React.RefObject<HTMLVideoElement>}
+                        src={activeMedia.stream_url}
+                        style={{
+                          position: "absolute",
+                          inset: 0,
+                          width: "100%",
+                          height: "100%",
+                          objectFit: "contain",
+                          zIndex: 0,
+                        }}
+                        onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
+                        onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
+                        onEnded={handleMediaEndedSync}
+                        onError={handleMediaStreamError}
+                      />
+                    )}
+                    {(!activeMedia || !activeMedia.stream_url) && !unsupportedError && (
+                      <div style={{ position: "relative", zIndex: 1 }}>
+                        <p className="canvas-eyebrow">
+                          {activeMedia ? "LOCAL VIDEO" : "NO MEDIA LOADED"}
+                        </p>
+                        <h1 className="canvas-headline">
+                          {activeMedia ? activeMedia.display_name : "Open a local media file"}
+                        </h1>
+                        <p className="canvas-subtitle">
+                          {activeMedia
+                            ? `${activeMedia.path} · ${formatDurationMs(snapshot.duration_ms, timestampPrecision)}`
+                            : "Choose an audio or video file from your device to begin."}
+                        </p>
+                        {!activeMedia && (
+                          <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+                            <button
+                              type="button"
+                              className="btn-primary"
+                              onClick={triggerOpenMediaPicker}
+                            >
+                              <IconFolderOpen size={14} />
+                              <span>Open media…</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {unsupportedError && (
+                  /* Unsupported Format Error Card Overlay (Frame 4:399) */
+                  <div
+                    style={{
+                      position: "absolute",
+                      inset: "24px 36px 152px 36px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      background: "var(--bg-media-canvas)",
+                      borderRadius: "var(--radius-card)",
+                      border: "1px solid var(--border-subtle)",
+                      zIndex: 10,
+                      padding: 24,
+                    }}
                   >
                     <div
                       role="alert"
@@ -1368,112 +1716,13 @@ export function App(): React.ReactElement {
                       </div>
                     </div>
                   </div>
-                ) : activeMedia?.media_kind === "audio" ? (
-                  /* Dedicated Audio-Only Canvas (Frame 4:3) */
-                  <div
-                    className={`audio-canvas ${snapshot.state === "playing" ? "is-playing" : ""}`}
-                    data-testid="audio-only-canvas"
-                  >
-                    <div className="audio-ring-outer" aria-hidden="true" />
-                    <div className="audio-ring-inner" aria-hidden="true" />
-                    <div className="audio-artwork-card">
-                      <div
-                        className={`waveform-bars ${snapshot.state === "playing" ? "is-playing" : ""}`}
-                        aria-hidden="true"
-                      >
-                        {WAVEFORM_BAR_HEIGHTS.map((h, idx) => (
-                          <span
-                            key={idx}
-                            className="waveform-bar"
-                            style={
-                              {
-                                height: `${h}px`,
-                                opacity: snapshot.state === "playing" ? 0.95 : 0.55,
-                                "--wave-dur": `${700 + ((idx * 137) % 460)}ms`,
-                                "--wave-delay": `-${(idx * 95) % 820}ms`,
-                              } as React.CSSProperties
-                            }
-                          />
-                        ))}
-                      </div>
-                      <span
-                        style={{
-                          marginTop: 18,
-                          fontSize: 10,
-                          fontWeight: 600,
-                          letterSpacing: "0.1em",
-                          color: "var(--text-tertiary)",
-                        }}
-                      >
-                        LOCAL AUDIO
-                      </span>
-                    </div>
-                    <h1 className="canvas-headline" style={{ zIndex: 1 }}>
-                      {activeMedia.display_name}
-                    </h1>
-                    <p className="canvas-subtitle" style={{ zIndex: 1 }}>
-                      Local audio · {formatDurationMs(snapshot.duration_ms, timestampPrecision)}
-                    </p>
-                  </div>
-                ) : (
-                  /* Video Playback Canvas & Empty Player State (Frame 2:31) */
-                  <div
-                    className={`media-canvas ${activeMedia?.stream_url ? "has-video-stream" : ""}`}
-                    data-testid="video-canvas"
-                  >
-                    {activeMedia?.stream_url && (
-                      <video
-                        ref={mediaElementRef as React.RefObject<HTMLVideoElement>}
-                        src={activeMedia.stream_url}
-                        style={{
-                          position: "absolute",
-                          inset: 0,
-                          width: "100%",
-                          height: "100%",
-                          objectFit: "contain",
-                          zIndex: 0,
-                        }}
-                        onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-                        onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
-                        onEnded={handleMediaEndedSync}
-                        onError={handleMediaStreamError}
-                      />
-                    )}
-                    {(!activeMedia || !activeMedia.stream_url) && (
-                      <div style={{ position: "relative", zIndex: 1 }}>
-                        <p className="canvas-eyebrow">
-                          {activeMedia ? "LOCAL VIDEO" : "NO MEDIA LOADED"}
-                        </p>
-                        <h1 className="canvas-headline">
-                          {activeMedia ? activeMedia.display_name : "Open a local media file"}
-                        </h1>
-                        <p className="canvas-subtitle">
-                          {activeMedia
-                            ? `${activeMedia.path} · ${formatDurationMs(snapshot.duration_ms, timestampPrecision)}`
-                            : "Choose an audio or video file from your device to begin."}
-                        </p>
-                        {!activeMedia && (
-                          <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-                            <button
-                              type="button"
-                              className="btn-primary"
-                              onClick={triggerOpenMediaPicker}
-                            >
-                              <IconFolderOpen size={14} />
-                              <span>Open media…</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
                 )}
 
                 {/* 128px Transport Bar with Scrubber Note Markers & Volume Slider (Frame 2:47) */}
                 <section className="transport-bar" aria-label="Playback controls">
                   <div className="scrubber-row">
                     <span className="tabular-nums">
-                      {formatDurationMs(snapshot.position_ms, timestampPrecision)}
+                      {formatDurationMs(displayPositionMs, timestampPrecision)}
                     </span>
                     <div className="scrubber-track-wrapper">
                       {snapshot.duration_ms &&
@@ -1503,18 +1752,16 @@ export function App(): React.ReactElement {
                       <input
                         type="range"
                         aria-label="Seek timeline"
+                        aria-valuetext={formatAriaTimestamp(displayPositionMs)}
                         className="scrubber-slider"
+                        disabled={!activeMedia}
                         min={0}
                         max={snapshot.duration_ms ?? 100}
-                        value={snapshot.position_ms}
-                        onChange={(e) =>
-                          setSnapshot(
-                            ipcClient.playbackCommand({
-                              action: "seek",
-                              position_ms: Number(e.target.value),
-                            }),
-                          )
-                        }
+                        value={displayPositionMs}
+                        onPointerDown={handleScrubPointerDown}
+                        onChange={(e) => handleScrubChange(Number(e.target.value))}
+                        onPointerUp={(e) => handleScrubCommit(Number(e.currentTarget.value))}
+                        onPointerCancel={(e) => handleScrubCommit(Number(e.currentTarget.value))}
                       />
                     </div>
                     <span className="tabular-nums">
@@ -1558,6 +1805,11 @@ export function App(): React.ReactElement {
                       <input
                         type="range"
                         aria-label="Volume"
+                        aria-valuetext={
+                          snapshot.muted
+                            ? "Muted"
+                            : `${Math.round(snapshot.volume * 100)}%`
+                        }
                         min={0}
                         max={100}
                         value={snapshot.muted ? 0 : Math.round(snapshot.volume * 100)}
@@ -1586,16 +1838,19 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary transport-icon-btn"
+                        disabled={!activeMedia}
                         aria-label="Previous item or restart"
-                        onClick={() =>
-                          setSnapshot(ipcClient.playbackCommand({ action: "previous" }))
-                        }
+                        onClick={() => {
+                          bumpExplicitSeek();
+                          setSnapshot(ipcClient.playbackCommand({ action: "previous" }));
+                        }}
                       >
                         <IconSkipPrev size={15} />
                       </button>
                       <button
                         type="button"
                         className="play-circle-btn"
+                        disabled={!activeMedia}
                         aria-label={snapshot.state === "playing" ? "Pause" : "Play"}
                         onClick={() =>
                           setSnapshot(
@@ -1612,10 +1867,12 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary transport-icon-btn"
+                        disabled={!activeMedia}
                         aria-label="Next item"
-                        onClick={() =>
-                          setSnapshot(ipcClient.playbackCommand({ action: "next" }))
-                        }
+                        onClick={() => {
+                          bumpExplicitSeek();
+                          setSnapshot(ipcClient.playbackCommand({ action: "next" }));
+                        }}
                       >
                         <IconSkipNext size={15} />
                       </button>
@@ -1640,6 +1897,7 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary transport-collapsible-btn"
+                        disabled={!activeMedia}
                         aria-label="Add quick marker"
                         title="Add quick marker at current timestamp (Shift+N)"
                         onClick={handleCreateQuickMarker}
@@ -1650,8 +1908,9 @@ export function App(): React.ReactElement {
                       <button
                         type="button"
                         className="btn-secondary transport-collapsible-btn"
+                        disabled={!activeMedia}
                         aria-label="Add timestamped note"
-                        title={`Add note at ${formatDurationMs(snapshot.position_ms)} (N)`}
+                        title={`Add note at ${formatDurationMs(displayPositionMs, timestampPrecision)} (N)`}
                         onClick={openAddNoteModal}
                       >
                         <IconPlus size={13} />
@@ -1769,7 +2028,7 @@ export function App(): React.ReactElement {
       {/* Add / Edit Note Modal (Frame 4:88) */}
       {isNoteModalOpen && (
         <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Note composer">
-          <div className="modal-dialog">
+          <div ref={noteDialogRef} className="modal-dialog">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div>
                 <h2 style={{ margin: 0, fontSize: 17 }}>
@@ -1859,7 +2118,7 @@ export function App(): React.ReactElement {
           aria-modal="true"
           aria-label="Confirm relink mismatch"
         >
-          <div className="modal-dialog">
+          <div ref={mismatchDialogRef} className="modal-dialog">
             <h2 style={{ margin: 0, fontSize: 17 }}>
               {pendingMismatchRelink.payload.title} ({pendingMismatchRelink.payload.code})
             </h2>
@@ -1917,7 +2176,7 @@ export function App(): React.ReactElement {
           aria-label="Save queue as playlist"
           data-testid="save-queue-playlist-modal"
         >
-          <form className="modal-dialog" onSubmit={handleSaveQueueAsPlaylist}>
+          <form ref={saveQueueDialogRef} className="modal-dialog" onSubmit={handleSaveQueueAsPlaylist}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <h2 style={{ margin: 0, fontSize: 17 }}>Save queue as playlist</h2>
               <button
@@ -1935,8 +2194,8 @@ export function App(): React.ReactElement {
               {snapshot.queue.length === 1 ? "item" : "items"} currently in your queue.
             </p>
             <input
+              ref={saveQueueInputRef}
               type="text"
-              autoFocus
               aria-label="Playlist name"
               placeholder="Playlist name…"
               value={saveQueueNameDraft}
@@ -1983,35 +2242,39 @@ export function App(): React.ReactElement {
         />
       )}
 
-      {/* 6-second Undo Toast Banners (Frame 4:578) & Status Toast */}
-      {deletedNoteToast && (
-        <div className="toast-banner" role="status">
-          <span>Note deleted</span>
-          <button type="button" className="jump-link-btn" onClick={handleUndoDelete}>
-            Undo
-          </button>
-        </div>
-      )}
+      {/* Stacked 6-second Undo Toast Banners (Frame 4:578) & Status Toast (`L-4`) */}
+      {(deletedNoteToast || deletedPlaylistToast || updateToastMessage) && (
+        <div className="toast-stack">
+          {deletedNoteToast && (
+            <div className="toast-banner" role="status">
+              <span>Note deleted</span>
+              <button type="button" className="jump-link-btn" onClick={handleUndoDelete}>
+                Undo
+              </button>
+            </div>
+          )}
 
-      {!deletedNoteToast && deletedPlaylistToast && (
-        <div className="toast-banner" role="status" data-testid="deleted-playlist-toast">
-          <span>Playlist “{deletedPlaylistToast.name}” deleted</span>
-          <button type="button" className="jump-link-btn" onClick={handleUndoDeletePlaylist}>
-            Undo
-          </button>
-        </div>
-      )}
+          {deletedPlaylistToast && (
+            <div className="toast-banner" role="status" data-testid="deleted-playlist-toast">
+              <span>Playlist “{deletedPlaylistToast.name}” deleted</span>
+              <button type="button" className="jump-link-btn" onClick={handleUndoDeletePlaylist}>
+                Undo
+              </button>
+            </div>
+          )}
 
-      {!deletedNoteToast && !deletedPlaylistToast && updateToastMessage && (
-        <div className="toast-banner" role="status" data-testid="update-toast">
-          <span>{updateToastMessage}</span>
-          <button
-            type="button"
-            className="jump-link-btn"
-            onClick={() => setUpdateToastMessage(null)}
-          >
-            Dismiss
-          </button>
+          {updateToastMessage && (
+            <div className="toast-banner" role="status" data-testid="update-toast">
+              <span>{updateToastMessage}</span>
+              <button
+                type="button"
+                className="jump-link-btn"
+                onClick={() => setUpdateToastMessage(null)}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
         </div>
       )}
 

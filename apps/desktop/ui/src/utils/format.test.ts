@@ -6,6 +6,8 @@ import {
 } from "../api/ipc";
 import {
   computeProgressPercent,
+  formatAriaTimestamp,
+  formatHumanDate,
   formatTimestamp,
   shouldSuppressGlobalShortcut,
 } from "./format";
@@ -253,25 +255,33 @@ describe("AudoraIpcClient workflows", () => {
     expect(json).not.toContain("Confidential studio");
   });
 
-  it("stages GitHub release JSON, respects dismiss vs manual check, installs update, and cleans up app data", async () => {
+  it("stages GitHub release JSON, prioritizes .app.tar.gz over .dmg, respects dismiss vs manual check, installs update, and cleans up app data", async () => {
     const client = new AudoraIpcClient(false);
     const initial = client.checkForUpdates();
-    expect(initial.current_version).toBe("0.1.0");
+    expect(initial.current_version).toBe("1.0.3");
     expect(initial.github_repo).toBe(DEFAULT_GITHUB_RELEASE_REPO);
     expect(initial.update_available).toBe(false);
 
     const staged = client.stageGitHubReleaseJson(
       JSON.stringify({
-        tag_name: "v0.2.0",
-        name: "Audora 0.2.0 is ready",
+        tag_name: "v1.1.0",
+        name: "Audora 1.1.0 is ready",
         body: "### Highlights\n- Native self-updater parity with **Readora**\n- Signed `Audora.app.tar.gz` bundle",
         published_at: "2026-11-12T10:00:00Z",
-        html_url: "https://github.com/smokeInCloud060201/audora/releases/tag/v0.2.0",
+        html_url: "https://github.com/smokeInCloud060201/audora/releases/tag/v1.1.0",
         assets: [
           {
-            name: "Audora_0.2.0_macos-aarch64.app.tar.gz",
+            name: "Audora_1.1.0_macos-aarch64.dmg",
             browser_download_url:
-              "https://github.com/smokeInCloud060201/audora/releases/download/v0.2.0/Audora_0.2.0_macos-aarch64.app.tar.gz",
+              "https://github.com/smokeInCloud060201/audora/releases/download/v1.1.0/Audora_1.1.0_macos-aarch64.dmg",
+            size: 18_000_000,
+            digest:
+              "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          },
+          {
+            name: "Audora_1.1.0_macos-aarch64.app.tar.gz",
+            browser_download_url:
+              "https://github.com/smokeInCloud060201/audora/releases/download/v1.1.0/Audora_1.1.0_macos-aarch64.app.tar.gz",
             size: 16_777_216,
             digest:
               "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
@@ -280,21 +290,25 @@ describe("AudoraIpcClient workflows", () => {
       }),
     );
     expect(staged.update_available).toBe(true);
-    expect(staged.latest_version).toBe("0.2.0");
+    expect(staged.latest_version).toBe("1.1.0");
     expect(staged.verified).toBe(true);
+    expect(staged.download_url).toContain(".app.tar.gz");
+    expect(staged.sha256_checksum).toBe(
+      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    );
 
-    const dismissed = client.dismissUpdate("0.2.0");
+    const dismissed = client.dismissUpdate("1.1.0");
     expect(dismissed.update_available).toBe(false);
     expect(client.checkForUpdates(true).update_available).toBe(true);
 
-    const { status } = await client.installNativeUpdate("0.2.0");
-    expect(status.current_version).toBe("0.2.0");
+    const { status } = await client.installNativeUpdate("1.1.0");
+    expect(status.current_version).toBe("1.1.0");
     expect(status.staged_for_restart).toBe(true);
-    expect(client.getCurrentVersion()).toBe("0.2.0");
+    expect(client.getCurrentVersion()).toBe("1.1.0");
 
     const cleanup = client.cleanupApplicationData();
     expect(cleanup.removed_paths.length).toBeGreaterThan(0);
-    expect(client.getCurrentVersion()).toBe("0.1.0");
+    expect(client.getCurrentVersion()).toBe("1.0.3");
     expect("github_release_repo" in client.getSettings()).toBe(false);
   });
 
@@ -486,18 +500,19 @@ describe("AudoraIpcClient workflows", () => {
     expect(ended.position_ms).toBe(true81HoursMs);
   });
 
-  it("enforces SemVer pre-release ordering, rejects missing SHA-256 digests, and keeps playback continuous across even-length shuffle", () => {
-    expect(compareSemver("0.2.0-rc.1", "0.2.0")).toBeLessThan(0);
-    expect(compareSemver("0.2.0", "0.2.0-rc.1")).toBeGreaterThan(0);
-    expect(compareSemver("0.2.0", "0.1.9")).toBeGreaterThan(0);
+  it("enforces SemVer pre-release ordering (including numeric rc.10 > rc.2), rejects missing SHA-256 digests, and keeps playback continuous across even-length shuffle", () => {
+    expect(compareSemver("1.2.0-rc.1", "1.2.0")).toBeLessThan(0);
+    expect(compareSemver("1.2.0", "1.2.0-rc.1")).toBeGreaterThan(0);
+    expect(compareSemver("1.2.0-rc.10", "1.2.0-rc.2")).toBeGreaterThan(0);
+    expect(compareSemver("1.2.0", "1.1.9")).toBeGreaterThan(0);
 
     const client = new AudoraIpcClient(false);
 
     // Release with missing digest must NOT be marked verified or installable
     const unverified = client.stageGitHubReleaseJson(
       JSON.stringify({
-        tag_name: "v0.3.0",
-        name: "Audora 0.3.0",
+        tag_name: "v1.2.0",
+        name: "Audora 1.2.0",
         assets: [
           {
             name: "release-manifest-macos-aarch64.json",
@@ -507,8 +522,8 @@ describe("AudoraIpcClient workflows", () => {
               "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
           },
           {
-            name: "Audora_0.3.0_macos-aarch64.dmg",
-            browser_download_url: "https://example.com/Audora_0.3.0.dmg",
+            name: "Audora_1.2.0_macos-aarch64.dmg",
+            browser_download_url: "https://example.com/Audora_1.2.0.dmg",
             size: 18_000_000,
           },
         ],
@@ -516,24 +531,42 @@ describe("AudoraIpcClient workflows", () => {
     );
     expect(unverified.verified).toBe(false);
     expect(unverified.update_available).toBe(false);
-    expect(() => client.installUpdate("0.3.0")).toThrow();
+    expect(() => client.installUpdate("1.2.0")).toThrow();
     expect(() => client.installUpdate("99.0.0")).toThrow();
 
-    // 4-item even-length queue shuffle visits all 4 items and keeps playing on Next
+    // 4-item even-length queue shuffle visits all 4 items and keeps playing on Next,
+    // while preserving active playback speed across track switches and restarting Track 1 on Previous
     const opened = client.openLocalFiles([
       { name: "T1.mp3", path: "/tmp/T1.mp3", size: 1000, durationMs: 60_000 },
       { name: "T2.mp3", path: "/tmp/T2.mp3", size: 1000, durationMs: 60_000 },
       { name: "T3.mp3", path: "/tmp/T3.mp3", size: 1000, durationMs: 60_000 },
       { name: "T4.mp3", path: "/tmp/T4.mp3", size: 1000, durationMs: 60_000 },
     ]);
+    client.playbackCommand({ action: "set_rate", rate: 1.5 });
+    client.playbackCommand({ action: "seek", position_ms: 1_800 });
+    expect(client.playbackCommand({ action: "previous" }).position_ms).toBe(0);
+
     client.playbackCommand({ action: "set_shuffle", shuffle: true });
     client.playbackCommand({ action: "play" });
     const visited = new Set<string>([client.getPlaybackSnapshot().media_id!]);
     for (let i = 0; i < 3; i += 1) {
       const snap = client.playbackCommand({ action: "next" });
       expect(snap.state).toBe("playing");
+      expect(snap.rate).toBe(1.5);
       visited.add(snap.media_id!);
     }
     expect(visited.size).toBe(opened.length);
+
+    // Format helpers & note length guard
+    expect(formatAriaTimestamp(3_905_000)).toBe("1 hour 5 minutes 5 seconds");
+    expect(formatHumanDate(new Date().toISOString())).toBe("Just now");
+    expect(() =>
+      client.createNote({
+        media_id: opened[0]!.id,
+        position_ms: 0,
+        is_quick_marker: false,
+        body: "x".repeat(10_001),
+      }),
+    ).toThrow();
   });
 });

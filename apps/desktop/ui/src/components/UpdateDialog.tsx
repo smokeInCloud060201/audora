@@ -1,5 +1,6 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { AppUpdateStatusDto } from "../types/domain";
+import { useModalFocusTrap } from "../utils/useModalFocusTrap";
 import { AudoraLogo } from "./AudoraLogo";
 import { IconCheck, IconClose } from "./Icons";
 
@@ -58,6 +59,12 @@ export function UpdateDialog({
   onClose,
 }: UpdateDialogProps): React.ReactElement {
   const [isInstalling, setIsInstalling] = useState(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap(true, dialogRef);
+
+  useEffect(() => {
+    setIsInstalling(false);
+  }, [updateStatus.checked_at_unix_ms, updateStatus.latest_version]);
   const targetVersion =
     updateStatus.latest_version || updateStatus.current_version;
   const isAvailable = updateStatus.update_available;
@@ -90,6 +97,7 @@ export function UpdateDialog({
       data-testid="update-dialog"
     >
       <div
+        ref={dialogRef}
         className={`update-dialog-card ${
           hasChangelogBlocks ? "has-changelog" : ""
         }`.trim()}

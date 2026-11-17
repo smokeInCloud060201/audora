@@ -1,6 +1,6 @@
 //! SQLite implementation of `MediaRepository`.
 
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 
 use crate::domain::{
     Availability, LibraryFilter, MediaItem, MediaKind, MediaRepository, RelinkMediaRecord,
@@ -69,81 +69,8 @@ impl SqliteMediaRepository {
 impl MediaRepository for SqliteMediaRepository {
     fn upsert_media(&self, item: &MediaItem) -> AppResult<MediaItem> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
-            let existing_by_id: Option<String> = tx
-                .query_row(
-                    "SELECT path FROM media WHERE id = ?1",
-                    params![item.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(old_path) = existing_by_id {
-                if old_path != item.path {
-                    tx.execute(
-                        "UPDATE media
-                         SET path = ?2,
-                             display_name = ?3,
-                             media_kind = ?4,
-                             duration_ms = COALESCE(?5, duration_ms),
-                             duration_probed = CASE WHEN ?10 != 0 THEN 1 ELSE duration_probed END,
-                             file_size_bytes = COALESCE(?6, file_size_bytes),
-                             availability = ?7,
-                             last_opened_at = ?8,
-                             last_seen_at = ?9,
-                             source_folder_id = COALESCE(?11, source_folder_id)
-                         WHERE id = ?1",
-                        params![
-                            item.id,
-                            item.path,
-                            item.display_name,
-                            item.media_kind.as_str(),
-                            item.duration_ms.and_then(|v| i64::try_from(v).ok()),
-                            item.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
-                            item.availability.as_str(),
-                            item.last_opened_at,
-                            item.last_seen_at,
-                            i64::from(item.duration_probed),
-                            item.source_folder_id,
-                        ],
-                    )?;
-                    tx.commit()?;
-                    return Ok(());
-                }
-            }
-            tx.execute(
-                "INSERT INTO media (
-                    id, path, display_name, media_kind, duration_ms, duration_probed,
-                    last_position_ms, completed, file_size_bytes, fingerprint, availability,
-                    added_at, last_opened_at, last_seen_at, source_folder_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                ON CONFLICT(path) DO UPDATE SET
-                    display_name = excluded.display_name,
-                    media_kind = excluded.media_kind,
-                    duration_ms = COALESCE(excluded.duration_ms, media.duration_ms),
-                    duration_probed = CASE WHEN excluded.duration_probed != 0 THEN 1 ELSE media.duration_probed END,
-                    file_size_bytes = COALESCE(excluded.file_size_bytes, media.file_size_bytes),
-                    availability = excluded.availability,
-                    last_opened_at = COALESCE(excluded.last_opened_at, media.last_opened_at),
-                    last_seen_at = excluded.last_seen_at,
-                    source_folder_id = COALESCE(excluded.source_folder_id, media.source_folder_id)",
-                params![
-                    item.id,
-                    item.path,
-                    item.display_name,
-                    item.media_kind.as_str(),
-                    item.duration_ms.and_then(|v| i64::try_from(v).ok()),
-                    i64::from(item.duration_probed),
-                    i64::try_from(item.last_position_ms).unwrap_or(0),
-                    i64::from(item.completed),
-                    item.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
-                    item.fingerprint,
-                    item.availability.as_str(),
-                    item.added_at,
-                    item.last_opened_at,
-                    item.last_seen_at,
-                    item.source_folder_id,
-                ],
-            )?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Database::reconcile_upsert_media_in_tx(&tx, item, false)?;
             tx.commit()?;
             Ok(())
         })?;
@@ -254,7 +181,7 @@ impl MediaRepository for SqliteMediaRepository {
         updated_at: &str,
     ) -> AppResult<()> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "UPDATE media
                  SET last_position_ms = ?2, completed = ?3, last_seen_at = ?4
@@ -278,7 +205,7 @@ impl MediaRepository for SqliteMediaRepository {
         updated_at: &str,
     ) -> AppResult<()> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 "UPDATE media SET availability = ?2, last_seen_at = ?3 WHERE id = ?1",
                 params![id, availability.as_str(), updated_at],
@@ -290,7 +217,7 @@ impl MediaRepository for SqliteMediaRepository {
 
     fn relink_path(&self, record: &RelinkMediaRecord<'_>) -> AppResult<MediaItem> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let dur_param = record.duration_ms.and_then(|v| i64::try_from(v).ok());
             let updated = tx.execute(
                 "UPDATE media
@@ -298,6 +225,7 @@ impl MediaRepository for SqliteMediaRepository {
                      display_name = ?3,
                      media_kind = ?4,
                      duration_ms = ?5,
+                     duration_probed = ?8,
                      last_position_ms = CASE
                          WHEN ?5 IS NOT NULL AND last_position_ms > ?5 THEN ?5
                          ELSE last_position_ms
@@ -314,6 +242,7 @@ impl MediaRepository for SqliteMediaRepository {
                     dur_param,
                     record.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
                     record.updated_at,
+                    i64::from(record.duration_probed),
                 ],
             )?;
             if updated == 0 {
@@ -332,7 +261,7 @@ impl MediaRepository for SqliteMediaRepository {
 
     fn delete_media(&self, id: &str) -> AppResult<bool> {
         self.db.with_conn(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let affected = tx.execute("DELETE FROM media WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(affected > 0)

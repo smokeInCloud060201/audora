@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useMemo } from "react";
 import { ipcClient } from "../api/ipc";
 import type {
   AppErrorPayload,
@@ -9,7 +9,11 @@ import type {
   PlaybackSnapshot,
   TimestampPrecision,
 } from "../types/domain";
-import { computeProgressPercent, formatDurationMs } from "../utils/format";
+import {
+  computeProgressPercent,
+  formatDurationMs,
+  formatHumanDate,
+} from "../utils/format";
 import {
   IconArrowRight,
   IconFolderOpen,
@@ -49,7 +53,7 @@ interface MediaLibraryViewProps {
   timestampPrecision: TimestampPrecision;
 }
 
-export function MediaLibraryView({
+export const MediaLibraryView = React.memo(function MediaLibraryView({
   allMedia,
   libraryResult,
   libraryFilter,
@@ -79,6 +83,14 @@ export function MediaLibraryView({
   onClearMissingTarget,
   timestampPrecision,
 }: MediaLibraryViewProps): React.ReactElement {
+  const mediaById = useMemo(() => {
+    const map = new Map<string, MediaItem>();
+    for (const m of allMedia) {
+      map.set(m.id, m);
+    }
+    return map;
+  }, [allMedia]);
+
   return (
     <div className="content-page library-page">
       {missingMediaTarget ? (
@@ -422,7 +434,18 @@ export function MediaLibraryView({
                               : "transparent",
                           }}
                         >
-                          <td style={{ fontWeight: 600 }}>{item.display_name}</td>
+                          <td style={{ fontWeight: 600 }}>
+                            <button
+                              type="button"
+                              className="library-title-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onSelectLibraryItem(item);
+                              }}
+                            >
+                              {item.display_name}
+                            </button>
+                          </td>
                           <td>
                             {isMissing
                               ? "! Missing file"
@@ -431,12 +454,12 @@ export function MediaLibraryView({
                                 : "Audio"}
                           </td>
                           <td className="tabular-nums">
-                            {formatDurationMs(item.duration_ms)}
+                            {formatDurationMs(item.duration_ms, timestampPrecision)}
                           </td>
                           <td>
                             {item.note_count > 0 ? (
                               <span className="timestamp-pill">
-                                {item.note_count} notes
+                                {item.note_count} {item.note_count === 1 ? "note" : "notes"}
                               </span>
                             ) : (
                               "—"
@@ -459,8 +482,10 @@ export function MediaLibraryView({
                                 <span>Locate file</span>
                                 <IconArrowRight size={12} />
                               </span>
+                            ) : item.last_opened_at ? (
+                              formatHumanDate(item.last_opened_at)
                             ) : (
-                              (item.last_opened_at ?? "Never")
+                              "Never"
                             )}
                           </td>
                           <td
@@ -572,7 +597,7 @@ export function MediaLibraryView({
                     }}
                   >
                     {libraryResult.matching_notes.map((note) => {
-                      const parent = allMedia.find((m) => m.id === note.media_id);
+                      const parent = mediaById.get(note.media_id);
                       return (
                         <div
                           key={note.id}
@@ -606,7 +631,7 @@ export function MediaLibraryView({
                             >
                               <IconPlay size={10} />
                               <span>
-                                {formatDurationMs(note.position_ms)} — Jump to moment
+                                {formatDurationMs(note.position_ms, timestampPrecision)} — Jump to moment
                               </span>
                             </button>
                           </div>
@@ -625,4 +650,4 @@ export function MediaLibraryView({
       )}
     </div>
   );
-}
+});

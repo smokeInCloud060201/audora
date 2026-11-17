@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * Audora Phase 5 & Phase 6 Release Gate Verifier (`pnpm verify:release`).
+ * Audora Release Gate Verifier (`pnpm verify:release`).
  *
  * Verifies that all required legal, licensing, security, and build artifacts exist,
+ * enforces manifest & SBOM version synchronization, validates runtime & bundle CSP,
  * and outputs SHA-256 checksums for built frontend and migration assets.
  */
 
@@ -65,36 +66,77 @@ if (missing > 0) {
   process.exit(1);
 }
 
-// Verify CSP in both tauri.conf.json AND runtime main.rs HTTP header enforces object-src 'none' and has no wildcard connect-src
+// Enforce version parity across Cargo.toml, package.json, apps/desktop/ui/package.json, tauri.conf.json, and sbom.cdx.json (`M-8`)
+const cargoToml = readFileSync(join(rootDir, "Cargo.toml"), "utf8");
+const cargoVersionMatch = cargoToml.match(/\[workspace\.package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m);
+const cargoVersion = cargoVersionMatch?.[1] ?? "";
+const rootPkg = JSON.parse(readFileSync(join(rootDir, "package.json"), "utf8"));
+const uiPkg = JSON.parse(readFileSync(join(rootDir, "apps/desktop/ui/package.json"), "utf8"));
 const tauriConf = JSON.parse(
   readFileSync(join(rootDir, "apps/desktop/src-tauri/tauri.conf.json"), "utf8"),
 );
+const sbom = JSON.parse(readFileSync(join(rootDir, "sbom.cdx.json"), "utf8"));
+const sbomVersion = sbom?.metadata?.component?.version ?? "";
+
+const versions = {
+  "Cargo.toml": cargoVersion,
+  "package.json": rootPkg.version ?? "",
+  "apps/desktop/ui/package.json": uiPkg.version ?? "",
+  "apps/desktop/src-tauri/tauri.conf.json": tauriConf.version ?? "",
+  "sbom.cdx.json": sbomVersion,
+};
+
+const uniqueVersions = new Set(Object.values(versions));
+if (!cargoVersion || uniqueVersions.size !== 1) {
+  console.error("[FAIL] Version mismatch across workspace manifests:", versions);
+  process.exit(1);
+}
+if (!Array.isArray(sbom.components) || sbom.components.length < 50) {
+  console.error("[FAIL] sbom.cdx.json is incomplete; expected full resolved dependency list");
+  process.exit(1);
+}
+
+// Verify CSP in BOTH tauri.conf.json AND `RUNTIME_CSP` in main.rs (`M-8`)
 const csp = tauriConf?.app?.security?.csp ?? "";
 const mainRs = readFileSync(
   join(rootDir, "apps/desktop/src-tauri/src/main.rs"),
   "utf8",
 );
-const hasWildcardConnect = (policy) => {
-  const match = policy.match(/connect-src\s+([^;]+)/i);
-  if (!match) return true;
-  return match[1].split(/\s+/).some((tok) => tok === "*" || tok.includes("*"));
+const runtimeCspMatch = mainRs.match(/const\s+RUNTIME_CSP:\s*&str\s*=\s*"([^"]+)"/);
+const runtimeCsp = runtimeCspMatch?.[1] ?? "";
+
+const hasWildcardDirective = (policy) => {
+  for (const dir of ["default-src", "script-src", "connect-src", "img-src", "media-src"]) {
+    const match = policy.match(new RegExp(`${dir}\\s+([^;]+)`, "i"));
+    if (match && match[1].split(/\s+/).some((tok) => tok === "*" || tok.includes("*"))) {
+      return true;
+    }
+  }
+  const connectMatch = policy.match(/connect-src\s+([^;]+)/i);
+  return !connectMatch;
 };
+
 if (
   !csp.includes("object-src 'none'") ||
   !csp.includes("connect-src 'self'") ||
-  hasWildcardConnect(csp)
+  hasWildcardDirective(csp)
 ) {
-  console.error("[FAIL] Tauri CSP does not enforce strict connect-src/object-src policy");
+  console.error("[FAIL] Tauri CSP does not enforce strict non-wildcard connect-src/object-src policy");
   process.exit(1);
 }
+
 if (
-  !mainRs.includes("Content-Security-Policy:") ||
-  !mainRs.includes("object-src 'none'") ||
-  !mainRs.includes("frame-ancestors 'none'") ||
+  !runtimeCsp ||
+  !runtimeCsp.includes("default-src 'self'") ||
+  !runtimeCsp.includes("script-src 'self'") ||
+  !runtimeCsp.includes("object-src 'none'") ||
+  !runtimeCsp.includes("frame-ancestors 'none'") ||
+  hasWildcardDirective(runtimeCsp) ||
+  !mainRs.includes("Content-Security-Policy: {RUNTIME_CSP}") ||
   !/x-audora-token/i.test(mainRs)
 ) {
   console.error(
-    "[FAIL] Runtime loopback server in main.rs is missing Content-Security-Policy or session token enforcement",
+    "[FAIL] Runtime loopback server in main.rs is missing strict RUNTIME_CSP or session token enforcement",
   );
   process.exit(1);
 }
@@ -104,7 +146,7 @@ function sha256File(filePath) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-console.log("=== Audora Release Gate Verification Passed ===");
+console.log(`=== Audora v${cargoVersion} Release Gate Verification Passed ===`);
 console.log("SHA-256 Checksums:");
 
 const checksumTargets = [

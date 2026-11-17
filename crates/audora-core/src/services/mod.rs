@@ -13,14 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    AppSettings, AppUpdateStatusDto, Availability, BackendEvent, CleanupSummaryDto,
-    CreateNoteInput, CreatePlaylistInput, DiagnosticReport, LibraryFilter, LibrarySearchResult,
-    MediaId, MediaItem, MediaRepository, Note, NotesRepository, PlaybackBackend, PlaybackCommand,
-    PlaybackSnapshot, PlaybackState, Playlist, PlaylistRepository, ReleaseManifestDto,
-    RelinkMediaRecord, RepeatMode, SettingsRepository, TimestampPrecision, UpdateNoteInput,
-    UpdatePlaylistInput, WindowMode, MAX_NOTE_BODY_CHARS, MAX_PLAYBACK_RATE,
-    MAX_PLAYLIST_DESCRIPTION_CHARS, MAX_PLAYLIST_NAME_CHARS, MAX_SEARCH_QUERY_CHARS,
-    MIN_PLAYBACK_RATE,
+    current_iso8601_utc, validate_local_media_path_str, validate_note_body, validate_playback_rate,
+    validate_playlist_fields, AppSettings, AppUpdateStatusDto, Availability, BackendEvent,
+    CleanupSummaryDto, CreateNoteInput, CreatePlaylistInput, DiagnosticReport, LibraryFilter,
+    LibrarySearchResult, MediaId, MediaItem, MediaRepository, Note, NotesRepository,
+    PlaybackBackend, PlaybackCommand, PlaybackSnapshot, PlaybackState, Playlist,
+    PlaylistRepository, ReleaseManifestDto, RelinkMediaRecord, RepeatMode, SettingsRepository,
+    TimestampPrecision, UpdateNoteInput, UpdatePlaylistInput, WindowMode, MAX_SEARCH_QUERY_CHARS,
 };
 use crate::error::{redact_path, AppError, AppResult};
 
@@ -36,11 +35,22 @@ fn generate_id(prefix: &str) -> String {
 }
 
 fn now_timestamp_string() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs}")
+    current_iso8601_utc()
+}
+
+fn canonicalize_if_exists(raw: &str) -> String {
+    let p = Path::new(raw);
+    let Ok(canon) = fs::canonicalize(p) else {
+        return raw.to_owned();
+    };
+    let lossy = canon.to_string_lossy();
+    if let Some(unc) = lossy.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(stripped) = lossy.strip_prefix(r"\\?\") {
+        stripped.to_owned()
+    } else {
+        lossy.into_owned()
+    }
 }
 
 /// Core application coordinator owning domain invariants across playback, library, notes, playlists, and settings.
@@ -112,34 +122,15 @@ impl AudoraAppService {
     }
 
     fn validate_local_media_path(raw_path: &str) -> AppResult<&str> {
-        let trimmed = raw_path.trim();
-        if trimmed.is_empty() {
-            return Err(AppError::validation("Media file path must not be empty"));
-        }
-        if trimmed.chars().any(char::is_control) {
-            return Err(AppError::validation(
-                "Media file path contains invalid control characters",
-            ));
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        for forbidden_scheme in [
-            "http://", "https://", "rtsp://", "rtsps://", "ftp://", "sftp://", "ws://", "wss://",
-            "mms://",
-        ] {
-            if lower.starts_with(forbidden_scheme) {
-                return Err(AppError::validation(
-                    "Audora only opens local files on your device; remote network URLs are not permitted.",
-                ));
-            }
-        }
-        Ok(trimmed)
+        validate_local_media_path_str(raw_path)
     }
 
     /// Opens a local media file, probes its stream metadata without modifying the source file,
     /// records/updates its library entry, increments the load generation, and loads it for playback.
     pub fn open_media(&self, raw_path: &str) -> AppResult<MediaItem> {
         let trimmed = Self::validate_local_media_path(raw_path)?;
-        let path = Path::new(trimmed);
+        let normalized_path = canonicalize_if_exists(trimmed);
+        let path = Path::new(&normalized_path);
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -148,7 +139,11 @@ impl AudoraAppService {
             .to_owned();
 
         if !path.exists() {
-            if let Some(existing) = self.media_repo.get_by_path(trimmed)? {
+            if let Some(existing) = self
+                .media_repo
+                .get_by_path(&normalized_path)?
+                .or(self.media_repo.get_by_path(trimmed)?)
+            {
                 let now = now_timestamp_string();
                 self.media_repo
                     .update_availability(&existing.id, Availability::Missing, &now)?;
@@ -202,7 +197,10 @@ impl AudoraAppService {
             }
         };
 
-        let existing = self.media_repo.get_by_path(trimmed)?;
+        let existing = self
+            .media_repo
+            .get_by_path(&normalized_path)?
+            .or(self.media_repo.get_by_path(trimmed)?);
         let now = now_timestamp_string();
         let media_id = existing
             .as_ref()
@@ -213,7 +211,7 @@ impl AudoraAppService {
         let prior_folder = existing.as_ref().and_then(|m| m.source_folder_id.clone());
         let item_to_save = MediaItem {
             id: media_id,
-            path: trimmed.to_owned(),
+            path: normalized_path,
             display_name: file_name,
             media_kind: probed.media_kind,
             duration_ms: probed.duration_ms,
@@ -269,7 +267,7 @@ impl AudoraAppService {
             return Err(AppError::validation("At least one media path is required"));
         }
 
-        let mut expanded_paths: Vec<String> = Vec::new();
+        let mut expanded_paths: Vec<(String, bool)> = Vec::new();
         for raw in raw_paths {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -284,14 +282,16 @@ impl AudoraAppService {
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
                     .filter(|entry_path| {
-                        entry_path.is_file() && Self::is_supported_media_extension(entry_path)
+                        entry_path.is_file()
+                            && entry_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                            && Self::is_supported_media_extension(entry_path)
                     })
                     .filter_map(|entry_path| entry_path.to_str().map(str::to_owned))
                     .collect();
                 dir_files.sort();
-                expanded_paths.extend(dir_files);
+                expanded_paths.extend(dir_files.into_iter().map(|f| (f, true)));
             } else {
-                expanded_paths.push(trimmed.to_owned());
+                expanded_paths.push((trimmed.to_owned(), false));
             }
         }
 
@@ -302,15 +302,39 @@ impl AudoraAppService {
         }
 
         let mut opened_items = Vec::with_capacity(expanded_paths.len());
-        for path_str in &expanded_paths {
-            let item = self.open_media(path_str)?;
-            opened_items.push(item);
+        let mut last_err: Option<AppError> = None;
+        for (path_str, from_dir) in &expanded_paths {
+            match self.open_media(path_str) {
+                Ok(item) => opened_items.push(item),
+                Err(err) if *from_dir => {
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if opened_items.is_empty() {
+            return Err(last_err.unwrap_or_else(|| {
+                AppError::media_unavailable(
+                    "No playable audio or video files were found in the selection.",
+                )
+            }));
         }
 
-        // Keep the first opened item active while leaving all opened items in the queue.
+        // Keep the first opened item active without double-spawning external probers (`M-5`).
         if opened_items.len() > 1 {
             let first = &opened_items[0];
-            let _ = self.open_media(&first.path)?;
+            if let Ok(mut snap) = self.snapshot.lock() {
+                self.load_queued_track_locked(&mut snap, &first.id, false);
+                if let Ok(settings) = self.settings_repo.load_settings() {
+                    if settings.resume_where_left_off && !first.completed {
+                        let ack = self
+                            .playback_backend
+                            .seek(snap.generation, first.last_position_ms)
+                            .unwrap_or(first.last_position_ms);
+                        snap.position_ms = ack;
+                    }
+                }
+            }
         }
 
         Ok(opened_items)
@@ -370,14 +394,28 @@ impl AudoraAppService {
         if let Ok(Some(item)) = self.media_repo.get_by_id(next_id) {
             let next_gen = snap.generation.saturating_add(1);
             let p = Path::new(&item.path);
-            let loaded_dur = if p.is_file() {
-                self.playback_backend
-                    .load(p, next_gen)
-                    .ok()
-                    .and_then(|m| m.duration_ms)
-            } else {
-                None
-            };
+            if !p.is_file() {
+                let _ = self.media_repo.update_availability(
+                    &item.id,
+                    Availability::Missing,
+                    &now_timestamp_string(),
+                );
+                let _ = self.playback_backend.stop();
+                snap.generation = next_gen;
+                snap.media_id = Some(next_id.to_owned());
+                snap.position_ms = 0;
+                snap.state = PlaybackState::Failed;
+                snap.error = Some(
+                    AppError::media_unavailable("Queued media file is missing from disk.")
+                        .to_payload(),
+                );
+                return;
+            }
+            let loaded_dur = self
+                .playback_backend
+                .load(p, next_gen)
+                .ok()
+                .and_then(|m| m.duration_ms);
             snap.generation = next_gen;
             snap.media_id = Some(next_id.to_owned());
             snap.duration_ms = loaded_dur.or(item.duration_ms);
@@ -525,11 +563,7 @@ impl AudoraAppService {
                 }
             }
             PlaybackCommand::SetRate { rate } => {
-                if !(MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&rate) {
-                    return Err(AppError::validation(format!(
-                        "Playback speed must be between {MIN_PLAYBACK_RATE}x and {MAX_PLAYBACK_RATE}x"
-                    )));
-                }
+                validate_playback_rate(rate)?;
                 self.playback_backend.set_rate(gen, rate)?;
                 snap.rate = rate;
             }
@@ -605,6 +639,15 @@ impl AudoraAppService {
                             );
                             let prev_id = snap.queue[i].clone();
                             self.load_queued_track_locked(&mut snap, &prev_id, was_playing);
+                        } else {
+                            let acknowledged = self.playback_backend.seek(gen, 0)?;
+                            snap.position_ms = acknowledged;
+                            let _ = self.media_repo.update_progress(
+                                &current_id,
+                                acknowledged,
+                                false,
+                                &now_timestamp_string(),
+                            );
                         }
                     }
                 }
@@ -689,7 +732,7 @@ impl AudoraAppService {
                             Self::next_shuffle_index(idx, len)
                         } else if idx + 1 < len {
                             Some(idx + 1)
-                        } else if snap.repeat_mode == RepeatMode::All && len > 1 {
+                        } else if snap.repeat_mode == RepeatMode::All && len > 0 {
                             Some(0)
                         } else {
                             None
@@ -717,23 +760,18 @@ impl AudoraAppService {
             .get_by_id(&input.media_id)?
             .ok_or_else(|| AppError::validation("Referenced media item does not exist"))?;
 
-        let trimmed_body = input.body.trim().to_owned();
-        if trimmed_body.chars().count() > MAX_NOTE_BODY_CHARS {
-            return Err(AppError::validation(format!(
-                "Note text exceeds maximum length of {MAX_NOTE_BODY_CHARS} characters"
-            )));
-        }
-
-        if trimmed_body.is_empty() && !input.is_quick_marker {
-            return Err(AppError::validation(
-                "Enter note text or check 'Save as quick marker' before saving.",
-            ));
-        }
+        let trimmed_body = validate_note_body(&input.body, input.is_quick_marker)?.to_owned();
 
         let settings = self.settings_repo.load_settings()?;
+        let pre_clamped = match media.duration_ms {
+            Some(dur) => input.position_ms.min(dur),
+            None => input.position_ms,
+        };
         let rounded_pos = match settings.timestamp_precision {
-            TimestampPrecision::NearestSecond => ((input.position_ms + 500) / 1_000) * 1_000,
-            TimestampPrecision::Milliseconds => input.position_ms,
+            TimestampPrecision::NearestSecond => {
+                (pre_clamped.saturating_add(500) / 1_000).saturating_mul(1_000)
+            }
+            TimestampPrecision::Milliseconds => pre_clamped,
         };
         let clamped_pos = match media.duration_ms {
             Some(dur) => rounded_pos.min(dur),
@@ -754,16 +792,11 @@ impl AudoraAppService {
 
     /// Updates an existing note's text.
     pub fn update_note(&self, input: UpdateNoteInput) -> AppResult<Note> {
-        let trimmed = input.body.trim();
+        let trimmed = validate_note_body(&input.body, false)?;
         if trimmed.is_empty() {
             return Err(AppError::validation(
                 "Note text cannot be empty when editing",
             ));
-        }
-        if trimmed.chars().count() > MAX_NOTE_BODY_CHARS {
-            return Err(AppError::validation(format!(
-                "Note text exceeds maximum length of {MAX_NOTE_BODY_CHARS} characters"
-            )));
         }
         self.notes_repo.update_note(
             &UpdateNoteInput {
@@ -935,13 +968,15 @@ impl AudoraAppService {
             .unwrap_or(&current.display_name)
             .to_owned();
 
+        let canon_new = canonicalize_if_exists(trimmed_path);
         let now = now_timestamp_string();
         let updated_item = self.media_repo.relink_path(&RelinkMediaRecord {
             id: media_id,
-            new_path: trimmed_path,
+            new_path: &canon_new,
             display_name: &display_name,
             media_kind: probed.media_kind,
-            duration_ms: probed.duration_ms.or(current.duration_ms),
+            duration_ms: probed.duration_ms,
+            duration_probed: probed.duration_ms.is_some(),
             file_size_bytes: Some(fs_meta.len()),
             updated_at: &now,
         })?;
@@ -970,6 +1005,8 @@ impl AudoraAppService {
             if snap.media_id.as_deref() == Some(media_id) {
                 let _ = self.playback_backend.stop();
                 snap.media_id = None;
+                snap.duration_ms = None;
+                snap.error = None;
                 snap.state = PlaybackState::Idle;
                 snap.position_ms = 0;
             }
@@ -984,10 +1021,9 @@ impl AudoraAppService {
 
     /// Validates and saves application settings.
     pub fn update_settings(&self, settings: AppSettings) -> AppResult<AppSettings> {
-        if !(MIN_PLAYBACK_RATE..=MAX_PLAYBACK_RATE).contains(&settings.default_playback_speed) {
-            return Err(AppError::validation(format!(
-                "Default playback speed must be between {MIN_PLAYBACK_RATE}x and {MAX_PLAYBACK_RATE}x"
-            )));
+        validate_playback_rate(settings.default_playback_speed)?;
+        for folder in &settings.source_folders {
+            validate_local_media_path_str(&folder.path)?;
         }
         self.settings_repo
             .save_settings(&settings, &now_timestamp_string())?;
@@ -1035,11 +1071,13 @@ impl AudoraAppService {
         let playlist_count = self.playlist_repo.list_playlists()?.len();
         let snap = self.get_playback_snapshot()?;
 
+        let schema_version = self.settings_repo.schema_version().unwrap_or(4);
+
         Ok(DiagnosticReport {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             os_family: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
-            schema_version: 4,
+            schema_version,
             media_count,
             missing_media_count,
             total_note_count,
@@ -1052,21 +1090,8 @@ impl AudoraAppService {
 
     /// Creates a new user playlist (`0002_playlists`).
     pub fn create_playlist(&self, input: CreatePlaylistInput) -> AppResult<Playlist> {
-        let trimmed_name = input.name.trim();
-        if trimmed_name.is_empty() {
-            return Err(AppError::validation("Playlist name must not be empty"));
-        }
-        if trimmed_name.chars().count() > MAX_PLAYLIST_NAME_CHARS {
-            return Err(AppError::validation(format!(
-                "Playlist name must not exceed {MAX_PLAYLIST_NAME_CHARS} characters"
-            )));
-        }
-        let trimmed_desc = input.description.trim();
-        if trimmed_desc.chars().count() > MAX_PLAYLIST_DESCRIPTION_CHARS {
-            return Err(AppError::validation(format!(
-                "Playlist description must not exceed {MAX_PLAYLIST_DESCRIPTION_CHARS} characters"
-            )));
-        }
+        let (trimmed_name, trimmed_desc) =
+            validate_playlist_fields(&input.name, &input.description)?;
         let sanitized = CreatePlaylistInput {
             name: trimmed_name.to_owned(),
             description: trimmed_desc.to_owned(),
@@ -1079,21 +1104,8 @@ impl AudoraAppService {
 
     /// Updates a playlist's name and description.
     pub fn update_playlist(&self, input: UpdatePlaylistInput) -> AppResult<Playlist> {
-        let trimmed_name = input.name.trim();
-        if trimmed_name.is_empty() {
-            return Err(AppError::validation("Playlist name must not be empty"));
-        }
-        if trimmed_name.chars().count() > MAX_PLAYLIST_NAME_CHARS {
-            return Err(AppError::validation(format!(
-                "Playlist name must not exceed {MAX_PLAYLIST_NAME_CHARS} characters"
-            )));
-        }
-        let trimmed_desc = input.description.trim();
-        if trimmed_desc.chars().count() > MAX_PLAYLIST_DESCRIPTION_CHARS {
-            return Err(AppError::validation(format!(
-                "Playlist description must not exceed {MAX_PLAYLIST_DESCRIPTION_CHARS} characters"
-            )));
-        }
+        let (trimmed_name, trimmed_desc) =
+            validate_playlist_fields(&input.name, &input.description)?;
         let sanitized = UpdatePlaylistInput {
             id: input.id,
             name: trimmed_name.to_owned(),
@@ -1371,7 +1383,7 @@ impl AudoraAppService {
 
     /// Dismisses notifications for a specific update version until a newer release is published.
     pub fn dismiss_update(&self, version: &str) -> AppResult<AppUpdateStatusDto> {
-        let trimmed = version.trim().trim_start_matches('v');
+        let trimmed = version.trim().trim_start_matches(['v', 'V']);
         if trimmed.is_empty() {
             return Err(AppError::validation(
                 "Update version to dismiss must not be empty",
@@ -1392,8 +1404,8 @@ impl AudoraAppService {
 
 /// Compares two semantic version strings (`major.minor.patch[-prerelease]`, ignoring optional leading `v`).
 ///
-/// Follows SemVer 2.0 precedence so pre-release versions (`0.2.0-rc.1`) sort strictly below
-/// their corresponding stable release (`0.2.0`) (`L-1`).
+/// Follows SemVer 2.0.0 §11.4 precedence: pre-release versions sort strictly below stable releases,
+/// and dot-separated numeric pre-release identifiers are compared numerically (`rc.10 > rc.2`) (`L-3`).
 #[must_use]
 pub fn compare_semver(a: &str, b: &str) -> CmpOrdering {
     fn parse_semver(v: &str) -> ((u64, u64, u64), Option<&str>) {
@@ -1414,6 +1426,29 @@ pub fn compare_semver(a: &str, b: &str) -> CmpOrdering {
         )
     }
 
+    fn cmp_prerelease(pa: &str, pb: &str) -> CmpOrdering {
+        let mut ia = pa.split('.');
+        let mut ib = pb.split('.');
+        loop {
+            match (ia.next(), ib.next()) {
+                (None, None) => return CmpOrdering::Equal,
+                (None, Some(_)) => return CmpOrdering::Less,
+                (Some(_), None) => return CmpOrdering::Greater,
+                (Some(sa), Some(sb)) => {
+                    let ord = match (sa.parse::<u64>(), sb.parse::<u64>()) {
+                        (Ok(na), Ok(nb)) => na.cmp(&nb),
+                        (Ok(_), Err(_)) => CmpOrdering::Less,
+                        (Err(_), Ok(_)) => CmpOrdering::Greater,
+                        (Err(_), Err(_)) => sa.cmp(sb),
+                    };
+                    if ord != CmpOrdering::Equal {
+                        return ord;
+                    }
+                }
+            }
+        }
+    }
+
     let (core_a, pre_a) = parse_semver(a);
     let (core_b, pre_b) = parse_semver(b);
     match core_a.cmp(&core_b) {
@@ -1421,14 +1456,14 @@ pub fn compare_semver(a: &str, b: &str) -> CmpOrdering {
             (None, None) => CmpOrdering::Equal,
             (Some(_), None) => CmpOrdering::Less,
             (None, Some(_)) => CmpOrdering::Greater,
-            (Some(pa), Some(pb)) => pa.cmp(pb),
+            (Some(pa), Some(pb)) => cmp_prerelease(pa, pb),
         },
         ord => ord,
     }
 }
 
 /// Parses a GitHub Releases `/repos/{owner}/{repo}/releases/latest` JSON payload into a
-/// `ReleaseManifestDto`, selecting the platform-appropriate installer asset and extracting
+/// `ReleaseManifestDto`, selecting the highest-priority platform installer asset (`C-5`) and extracting
 /// its explicit 64-hex `sha256:` digest (leaving `sha256` empty so `verified == false` when absent).
 pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto> {
     let v: serde_json::Value = serde_json::from_str(raw_json)
@@ -1466,7 +1501,10 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
         .unwrap_or("")
         .to_owned();
 
-    let mut chosen: Option<(String, u64, String)> = None;
+    // `(priority_rank, url, size, sha256)` — lower `priority_rank` wins so `.app.tar.gz` beats `.dmg`
+    // regardless of GitHub asset upload order (`C-5`).
+    let mut best_arch_match: Option<(usize, String, u64, String)> = None;
+    let mut best_os_match: Option<(usize, String, u64, String)> = None;
     let mut fallback: Option<(String, u64, String)> = None;
 
     if let Some(assets) = v.get("assets").and_then(serde_json::Value::as_array) {
@@ -1489,7 +1527,6 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            // Never select metadata sidecar files as installer packages (`C-2`).
             if name.ends_with(".json") || name.ends_with(".sha256") || name.ends_with(".sig") {
                 continue;
             }
@@ -1515,21 +1552,31 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
                 fallback = Some((url.to_owned(), size, asset_sha.clone()));
             }
 
-            if os_suffixes.iter().any(|ext| name.ends_with(ext)) {
+            if let Some(rank) = os_suffixes.iter().position(|ext| name.ends_with(ext)) {
                 let matches_arch = name.contains(arch_hint)
                     || (!name.contains("aarch64") && !name.contains("x86_64"));
                 if matches_arch {
-                    chosen = Some((url.to_owned(), size, asset_sha));
-                    break;
-                } else if chosen.is_none() {
-                    chosen = Some((url.to_owned(), size, asset_sha));
+                    if best_arch_match
+                        .as_ref()
+                        .map_or(true, |(r, _, _, _)| rank < *r)
+                    {
+                        best_arch_match = Some((rank, url.to_owned(), size, asset_sha));
+                    }
+                } else if best_os_match
+                    .as_ref()
+                    .map_or(true, |(r, _, _, _)| rank < *r)
+                {
+                    best_os_match = Some((rank, url.to_owned(), size, asset_sha));
                 }
             }
         }
     }
 
-    let (download_url, package_size_bytes, sha256) =
-        chosen.or(fallback).unwrap_or((html_url, 0, String::new()));
+    let (download_url, package_size_bytes, sha256) = best_arch_match
+        .or(best_os_match)
+        .map(|(_, u, s, h)| (u, s, h))
+        .or(fallback)
+        .unwrap_or((html_url, 0, String::new()));
 
     Ok(ReleaseManifestDto {
         version,
@@ -1585,7 +1632,8 @@ pub fn cleanup_all_app_artifacts(app_data_dir: &Path) -> AppResult<CleanupSummar
                 | "webview"
                 | "logs"
                 | "cache"
-        ) || (name.starts_with("audora.sqlite.") && name.ends_with(".bak"))
+        ) || (name.starts_with("audora.sqlite.")
+            && (name.ends_with(".bak") || name.ends_with(".bak.tmp")))
     }
 
     if let Ok(entries) = fs::read_dir(app_data_dir) {

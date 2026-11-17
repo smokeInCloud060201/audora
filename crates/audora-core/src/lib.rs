@@ -1376,31 +1376,66 @@ Properties:
             Ordering::Greater
         );
 
-        // `.app.tar.gz` must win over `.dmg` on macOS even when `.dmg` appears first (`C-5`).
-        #[cfg(target_os = "macos")]
-        {
-            let release_json = r#"{
-                "tag_name": "v2.0.0",
-                "assets": [
-                    {
-                        "name": "Audora_2.0.0_macos-aarch64.dmg",
-                        "browser_download_url": "https://example.com/Audora.dmg",
-                        "size": 100,
-                        "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-                    },
-                    {
-                        "name": "Audora_2.0.0_macos-aarch64.app.tar.gz",
-                        "browser_download_url": "https://example.com/Audora.app.tar.gz",
-                        "size": 90,
-                        "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
-                    }
-                ]
-            }"#;
-            let manifest = parse_github_release_json(release_json).expect("parse");
+        // Higher-priority installer suffix must win on every OS even when fallback appears first (`C-5`).
+        let release_json = r#"{
+            "tag_name": "v2.0.0",
+            "assets": [
+                {
+                    "name": "Audora_2.0.0_macos-aarch64.dmg",
+                    "browser_download_url": "https://example.com/Audora.dmg",
+                    "size": 100,
+                    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                {
+                    "name": "Audora_2.0.0_macos-aarch64.app.tar.gz",
+                    "browser_download_url": "https://example.com/Audora.app.tar.gz",
+                    "size": 90,
+                    "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                {
+                    "name": "Audora_2.0.0_windows-x86_64-portable.zip",
+                    "browser_download_url": "https://example.com/Audora-portable.zip",
+                    "size": 110,
+                    "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                },
+                {
+                    "name": "Audora_2.0.0_windows-x86_64-setup.exe",
+                    "browser_download_url": "https://example.com/Audora-setup.exe",
+                    "size": 120,
+                    "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+                },
+                {
+                    "name": "Audora_2.0.0_linux-x86_64.tar.gz",
+                    "browser_download_url": "https://example.com/Audora-linux.tar.gz",
+                    "size": 130,
+                    "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+                },
+                {
+                    "name": "Audora_2.0.0_linux-x86_64.deb",
+                    "browser_download_url": "https://example.com/Audora-linux.deb",
+                    "size": 140,
+                    "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+                }
+            ]
+        }"#;
+        let manifest = parse_github_release_json(release_json).expect("parse");
+        if cfg!(target_os = "macos") {
             assert!(manifest.download_url.ends_with(".app.tar.gz"));
             assert_eq!(
                 manifest.sha256,
                 "2222222222222222222222222222222222222222222222222222222222222222"
+            );
+        } else if cfg!(target_os = "windows") {
+            assert!(manifest.download_url.ends_with("-setup.exe"));
+            assert_eq!(
+                manifest.sha256,
+                "4444444444444444444444444444444444444444444444444444444444444444"
+            );
+        } else {
+            assert!(manifest.download_url.ends_with(".deb"));
+            assert_eq!(
+                manifest.sha256,
+                "6666666666666666666666666666666666666666666666666666666666666666"
             );
         }
 

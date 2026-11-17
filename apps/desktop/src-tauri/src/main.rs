@@ -2973,9 +2973,13 @@ mod tests {
             .is_none());
 
         allowlist.register_file(&valid_mp4);
+        allowlist.register_file(&secret_txt);
         assert!(allowlist
             .resolve_allowed_media_file(&valid_mp4.to_string_lossy())
             .is_some());
+        assert!(allowlist
+            .resolve_allowed_media_file(&secret_txt.to_string_lossy())
+            .is_none());
 
         #[cfg(unix)]
         {

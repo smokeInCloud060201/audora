@@ -2,13 +2,24 @@
 
 All notable changes to Audora are documented in this file.
 
-## [1.0.3] - 2026-11-17
+## [1.1.0] - 2026-11-17
 
-### Added & Improved
-- **Unified Relational SQLite v4 Storage (`0004_relational_unification.sql`):** All media items, timestamped notes, playlists, trusted source folders, and playback sessions now persist directly in normalized SQLite WAL tables with non-destructive legacy `app_ui_state` migration, `id`/`path` collision reconciliation, and atomic shutdown batch flushing.
-- **12-Format Pure-Rust Container Duration Prober:** Instant, offline duration discovery across `.mp4`, `.m4a`, `.m4v`, `.mov` (`mvhd` / `mehd` / `mdhd` / multi-`sidx`), `.mkv` & `.webm` (EBML `Segment` -> `Info`), `.mp3` (`Xing`/`Info`/`VBRI` + multi-frame sync verification), `.aac` (ADTS + ISO-BMFF), `.ogg` & `.opus` (BOS serial + granule framing), `.wav` (RIFF + `RF64`/`BW64` `ds64`), and `.flac` (`STREAMINFO`), with bounded-timeout CLI fallbacks on Linux.
-- **Loopback & Native Self-Updater Hardening:** Ephemeral `127.0.0.1`-only origin binding, 256-bit OS CSPRNG session tokens, OS-picker-gated two-tier media/folder allowlists with instant revocation, macOS `codesign` identity & `ditto` verification, and detached Windows Authenticode installer handoff.
-- **Playback, Drag-Drop & Accessibility Polish:** Zero-dead-zone timeline scrubbing, native OS window drag-and-drop file/folder ingestion, decode-error (`AV-104`) vs missing-file (`AV-101`) separation, modal keyboard focus traps, WCAG AA Light Minimum Mode contrast, and full CycloneDX 1.5 SBOM synchronization.
+### Added
+- **Unified Relational SQLite v4 Persistence (`0004_relational_unification.sql`):** Replaced whole-state JSON blob snapshots with O(1) indexed relational RPC mutations (`/__audora_rpc`) across `media`, `notes`, `playlists`, `playlist_items`, and `settings`, including automatic non-destructive migration from legacy `app_ui_state` (`v3`) blobs, ID/path collision reconciliation, and atomic shutdown batch flushing.
+- **Pure-Rust 12-Format Container Duration Prober:** Instant offline stream duration inspection for `.mp4`, `.m4a`, `.m4v`, `.mov` (`mvhd` / `mehd` / `mdhd` / multi-`sidx`), `.mkv` & `.webm` (EBML `Segment` → `Info`), `.mp3` (`Xing` / `Info` / `VBRI` + multi-frame sync verification), `.aac` (ADTS + ISO-BMFF), `.ogg` & `.opus` (BOS serial + granule framing), `.wav` (RIFF + `RF64`/`BW64` `ds64`), and `.flac` (`STREAMINFO`), with bounded-timeout CLI fallbacks.
+- **Native OS Drag-and-Drop & Active Playback Animations:** Direct native `wry` OS file/folder drag-and-drop ingestion into the Library and Player, plus animated equalizer/waveform indicators when tracks are actively playing.
+
+### Changed
+- **Modularized Frontend Architecture:** Extracted `PlayerStageView`, `LibraryView`, `SettingsView`, `MinimumWidgetView`, `PlaylistsSidebar`, `RightInspectorDrawer`, and `UpdateBanner` into dedicated typed view/component modules with modal keyboard focus traps and WCAG AA Light Minimum Mode contrast.
+- **Core Toolchain & Native Shell Upgrades:** Upgraded `tao` (`0.37.2`), `wry` (`0.57.2`), `rusqlite` (`0.43.0` / `libsqlite3-sys 0.40.0`), `vite` (`6.4.6`), and `vitest` (`4.1.12`), synchronizing CycloneDX 1.5 `sbom.cdx.json` and `THIRD_PARTY_NOTICES.md`.
+
+### Security
+- **Patched Bundled SQLite & Frontend Build Advisories:** Resolved `RUSTSEC-2026-0459` (`CVE-2026-119375` in `libsqlite3-sys` via SQLite `>= 3.54.1`), eliminated unmaintained `kuchikiki`/`fxhash` (`RUSTSEC-2025-0057`), and cleared all 15 npm advisories (`pnpm audit`).
+- **Loopback Server & Native Self-Updater Hardening:** Enforced ephemeral IPv4 `127.0.0.1`-only `Host`/`Origin` validation (blocking `localhost` IPv6 port shadowing and `Origin: null` iframe bypasses), 256-bit OS CSPRNG `X-Audora-Token` authentication, OS-picker-gated two-tier media/folder allowlists with immediate revocation, macOS `codesign` identity & `ditto` bundle verification, Windows Authenticode signature checks, and GitHub Sigstore SLSA build provenance attestations.
+
+### Fixed
+- **Playback, Scrubbing & Error Classification:** Eliminated timeline scrubber dead zones while dragging, preserved authoritative ISO-BMFF container durations on fragmented `.m4a` files, separated unsupported codec errors (`AV-104`) from missing-file states (`AV-101`), fixed even-length shuffle wraparound, and kept Full Mode windows freely resizable above minimum dimensions.
+- **Cross-Platform Persistence & Installer Safety:** Fixed SQLite Unicode case-insensitive search and `%`/`_` wildcard escaping, preserved corrupt databases during `PRAGMA quick_check` recovery, handled Windows open-handle SQLite cleanup (`VACUUM` + `wal_checkpoint(TRUNCATE)`) and 8.3 short-path canonicalization, and scoped NSIS uninstaller cleanup strictly to Audora-owned files.
 
 ## [0.1.0] - Initial Public Release
 

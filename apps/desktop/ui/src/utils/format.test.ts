@@ -258,30 +258,30 @@ describe("AudoraIpcClient workflows", () => {
   it("stages GitHub release JSON, prioritizes .app.tar.gz over .dmg, respects dismiss vs manual check, installs update, and cleans up app data", async () => {
     const client = new AudoraIpcClient(false);
     const initial = client.checkForUpdates();
-    expect(initial.current_version).toBe("1.0.3");
+    expect(initial.current_version).toBe("1.1.0");
     expect(initial.github_repo).toBe(DEFAULT_GITHUB_RELEASE_REPO);
     expect(initial.update_available).toBe(false);
 
     const staged = client.stageGitHubReleaseJson(
       JSON.stringify({
-        tag_name: "v1.1.0",
-        name: "Audora 1.1.0 is ready",
+        tag_name: "v1.2.0",
+        name: "Audora 1.2.0 is ready",
         body: "### Highlights\n- Native self-updater parity with **Readora**\n- Signed `Audora.app.tar.gz` bundle",
         published_at: "2026-11-12T10:00:00Z",
-        html_url: "https://github.com/smokeInCloud060201/audora/releases/tag/v1.1.0",
+        html_url: "https://github.com/smokeInCloud060201/audora/releases/tag/v1.2.0",
         assets: [
           {
-            name: "Audora_1.1.0_macos-aarch64.dmg",
+            name: "Audora_1.2.0_macos-aarch64.dmg",
             browser_download_url:
-              "https://github.com/smokeInCloud060201/audora/releases/download/v1.1.0/Audora_1.1.0_macos-aarch64.dmg",
+              "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_macos-aarch64.dmg",
             size: 18_000_000,
             digest:
               "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           },
           {
-            name: "Audora_1.1.0_macos-aarch64.app.tar.gz",
+            name: "Audora_1.2.0_macos-aarch64.app.tar.gz",
             browser_download_url:
-              "https://github.com/smokeInCloud060201/audora/releases/download/v1.1.0/Audora_1.1.0_macos-aarch64.app.tar.gz",
+              "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_macos-aarch64.app.tar.gz",
             size: 16_777_216,
             digest:
               "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
@@ -290,25 +290,25 @@ describe("AudoraIpcClient workflows", () => {
       }),
     );
     expect(staged.update_available).toBe(true);
-    expect(staged.latest_version).toBe("1.1.0");
+    expect(staged.latest_version).toBe("1.2.0");
     expect(staged.verified).toBe(true);
     expect(staged.download_url).toContain(".app.tar.gz");
     expect(staged.sha256_checksum).toBe(
       "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     );
 
-    const dismissed = client.dismissUpdate("1.1.0");
+    const dismissed = client.dismissUpdate("1.2.0");
     expect(dismissed.update_available).toBe(false);
     expect(client.checkForUpdates(true).update_available).toBe(true);
 
-    const { status } = await client.installNativeUpdate("1.1.0");
-    expect(status.current_version).toBe("1.1.0");
+    const { status } = await client.installNativeUpdate("1.2.0");
+    expect(status.current_version).toBe("1.2.0");
     expect(status.staged_for_restart).toBe(true);
-    expect(client.getCurrentVersion()).toBe("1.1.0");
+    expect(client.getCurrentVersion()).toBe("1.2.0");
 
     const cleanup = client.cleanupApplicationData();
     expect(cleanup.removed_paths.length).toBeGreaterThan(0);
-    expect(client.getCurrentVersion()).toBe("1.0.3");
+    expect(client.getCurrentVersion()).toBe("1.1.0");
     expect("github_release_repo" in client.getSettings()).toBe(false);
   });
 

@@ -707,24 +707,24 @@ Properties:
         let db_path = temp.path().join("audora.sqlite");
         let dispatcher = build_production_dispatcher(&db_path).expect("dispatcher");
 
-        // 1. Initial check reports 1.0.3 with no update available and default GitHub repo.
+        // 1. Initial check reports 1.1.0 with no update available and default GitHub repo.
         let initial = dispatcher.check_for_updates().expect("initial check");
-        assert_eq!(initial.current_version, "1.0.3");
+        assert_eq!(initial.current_version, "1.1.0");
         assert_eq!(initial.github_repo, "smokeInCloud060201/audora");
         assert!(!initial.update_available);
         assert!(initial.verified);
 
-        // 2. Stage a GitHub Releases `/releases/latest` JSON payload for v1.1.0.
+        // 2. Stage a GitHub Releases `/releases/latest` JSON payload for v1.2.0.
         let github_json = r#"{
-            "tag_name": "v1.1.0",
-            "name": "Audora 1.1.0 — Signed & Notarized Release",
+            "tag_name": "v1.2.0",
+            "name": "Audora 1.2.0 — Signed & Notarized Release",
             "body": "- Added macOS Developer ID & ad-hoc bundle signing\n- Added native self-updater",
             "published_at": "2026-11-12T10:00:00Z",
-            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v1.1.0",
+            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v1.2.0",
             "assets": [
                 {
-                    "name": "Audora_1.1.0_macos-aarch64.dmg",
-                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.1.0/Audora_1.1.0_macos-aarch64.dmg",
+                    "name": "Audora_1.2.0_macos-aarch64.dmg",
+                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_macos-aarch64.dmg",
                     "size": 18452992,
                     "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 }
@@ -735,25 +735,25 @@ Properties:
             .stage_github_release_json(github_json)
             .expect("stage github release json");
         assert!(staged.update_available);
-        assert_eq!(staged.latest_version, "1.1.0");
+        assert_eq!(staged.latest_version, "1.2.0");
         assert!(staged.verified);
         assert_eq!(
             staged.sha256_checksum,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
 
-        // 3. Dismissing v1.1.0 suppresses `update_available` on automatic startup checks,
+        // 3. Dismissing v1.2.0 suppresses `update_available` on automatic startup checks,
         //    while manual checks (`include_dismissed = true`) still surface it.
-        let dismissed = dispatcher.dismiss_update("1.1.0").expect("dismiss update");
+        let dismissed = dispatcher.dismiss_update("1.2.0").expect("dismiss update");
         assert!(!dismissed.update_available);
         let manual_check = dispatcher
             .check_for_updates_with_options(true)
             .expect("manual check including dismissed");
         assert!(manual_check.update_available);
 
-        // 4. Installing v1.1.0 marks `current_version = 1.1.0` and `staged_for_restart = true`.
-        let installed = dispatcher.install_update("1.1.0").expect("install update");
-        assert_eq!(installed.current_version, "1.1.0");
+        // 4. Installing v1.2.0 marks `current_version = 1.2.0` and `staged_for_restart = true`.
+        let installed = dispatcher.install_update("1.2.0").expect("install update");
+        assert_eq!(installed.current_version, "1.2.0");
         assert!(!installed.update_available);
         assert!(installed.staged_for_restart);
 

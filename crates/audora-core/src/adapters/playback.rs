@@ -205,6 +205,7 @@ impl PlaybackBackend for FakePlaybackBackend {
 /// inspection when GStreamer CLI binaries are not in `PATH`.
 pub struct GStreamerBackend {
     discoverer_bin: Option<PathBuf>,
+    ffprobe_bin: Option<PathBuf>,
     state: Mutex<RuntimePlayerState>,
 }
 
@@ -217,20 +218,39 @@ impl Default for GStreamerBackend {
 impl GStreamerBackend {
     #[must_use]
     pub fn new() -> Self {
-        let discoverer_bin = Self::locate_discoverer_binary();
+        let discoverer_bin = Self::locate_binary(
+            if cfg!(target_os = "windows") {
+                "gst-discoverer-1.0.exe"
+            } else {
+                "gst-discoverer-1.0"
+            },
+            &[
+                "/Library/Frameworks/GStreamer.framework/Versions/1.0/bin/gst-discoverer-1.0",
+                "/opt/homebrew/bin/gst-discoverer-1.0",
+                "/usr/local/bin/gst-discoverer-1.0",
+                "/usr/bin/gst-discoverer-1.0",
+            ],
+        );
+        let ffprobe_bin = Self::locate_binary(
+            if cfg!(target_os = "windows") {
+                "ffprobe.exe"
+            } else {
+                "ffprobe"
+            },
+            &[
+                "/opt/homebrew/bin/ffprobe",
+                "/usr/local/bin/ffprobe",
+                "/usr/bin/ffprobe",
+            ],
+        );
         Self {
             discoverer_bin,
+            ffprobe_bin,
             state: Mutex::new(RuntimePlayerState::default()),
         }
     }
 
-    fn locate_discoverer_binary() -> Option<PathBuf> {
-        let bin_name = if cfg!(target_os = "windows") {
-            "gst-discoverer-1.0.exe"
-        } else {
-            "gst-discoverer-1.0"
-        };
-
+    fn locate_binary(bin_name: &str, static_candidates: &[&str]) -> Option<PathBuf> {
         if let Some(path_os) = env::var_os("PATH") {
             for dir in env::split_paths(&path_os) {
                 let candidate = dir.join(bin_name);
@@ -239,20 +259,12 @@ impl GStreamerBackend {
                 }
             }
         }
-
-        let static_candidates = [
-            "/Library/Frameworks/GStreamer.framework/Versions/1.0/bin/gst-discoverer-1.0",
-            "/opt/homebrew/bin/gst-discoverer-1.0",
-            "/usr/local/bin/gst-discoverer-1.0",
-            "/usr/bin/gst-discoverer-1.0",
-        ];
         for cand in static_candidates {
             let p = PathBuf::from(cand);
             if p.is_file() {
                 return Some(p);
             }
         }
-
         None
     }
 
@@ -361,6 +373,32 @@ impl PlaybackBackend for GStreamerBackend {
                 }
                 Err(err) => {
                     tracing::debug!("gst-discoverer invocation skipped: {err}");
+                }
+            }
+        }
+
+        if ext_meta.duration_ms.is_none() {
+            if let Some(ref ffprobe) = self.ffprobe_bin {
+                if let Ok(out) = Command::new(ffprobe)
+                    .args([
+                        "-v",
+                        "quiet",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                    ])
+                    .arg(path)
+                    .output()
+                {
+                    if out.status.success() {
+                        if let Ok(secs) = String::from_utf8_lossy(&out.stdout).trim().parse::<f64>()
+                        {
+                            if secs.is_finite() && secs > 0.0 {
+                                ext_meta.duration_ms = Some((secs * 1_000.0).round() as u64);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -526,7 +564,8 @@ fn parse_gst_duration_ms(raw: &str) -> Option<u64> {
     )
 }
 
-/// Probes real container duration (`ISO BMFF` `mvhd`, `WAV`, `FLAC`) without external binaries.
+/// Probes real container duration (`ISO BMFF` `mvhd`/`sidx`, `MKV`/`WebM` EBML, `MP3` Xing/VBRI/CBR,
+/// `Ogg` Opus/Vorbis, `WAV` RIFF, `FLAC` STREAMINFO) in pure Rust without external binaries.
 pub fn probe_container_duration_ms(path: &Path) -> Option<u64> {
     let ext = path
         .extension()
@@ -540,6 +579,9 @@ pub fn probe_container_duration_ms(path: &Path) -> Option<u64> {
     }
     match ext.as_str() {
         "mp4" | "m4a" | "m4v" | "mov" => probe_isobmff_mvhd_ms(&mut file, len),
+        "mkv" | "webm" => probe_ebml_ms(&mut file, len),
+        "mp3" => probe_mp3_ms(&mut file, len),
+        "ogg" | "opus" => probe_ogg_ms(&mut file, len),
         "wav" => probe_wav_ms(&mut file, len),
         "flac" => probe_flac_ms(&mut file, len),
         _ => None,
@@ -583,11 +625,14 @@ fn read_box_hdr(file: &mut File, pos: u64, limit: u64) -> Option<([u8; 4], u64, 
 
 fn probe_isobmff_mvhd_ms(file: &mut File, file_len: u64) -> Option<u64> {
     let mut pos = 0_u64;
+    let mut sidx_fallback_ms: Option<u64> = None;
     for _ in 0..256 {
         if pos >= file_len {
             break;
         }
-        let (btype, bsz, hlen) = read_box_hdr(file, pos, file_len)?;
+        let Some((btype, bsz, hlen)) = read_box_hdr(file, pos, file_len) else {
+            break;
+        };
         if &btype == b"moov" {
             let moov_end = pos.saturating_add(bsz);
             let mut cpos = pos.saturating_add(hlen);
@@ -635,8 +680,362 @@ fn probe_isobmff_mvhd_ms(file: &mut File, file_len: u64) -> Option<u64> {
                 }
                 cpos = cpos.saturating_add(csz);
             }
+        } else if &btype == b"sidx" && sidx_fallback_ms.is_none() {
+            let plen = bsz.saturating_sub(hlen);
+            if (24..=2_097_152).contains(&plen) {
+                let mut buf = vec![0_u8; plen as usize];
+                if read_at(file, pos.saturating_add(hlen), &mut buf) {
+                    let ver = buf[0];
+                    let ts = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                    let off_entries = if ver == 0 { 20_usize } else { 28_usize };
+                    if ts > 0 && buf.len() >= off_entries + 4 {
+                        let ref_count =
+                            u16::from_be_bytes([buf[off_entries + 2], buf[off_entries + 3]])
+                                as usize;
+                        let table_start = off_entries + 4;
+                        if buf.len() >= table_start.saturating_add(ref_count.saturating_mul(12)) {
+                            let mut total_dur = 0_u64;
+                            for idx in 0..ref_count {
+                                let off = table_start + idx * 12 + 4;
+                                let sub = u32::from_be_bytes([
+                                    buf[off],
+                                    buf[off + 1],
+                                    buf[off + 2],
+                                    buf[off + 3],
+                                ]);
+                                total_dur = total_dur.saturating_add(u64::from(sub));
+                            }
+                            if total_dur > 0 {
+                                let ms = (u128::from(total_dur) * 1_000) / u128::from(ts);
+                                sidx_fallback_ms = u64::try_from(ms).ok().filter(|&v| v > 0);
+                            }
+                        }
+                    }
+                }
+            }
         }
         pos = pos.saturating_add(bsz);
+    }
+    sidx_fallback_ms
+}
+
+fn read_ebml_vint(buf: &[u8], pos: usize, strip_marker: bool) -> Option<(u64, usize)> {
+    let first = *buf.get(pos)?;
+    if first == 0 {
+        return None;
+    }
+    let len = (first.leading_zeros() as usize) + 1;
+    if len > 8 || pos.checked_add(len)? > buf.len() {
+        return None;
+    }
+    let mask = if strip_marker {
+        (1_u8 << (8 - len)).wrapping_sub(1)
+    } else {
+        0xFF
+    };
+    let mut val = u64::from(first & mask);
+    for &b in &buf[pos + 1..pos + len] {
+        val = (val << 8) | u64::from(b);
+    }
+    Some((val, len))
+}
+
+fn probe_ebml_ms(file: &mut File, file_len: u64) -> Option<u64> {
+    if file_len < 32 {
+        return None;
+    }
+    let head_len = (file_len as usize).min(262_144);
+    let mut buf = vec![0_u8; head_len];
+    if !read_at(file, 0, &mut buf) || &buf[..4] != b"\x1A\x45\xDF\xA3" {
+        return None;
+    }
+    // Skip EBML Header element (`0x1A45DFA3`)
+    let (hdr_sz, hdr_vlen) = read_ebml_vint(&buf, 4, true)?;
+    let mut pos = 4_usize
+        .checked_add(hdr_vlen)?
+        .checked_add(hdr_sz as usize)?;
+    while pos < buf.len() {
+        let (eid, id_len) = read_ebml_vint(&buf, pos, false)?;
+        let (esz, sz_len) = read_ebml_vint(&buf, pos + id_len, true)?;
+        let payload_start = pos + id_len + sz_len;
+        if eid == 0x1853_8067 {
+            // Matroska Segment: scan top-level Segment children for Info (`0x1549A966`)
+            let mut spos = payload_start;
+            while spos < buf.len() {
+                let Some((cid, cid_len)) = read_ebml_vint(&buf, spos, false) else {
+                    break;
+                };
+                let Some((csz, csz_len)) = read_ebml_vint(&buf, spos + cid_len, true) else {
+                    break;
+                };
+                let cstart = spos + cid_len + csz_len;
+                let cend = cstart.saturating_add(csz as usize).min(buf.len());
+                if cid == 0x1549_A966 {
+                    let mut ts_scale: u64 = 1_000_000; // default 1ms in nanoseconds
+                    let mut duration_ticks: Option<f64> = None;
+                    let mut ipos = cstart;
+                    while ipos < cend {
+                        let Some((iid, iid_len)) = read_ebml_vint(&buf, ipos, false) else {
+                            break;
+                        };
+                        let Some((isz, isz_len)) = read_ebml_vint(&buf, ipos + iid_len, true)
+                        else {
+                            break;
+                        };
+                        let istart = ipos + iid_len + isz_len;
+                        let isz_usize = isz as usize;
+                        if istart.saturating_add(isz_usize) > cend {
+                            break;
+                        }
+                        if iid == 0x2AD7B1 && (1..=8).contains(&isz_usize) {
+                            let mut v = 0_u64;
+                            for &b in &buf[istart..istart + isz_usize] {
+                                v = (v << 8) | u64::from(b);
+                            }
+                            if v > 0 {
+                                ts_scale = v;
+                            }
+                        } else if iid == 0x4489 {
+                            if isz_usize == 4 {
+                                let f = f32::from_be_bytes([
+                                    buf[istart],
+                                    buf[istart + 1],
+                                    buf[istart + 2],
+                                    buf[istart + 3],
+                                ]);
+                                duration_ticks = Some(f64::from(f));
+                            } else if isz_usize == 8 {
+                                let f = f64::from_be_bytes([
+                                    buf[istart],
+                                    buf[istart + 1],
+                                    buf[istart + 2],
+                                    buf[istart + 3],
+                                    buf[istart + 4],
+                                    buf[istart + 5],
+                                    buf[istart + 6],
+                                    buf[istart + 7],
+                                ]);
+                                duration_ticks = Some(f);
+                            }
+                        }
+                        ipos = istart + isz_usize;
+                    }
+                    if let Some(ticks) = duration_ticks {
+                        if ticks.is_finite() && ticks > 0.0 {
+                            let ms = (ticks * (ts_scale as f64)) / 1_000_000.0;
+                            if ms.is_finite() && ms >= 1.0 {
+                                return Some(ms.round() as u64);
+                            }
+                        }
+                    }
+                    return None;
+                }
+                if csz as usize > buf.len() {
+                    break;
+                }
+                spos = cend;
+            }
+            break;
+        }
+        pos = payload_start.saturating_add(esz as usize);
+    }
+    None
+}
+
+fn probe_mp3_ms(file: &mut File, file_len: u64) -> Option<u64> {
+    if file_len < 16 {
+        return None;
+    }
+    let mut id3 = [0_u8; 10];
+    let mut audio_offset = 0_u64;
+    if read_at(file, 0, &mut id3) && &id3[0..3] == b"ID3" {
+        let tag_sz = ((u64::from(id3[6] & 0x7F)) << 21)
+            | ((u64::from(id3[7] & 0x7F)) << 14)
+            | ((u64::from(id3[8] & 0x7F)) << 7)
+            | u64::from(id3[9] & 0x7F);
+        let footer = if (id3[5] & 0x10) != 0 { 10_u64 } else { 0_u64 };
+        audio_offset = 10_u64.saturating_add(tag_sz).saturating_add(footer);
+    }
+    if audio_offset >= file_len {
+        return None;
+    }
+    let scan_len = (file_len.saturating_sub(audio_offset) as usize).min(16_384);
+    let mut buf = vec![0_u8; scan_len];
+    if !read_at(file, audio_offset, &mut buf) {
+        return None;
+    }
+
+    const BITRATES_V1_L3: [u32; 16] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+    ];
+    const BITRATES_V2_L3: [u32; 16] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+    ];
+
+    for idx in 0..buf.len().saturating_sub(4) {
+        let b0 = buf[idx];
+        let b1 = buf[idx + 1];
+        if b0 != 0xFF || (b1 & 0xE0) != 0xE0 {
+            continue;
+        }
+        let version_id = (b1 >> 3) & 0x03;
+        let layer_id = (b1 >> 1) & 0x03;
+        // Layer III is `0b01`; version `0b01` is reserved
+        if version_id == 1 || layer_id != 1 {
+            continue;
+        }
+        let b2 = buf[idx + 2];
+        let b3 = buf[idx + 3];
+        let br_idx = ((b2 >> 4) & 0x0F) as usize;
+        let sr_idx = ((b2 >> 2) & 0x03) as usize;
+        if br_idx == 0 || br_idx == 15 || sr_idx == 3 {
+            continue;
+        }
+        let sample_rate: u32 = match (version_id, sr_idx) {
+            (3, 0) => 44_100,
+            (3, 1) => 48_000,
+            (3, 2) => 32_000,
+            (2, 0) => 22_050,
+            (2, 1) => 24_000,
+            (2, 2) => 16_000,
+            (0, 0) => 11_025,
+            (0, 1) => 12_000,
+            (0, 2) => 8_000,
+            _ => continue,
+        };
+        let kbps = if version_id == 3 {
+            BITRATES_V1_L3[br_idx]
+        } else {
+            BITRATES_V2_L3[br_idx]
+        };
+        if kbps == 0 {
+            continue;
+        }
+        let samples_per_frame: u64 = if version_id == 3 { 1_152 } else { 576 };
+        let is_mono = ((b3 >> 6) & 0x03) == 3;
+        let side_info_len: usize = match (version_id == 3, is_mono) {
+            (true, true) => 17,
+            (true, false) => 32,
+            (false, true) => 9,
+            (false, false) => 17,
+        };
+
+        // 1. Check Xing / Info VBR frame count header
+        let xing_off = idx + 4 + side_info_len;
+        if xing_off + 12 <= buf.len()
+            && (&buf[xing_off..xing_off + 4] == b"Xing" || &buf[xing_off..xing_off + 4] == b"Info")
+        {
+            let flags = u32::from_be_bytes([
+                buf[xing_off + 4],
+                buf[xing_off + 5],
+                buf[xing_off + 6],
+                buf[xing_off + 7],
+            ]);
+            if (flags & 0x01) != 0 {
+                let frames = u32::from_be_bytes([
+                    buf[xing_off + 8],
+                    buf[xing_off + 9],
+                    buf[xing_off + 10],
+                    buf[xing_off + 11],
+                ]);
+                if frames > 0 {
+                    let ms = (u128::from(frames) * u128::from(samples_per_frame) * 1_000)
+                        / u128::from(sample_rate);
+                    return u64::try_from(ms).ok().filter(|&v| v > 0);
+                }
+            }
+        }
+
+        // 2. Check Fraunhofer VBRI header at fixed offset +36
+        let vbri_off = idx + 4 + 32;
+        if vbri_off + 18 <= buf.len() && &buf[vbri_off..vbri_off + 4] == b"VBRI" {
+            let frames = u32::from_be_bytes([
+                buf[vbri_off + 14],
+                buf[vbri_off + 15],
+                buf[vbri_off + 16],
+                buf[vbri_off + 17],
+            ]);
+            if frames > 0 {
+                let ms = (u128::from(frames) * u128::from(samples_per_frame) * 1_000)
+                    / u128::from(sample_rate);
+                return u64::try_from(ms).ok().filter(|&v| v > 0);
+            }
+        }
+
+        // 3. Constant-bitrate (CBR) duration from audio payload size
+        let mut tail_tag = 0_u64;
+        if file_len >= 128 {
+            let mut t = [0_u8; 3];
+            if read_at(file, file_len - 128, &mut t) && &t == b"TAG" {
+                tail_tag = 128;
+            }
+        }
+        let audio_bytes = file_len
+            .saturating_sub(audio_offset + idx as u64)
+            .saturating_sub(tail_tag);
+        let ms = (u128::from(audio_bytes) * 8) / u128::from(kbps);
+        return u64::try_from(ms).ok().filter(|&v| v > 0);
+    }
+
+    None
+}
+
+fn probe_ogg_ms(file: &mut File, file_len: u64) -> Option<u64> {
+    if file_len < 48 {
+        return None;
+    }
+    let head_len = (file_len as usize).min(512);
+    let mut head = vec![0_u8; head_len];
+    if !read_at(file, 0, &mut head) || &head[0..4] != b"OggS" {
+        return None;
+    }
+    let seg_count = *head.get(26)? as usize;
+    let pkt_start = 27_usize.checked_add(seg_count)?;
+    if pkt_start + 16 > head.len() {
+        return None;
+    }
+    let (sample_rate, pre_skip): (u32, u64) = if &head[pkt_start..pkt_start + 8] == b"OpusHead" {
+        let skip = u16::from_le_bytes([head[pkt_start + 10], head[pkt_start + 11]]);
+        (48_000, u64::from(skip))
+    } else if &head[pkt_start..pkt_start + 7] == b"\x01vorbis" {
+        let sr = u32::from_le_bytes([
+            head[pkt_start + 12],
+            head[pkt_start + 13],
+            head[pkt_start + 14],
+            head[pkt_start + 15],
+        ]);
+        (sr, 0)
+    } else {
+        return None;
+    };
+    if sample_rate == 0 {
+        return None;
+    }
+
+    let tail_len = (file_len as usize).min(65_536);
+    let tail_pos = file_len.saturating_sub(tail_len as u64);
+    let mut tail = vec![0_u8; tail_len];
+    if !read_at(file, tail_pos, &mut tail) {
+        return None;
+    }
+    for i in (0..=tail.len().saturating_sub(14)).rev() {
+        if &tail[i..i + 4] == b"OggS" && tail[i + 4] == 0 {
+            let granule = u64::from_le_bytes([
+                tail[i + 6],
+                tail[i + 7],
+                tail[i + 8],
+                tail[i + 9],
+                tail[i + 10],
+                tail[i + 11],
+                tail[i + 12],
+                tail[i + 13],
+            ]);
+            if granule != u64::MAX && granule > pre_skip {
+                let samples = granule - pre_skip;
+                let ms = (u128::from(samples) * 1_000) / u128::from(sample_rate);
+                return u64::try_from(ms).ok().filter(|&v| v > 0);
+            }
+        }
     }
     None
 }

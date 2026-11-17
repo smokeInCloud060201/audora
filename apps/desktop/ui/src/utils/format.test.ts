@@ -244,6 +244,7 @@ describe("AudoraIpcClient workflows", () => {
     expect(backupPath).toContain(".sqlite.manual.bak");
 
     const report = client.generateDiagnosticReport();
+    expect(report.schema_version).toBe(4);
     expect(report.media_count).toBe(2);
     expect(report.missing_media_count).toBe(1);
     expect(report.total_note_count).toBe(1);

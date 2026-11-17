@@ -86,7 +86,7 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::persistence::{
         MigrationSpec, MIGRATION_0001_INITIAL_SQL, MIGRATION_0002_PLAYLISTS_SQL,
-        MIGRATION_0003_UI_STATE_SQL,
+        MIGRATION_0003_UI_STATE_SQL, MIGRATION_0004_RELATIONAL_UNIFICATION_SQL,
     };
 
     fn create_dummy_media_file(dir: &TempDir, name: &str, contents: &[u8]) -> std::path::PathBuf {
@@ -117,7 +117,7 @@ mod tests {
                 .expect("create note");
         }
 
-        // 2. Attempt to upgrade with a faulty v4 migration on top of v1 + v2 + v3.
+        // 2. Attempt to upgrade with a faulty v5 migration on top of v1..v4.
         let faulty_migrations = [
             MigrationSpec {
                 version: 1,
@@ -136,7 +136,12 @@ mod tests {
             },
             MigrationSpec {
                 version: 4,
-                name: "0004_broken",
+                name: "0004_relational_unification",
+                sql: MIGRATION_0004_RELATIONAL_UNIFICATION_SQL,
+            },
+            MigrationSpec {
+                version: 5,
+                name: "0005_broken",
                 sql: "ALTER TABLE notes ADD COLUMN valid_col TEXT; INVALID SQL SYNTAX HERE;",
             },
         ];
@@ -146,17 +151,17 @@ mod tests {
         let err = result.err().expect("error");
         assert_eq!(err.code(), ErrorCode::PersistenceFailure);
 
-        // 3. Verify that the pre-migration backup file was created before v4 ran.
-        let expected_backup = db_path.with_extension("sqlite.pre-v3.bak");
+        // 3. Verify that the pre-migration backup file was created before v5 ran.
+        let expected_backup = db_path.with_extension("sqlite.pre-v4.bak");
         assert!(
             expected_backup.exists(),
             "pre-migration backup file must exist at {}",
             expected_backup.display()
         );
 
-        // 4. Verify the original database rolled back cleanly to v3 and kept the note!
-        let recovered_db = Database::open(&db_path).expect("reopen rolled-back v3 db");
-        assert_eq!(recovered_db.schema_version().expect("version"), 3);
+        // 4. Verify the original database rolled back cleanly to v4 and kept the note!
+        let recovered_db = Database::open(&db_path).expect("reopen rolled-back v4 db");
+        assert_eq!(recovered_db.schema_version().expect("version"), 4);
         let notes_repo = SqliteNotesRepository::new(recovered_db.clone());
         let media_repo = SqliteMediaRepository::new(recovered_db);
         let items = media_repo
@@ -540,6 +545,7 @@ Properties:
                     display_name: "backup_test.mp4".to_owned(),
                     media_kind: MediaKind::Video,
                     duration_ms: Some(120_000),
+                    duration_probed: true,
                     last_position_ms: 0,
                     completed: false,
                     file_size_bytes: Some(1024),
@@ -549,6 +555,7 @@ Properties:
                     last_opened_at: Some("1".to_owned()),
                     last_seen_at: "1".to_owned(),
                     note_count: 0,
+                    source_folder_id: None,
                 })
                 .expect("upsert media");
             notes_repo
@@ -857,17 +864,71 @@ Properties:
     fn sqlite_ui_state_snapshot_persists_backs_up_and_clears_atomically() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("audora.sqlite");
-        let (_, db) = build_production_dispatcher_with_db(&db_path).expect("open db");
+        let (dispatcher, db) = build_production_dispatcher_with_db(&db_path).expect("open db");
 
-        assert_eq!(db.schema_version().expect("schema v3"), 3);
+        assert_eq!(db.schema_version().expect("schema v4"), 4);
         assert_eq!(db.get_ui_state_json().expect("empty state"), None);
 
-        let sample = r#"{"media":[],"notes":[],"playlists":[],"settings":{"theme":"dark"}}"#;
-        db.set_ui_state_json(sample).expect("persist ui state");
-        assert_eq!(
-            db.get_ui_state_json().expect("read ui state").as_deref(),
-            Some(sample)
-        );
+        let sample = r#"{
+            "media": [{
+                "id": "med_rel_1",
+                "path": "/tmp/rel_track.mp3",
+                "display_name": "rel_track.mp3",
+                "media_kind": "audio",
+                "duration_ms": 90000,
+                "duration_probed": true,
+                "last_position_ms": 12000,
+                "completed": false,
+                "file_size_bytes": 4096,
+                "fingerprint": null,
+                "availability": "available",
+                "added_at": "1",
+                "last_opened_at": "1",
+                "last_seen_at": "1",
+                "note_count": 1,
+                "source_folder_id": "src_1"
+            }],
+            "notes": [{
+                "id": "note_rel_1",
+                "media_id": "med_rel_1",
+                "position_ms": 5000,
+                "is_quick_marker": false,
+                "body": "Stored in normalized relational notes table",
+                "created_at": "1",
+                "updated_at": "1"
+            }],
+            "playlists": [{
+                "id": "pl_rel_1",
+                "name": "Relational Playlist",
+                "description": "",
+                "item_ids": ["med_rel_1"],
+                "created_at": "1",
+                "updated_at": "1"
+            }],
+            "settings": { "theme": "light" }
+        }"#;
+        db.set_ui_state_json(sample)
+            .expect("persist relational state");
+
+        // Verify diagnostic report in Rust sees real relational rows directly (`C-6`)!
+        let diag = dispatcher
+            .generate_diagnostic_report()
+            .expect("diagnostic report");
+        assert_eq!(diag.schema_version, 4);
+        assert_eq!(diag.media_count, 1);
+        assert_eq!(diag.total_note_count, 1);
+        assert_eq!(diag.playlist_count, 1);
+
+        // Test O(1) indexed RPC progress update
+        db.rpc_update_progress("med_rel_1", 45_000, true, None)
+            .expect("rpc update progress");
+        let exported = db
+            .export_relational_state()
+            .expect("export")
+            .expect("non-empty");
+        assert_eq!(exported.media[0].last_position_ms, 45_000);
+        assert!(exported.media[0].completed);
+        assert_eq!(exported.media[0].source_folder_id.as_deref(), Some("src_1"));
 
         let backup_path = db
             .create_manual_backup()
@@ -877,6 +938,73 @@ Properties:
 
         db.clear_ui_state().expect("clear ui state");
         assert_eq!(db.get_ui_state_json().expect("cleared"), None);
+    }
+
+    #[test]
+    fn pure_rust_container_prober_parses_webm_ebml_mp3_xing_and_ogg_opus() {
+        use crate::adapters::probe_container_duration_ms;
+
+        let temp = TempDir::new().expect("tempdir");
+
+        // 1. Synthetic WebM / Matroska EBML header + Segment + Info (TimestampScale=1_000_000, Duration=12500.0f64 -> 12_500ms)
+        let mut webm = Vec::new();
+        webm.extend_from_slice(&[0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01]); // EBML Header (4 bytes payload)
+        let mut info_payload = Vec::new();
+        info_payload.extend_from_slice(&[0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]); // TimestampScale = 1_000_000
+        info_payload.extend_from_slice(&[0x44, 0x89, 0x88]); // Duration (8-byte float)
+        info_payload.extend_from_slice(&(12_500.0_f64).to_be_bytes());
+        let mut segment_payload = Vec::new();
+        segment_payload.extend_from_slice(&[
+            0x15,
+            0x49,
+            0xA9,
+            0x66,
+            0x80 | (info_payload.len() as u8),
+        ]);
+        segment_payload.extend_from_slice(&info_payload);
+        webm.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x80 | (segment_payload.len() as u8)]);
+        webm.extend_from_slice(&segment_payload);
+        webm.resize(64, 0);
+        let webm_path = create_dummy_media_file(&temp, "clip.webm", &webm);
+        assert_eq!(probe_container_duration_ms(&webm_path), Some(12_500));
+
+        // 2. Synthetic MP3 MPEG-1 Layer III 44.1kHz Stereo frame with Xing VBR header (1000 frames -> 26_122 ms)
+        let mut mp3 = vec![0_u8; 256];
+        // Frame sync: MPEG-1 (11), Layer III (01), no CRC (1) -> 0xFF 0xFB; 128kbps (1001), 44.1kHz (00) -> 0x90; Stereo (00) -> 0x00
+        mp3[0] = 0xFF;
+        mp3[1] = 0xFB;
+        mp3[2] = 0x90;
+        mp3[3] = 0x00;
+        // Side info for MPEG-1 stereo = 32 bytes -> Xing at offset 36
+        mp3[36..40].copy_from_slice(b"Xing");
+        mp3[40..44].copy_from_slice(&1_u32.to_be_bytes()); // frames flag
+        mp3[44..48].copy_from_slice(&1_000_u32.to_be_bytes()); // 1000 frames * 1152 / 44100 = 26_122 ms
+        let mp3_path = create_dummy_media_file(&temp, "song.mp3", &mp3);
+        assert_eq!(probe_container_duration_ms(&mp3_path), Some(26_122));
+
+        // 3. Synthetic Ogg Opus (OpusHead pre_skip = 312, final OggS granule = 480_312 -> 480_000 / 48_000 = 10_000 ms)
+        let mut opus = Vec::new();
+        // Page 1: OggS header (27 bytes + 1 segment of 19 bytes)
+        opus.extend_from_slice(b"OggS\x00\x02");
+        opus.extend_from_slice(&0_u64.to_le_bytes());
+        opus.extend_from_slice(&1_u32.to_le_bytes());
+        opus.extend_from_slice(&0_u32.to_le_bytes());
+        opus.extend_from_slice(&0_u32.to_le_bytes());
+        opus.push(1);
+        opus.push(19);
+        opus.extend_from_slice(b"OpusHead\x01\x02");
+        opus.extend_from_slice(&312_u16.to_le_bytes());
+        opus.extend_from_slice(&48_000_u32.to_le_bytes());
+        opus.extend_from_slice(&[0, 0, 0]);
+        // Page 2: Final OggS page with granule_position = 480_312
+        opus.extend_from_slice(b"OggS\x00\x04");
+        opus.extend_from_slice(&480_312_u64.to_le_bytes());
+        opus.extend_from_slice(&1_u32.to_le_bytes());
+        opus.extend_from_slice(&1_u32.to_le_bytes());
+        opus.extend_from_slice(&0_u32.to_le_bytes());
+        opus.push(0);
+        let opus_path = create_dummy_media_file(&temp, "voice.opus", &opus);
+        assert_eq!(probe_container_duration_ms(&opus_path), Some(10_000));
     }
 
     #[test]
@@ -1006,5 +1134,131 @@ Properties:
             user_doc.is_file(),
             "unrelated user files must never be deleted by cleanup"
         );
+    }
+
+    #[test]
+    fn v3_ui_state_blob_automatically_migrates_into_v4_relational_tables_with_zero_data_loss() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora_legacy_v3.sqlite");
+
+        // 1. Open database at v3 schema (`0001`..`0003`) and write a legacy `app_ui_state` (`v2`) JSON blob.
+        let v3_migrations = &crate::persistence::db::BUILTIN_MIGRATIONS[..3];
+        let v3_db = Database::open_with_migrations(&db_path, v3_migrations).expect("open v3 db");
+        assert_eq!(v3_db.schema_version().expect("v3 schema"), 3);
+
+        let legacy_blob = r#"{
+            "media": [{
+                "id": "med_legacy_1",
+                "path": "/tmp/Legacy_Session.flac",
+                "display_name": "Legacy_Session.flac",
+                "media_kind": "audio",
+                "duration_ms": 240000,
+                "last_position_ms": 95000,
+                "completed": false,
+                "file_size_bytes": 8192,
+                "fingerprint": null,
+                "availability": "available",
+                "added_at": "Yesterday",
+                "last_opened_at": "Yesterday",
+                "last_seen_at": "Yesterday",
+                "note_count": 1,
+                "source_folder_id": "src_legacy"
+            }],
+            "notes": [{
+                "id": "note_legacy_1",
+                "media_id": "med_legacy_1",
+                "position_ms": 95000,
+                "is_quick_marker": false,
+                "body": "Migrated seamlessly from v3 JSON blob to v4 relational row",
+                "created_at": "Yesterday",
+                "updated_at": "Yesterday"
+            }],
+            "playlists": [{
+                "id": "pl_legacy_1",
+                "name": "Legacy Favorites",
+                "description": "Upgraded playlist",
+                "item_ids": ["med_legacy_1"],
+                "created_at": "Yesterday",
+                "updated_at": "Yesterday"
+            }],
+            "settings": {
+                "theme": "dark",
+                "default_playback_speed": 1.25,
+                "source_folders": [{
+                    "id": "src_legacy",
+                    "path": "/tmp/Music",
+                    "label": "Music",
+                    "enabled": true,
+                    "added_at": "Yesterday",
+                    "last_scanned_at": "Yesterday",
+                    "media_count": 1
+                }]
+            },
+            "playback_session": {
+                "active_media_id": "med_legacy_1",
+                "queue": ["med_legacy_1"],
+                "volume": 0.8,
+                "muted": false,
+                "rate": 1.25,
+                "repeat_mode": "all",
+                "shuffle": true
+            }
+        }"#;
+
+        v3_db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO app_ui_state (key, payload_json, updated_at) VALUES ('v2', ?1, '100');",
+                    [legacy_blob],
+                )?;
+                Ok(())
+            })
+            .expect("insert v3 blob");
+        drop(v3_db);
+
+        // 2. Open with production `Database::open` -> upgrades to v4, creates `.pre-v3.bak`, and migrates blob!
+        let (dispatcher, v4_db) =
+            build_production_dispatcher_with_db(&db_path).expect("upgrade to v4");
+        assert_eq!(v4_db.schema_version().expect("v4 schema"), 4);
+        assert!(
+            db_path.with_extension("sqlite.pre-v3.bak").is_file(),
+            "pre-v3 backup must exist"
+        );
+
+        // Legacy `app_ui_state` table row must be purged after relational migration.
+        let remaining_blobs: i64 = v4_db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM app_ui_state;", [], |r| r.get(0))
+                    .map_err(crate::error::AppError::from)
+            })
+            .expect("count blobs");
+        assert_eq!(remaining_blobs, 0);
+
+        // Rust repositories & diagnostic report must see all migrated relational records!
+        let diag = dispatcher.generate_diagnostic_report().expect("diag");
+        assert_eq!(diag.schema_version, 4);
+        assert_eq!(diag.media_count, 1);
+        assert_eq!(diag.total_note_count, 1);
+        assert_eq!(diag.playlist_count, 1);
+
+        let exported = v4_db
+            .export_relational_state()
+            .expect("export")
+            .expect("some state");
+        assert_eq!(exported.media[0].id, "med_legacy_1");
+        assert_eq!(exported.media[0].last_position_ms, 95_000);
+        assert_eq!(
+            exported.media[0].source_folder_id.as_deref(),
+            Some("src_legacy")
+        );
+        assert_eq!(
+            exported.notes[0].body,
+            "Migrated seamlessly from v3 JSON blob to v4 relational row"
+        );
+        assert_eq!(exported.playlists[0].item_ids, vec!["med_legacy_1"]);
+        assert_eq!(exported.settings.source_folders.len(), 1);
+        let session = exported.playback_session.expect("session");
+        assert_eq!(session.active_media_id.as_deref(), Some("med_legacy_1"));
+        assert!(session.shuffle);
     }
 }

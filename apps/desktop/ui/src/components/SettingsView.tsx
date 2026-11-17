@@ -620,7 +620,11 @@ export function SettingsView({
                 <button
                   type="button"
                   className="btn-secondary"
-                  onClick={() => onSetDiagnosticReport(ipcClient.generateDiagnosticReport())}
+                  onClick={() => {
+                    void ipcClient
+                      .generateDiagnosticReportNative()
+                      .then((rep) => onSetDiagnosticReport(rep));
+                  }}
                 >
                   Preview redacted diagnostic report
                 </button>

@@ -23,8 +23,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::windows::process::CommandExt;
 
 use audora_desktop::{
-    build_production_dispatcher_with_db, default_app_data_dir, default_database_path,
-    domain::DEFAULT_GITHUB_RELEASE_REPO, persistence::Database,
+    adapters::probe_container_duration_ms,
+    build_production_dispatcher_with_db,
+    commands::CommandDispatcher,
+    default_app_data_dir, default_database_path,
+    domain::{
+        AppSettings, MediaItem, Note, PersistedPlaybackSession, Playlist,
+        DEFAULT_GITHUB_RELEASE_REPO,
+    },
+    persistence::Database,
     services::cleanup_all_app_artifacts,
 };
 use sha2::{Digest, Sha256};
@@ -75,6 +82,31 @@ impl MediaAllowlist {
     fn clear(&mut self) {
         self.files.clear();
         self.dirs.clear();
+    }
+
+    fn sync_enabled_dirs(&mut self, folders: &[audora_desktop::domain::TrustedSourceFolder]) {
+        self.dirs.clear();
+        for folder in folders {
+            if folder.enabled {
+                let trimmed = folder.path.trim();
+                if !trimmed.is_empty() {
+                    self.register_dir(Path::new(trimmed));
+                }
+            }
+        }
+    }
+
+    fn register_from_relational_state(
+        &mut self,
+        state: &audora_desktop::domain::RelationalAppStateDto,
+    ) {
+        for item in &state.media {
+            let trimmed = item.path.trim();
+            if !trimmed.is_empty() {
+                self.register_file(Path::new(trimmed));
+            }
+        }
+        self.sync_enabled_dirs(&state.settings.source_folders);
     }
 
     fn register_from_ui_state_value(&mut self, val: &serde_json::Value) {
@@ -233,11 +265,9 @@ fn main() {
     }
 
     let allowlist = Arc::new(Mutex::new(MediaAllowlist::default()));
-    if let Ok(Some(saved_json)) = db.get_ui_state_json() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&saved_json) {
-            if let Ok(mut guard) = allowlist.lock() {
-                guard.register_from_ui_state_value(&val);
-            }
+    if let Ok(Some(saved_state)) = db.export_relational_state() {
+        if let Ok(mut guard) = allowlist.lock() {
+            guard.register_from_relational_state(&saved_state);
         }
     }
 
@@ -258,10 +288,14 @@ fn main() {
         for raw_cli in &cli_paths {
             let pb = PathBuf::from(raw_cli);
             if pb.is_dir() {
+                let start_len = cli_boot_files.len();
+                collect_media_files_in_dir(&pb, 0, 1, 200, &mut cli_boot_files);
                 if let Ok(mut guard) = allowlist.lock() {
                     guard.register_dir(&pb);
+                    for (fp, _, _, _) in &cli_boot_files[start_len..] {
+                        guard.register_file(Path::new(fp));
+                    }
                 }
-                collect_media_files_in_dir(&pb, 0, 1, 200, &mut cli_boot_files);
             } else if pb.is_file() {
                 if let Ok(meta) = fs::metadata(&pb) {
                     if meta.len() > 0 {
@@ -329,6 +363,7 @@ fn main() {
     let Some((server_url, server_port)) = start_local_ui_server(
         ui_dist,
         proxy.clone(),
+        Arc::clone(&dispatcher),
         db,
         Arc::clone(&session_token),
         Arc::clone(&allowlist),
@@ -614,6 +649,7 @@ struct ParsedHttpRequest {
 struct LoopbackServerContext {
     root: PathBuf,
     proxy: EventLoopProxy<DesktopUserEvent>,
+    dispatcher: Arc<CommandDispatcher>,
     db: Database,
     local_port: u16,
     session_token: Arc<String>,
@@ -623,6 +659,7 @@ struct LoopbackServerContext {
 fn start_local_ui_server(
     ui_dist: PathBuf,
     proxy: EventLoopProxy<DesktopUserEvent>,
+    dispatcher: Arc<CommandDispatcher>,
     db: Database,
     session_token: Arc<String>,
     allowlist: Arc<Mutex<MediaAllowlist>>,
@@ -637,6 +674,7 @@ fn start_local_ui_server(
     let ctx = Arc::new(LoopbackServerContext {
         root: ui_dist,
         proxy,
+        dispatcher,
         db,
         local_port,
         session_token,
@@ -1104,6 +1142,15 @@ fn handle_http_connection(mut stream: TcpStream, ctx: &LoopbackServerContext) {
                 );
             }
         }
+        return;
+    }
+
+    if raw_path == "/__audora_rpc" {
+        if method != "POST" {
+            write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
+            return;
+        }
+        handle_relational_rpc_request(&mut stream, &req_body, ctx);
         return;
     }
 
@@ -1673,231 +1720,165 @@ fn canonical_path_string(p: &Path) -> String {
         .into_owned()
 }
 
-fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> bool {
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return false;
-    }
-    file.read_exact(buf).is_ok()
-}
-
-fn read_mp4_box_header(file: &mut File, pos: u64, limit: u64) -> Option<([u8; 4], u64, u64)> {
-    if pos.checked_add(8)? > limit {
-        return None;
-    }
-    let mut hdr = [0_u8; 16];
-    if !read_exact_at(file, pos, &mut hdr[..8]) {
-        return None;
-    }
-    let sz32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-    let box_type = [hdr[4], hdr[5], hdr[6], hdr[7]];
-    let (box_size, header_len) = if sz32 == 1 {
-        if pos.checked_add(16)? > limit
-            || !read_exact_at(file, pos.saturating_add(8), &mut hdr[8..16])
-        {
-            return None;
-        }
-        let sz64 = u64::from_be_bytes([
-            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-        ]);
-        (sz64, 16_u64)
-    } else if sz32 == 0 {
-        (limit.saturating_sub(pos), 8_u64)
-    } else {
-        (u64::from(sz32), 8_u64)
+fn handle_relational_rpc_request(
+    stream: &mut TcpStream,
+    req_body: &[u8],
+    ctx: &LoopbackServerContext,
+) {
+    let Ok(body_str) = std::str::from_utf8(req_body) else {
+        write_json_response(stream, "400 Bad Request", br#"{"ok":false}"#);
+        return;
     };
-    if box_size < header_len || pos.checked_add(box_size)? > limit {
-        return None;
-    }
-    Some((box_type, box_size, header_len))
-}
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        write_json_response(stream, "400 Bad Request", br#"{"ok":false}"#);
+        return;
+    };
+    let op = val
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
 
-fn probe_isobmff_duration_ms(file: &mut File, file_len: u64) -> Option<u64> {
-    let mut pos = 0_u64;
-    let mut sidx_fallback_ms: Option<u64> = None;
-    let mut max_boxes = 0_usize;
-
-    while pos < file_len && max_boxes < 256 {
-        max_boxes = max_boxes.saturating_add(1);
-        let Some((box_type, box_size, hdr_len)) = read_mp4_box_header(file, pos, file_len) else {
-            break;
-        };
-        if &box_type == b"moov" {
-            let moov_end = pos.saturating_add(box_size);
-            let mut cpos = pos.saturating_add(hdr_len);
-            let mut child_guard = 0_usize;
-            while cpos < moov_end && child_guard < 128 {
-                child_guard = child_guard.saturating_add(1);
-                let Some((ctype, csize, chdr)) = read_mp4_box_header(file, cpos, moov_end) else {
-                    break;
-                };
-                if &ctype == b"mvhd" {
-                    let payload_pos = cpos.saturating_add(chdr);
-                    let payload_len = csize.saturating_sub(chdr);
-                    if payload_len >= 20 {
-                        let mut mvhd = [0_u8; 32];
-                        let want = (payload_len as usize).min(32);
-                        if read_exact_at(file, payload_pos, &mut mvhd[..want]) {
-                            let version = mvhd[0];
-                            let (timescale, duration) = if version == 1 && want >= 32 {
-                                let ts =
-                                    u32::from_be_bytes([mvhd[20], mvhd[21], mvhd[22], mvhd[23]]);
-                                let dur = u64::from_be_bytes([
-                                    mvhd[24], mvhd[25], mvhd[26], mvhd[27], mvhd[28], mvhd[29],
-                                    mvhd[30], mvhd[31],
-                                ]);
-                                (ts, if dur == u64::MAX { 0 } else { dur })
-                            } else if version == 0 {
-                                let ts =
-                                    u32::from_be_bytes([mvhd[12], mvhd[13], mvhd[14], mvhd[15]]);
-                                let dur32 =
-                                    u32::from_be_bytes([mvhd[16], mvhd[17], mvhd[18], mvhd[19]]);
-                                (
-                                    ts,
-                                    if dur32 == u32::MAX {
-                                        0
-                                    } else {
-                                        u64::from(dur32)
-                                    },
-                                )
-                            } else {
-                                (0, 0)
-                            };
-                            if timescale > 0 && duration > 0 {
-                                let ms = (u128::from(duration) * 1_000) / u128::from(timescale);
-                                if let Ok(ms64) = u64::try_from(ms) {
-                                    if ms64 > 0 {
-                                        return Some(ms64);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                cpos = cpos.saturating_add(csize);
-            }
-        } else if &box_type == b"sidx" && sidx_fallback_ms.is_none() {
-            let payload_pos = pos.saturating_add(hdr_len);
-            let payload_len = box_size.saturating_sub(hdr_len);
-            if (24..=2_097_152).contains(&payload_len) {
-                let mut buf = vec![0_u8; payload_len as usize];
-                if read_exact_at(file, payload_pos, &mut buf) {
-                    let version = buf[0];
-                    let timescale = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                    let entries_offset = if version == 0 { 20_usize } else { 28_usize };
-                    if timescale > 0 && buf.len() >= entries_offset + 4 {
-                        let ref_count =
-                            u16::from_be_bytes([buf[entries_offset + 2], buf[entries_offset + 3]])
-                                as usize;
-                        let table_start = entries_offset + 4;
-                        if buf.len() >= table_start.saturating_add(ref_count.saturating_mul(12)) {
-                            let mut total_dur = 0_u64;
-                            for idx in 0..ref_count {
-                                let off = table_start + idx * 12 + 4;
-                                let sub_dur = u32::from_be_bytes([
-                                    buf[off],
-                                    buf[off + 1],
-                                    buf[off + 2],
-                                    buf[off + 3],
-                                ]);
-                                total_dur = total_dur.saturating_add(u64::from(sub_dur));
-                            }
-                            if total_dur > 0 {
-                                let ms = (u128::from(total_dur) * 1_000) / u128::from(timescale);
-                                sidx_fallback_ms = u64::try_from(ms).ok().filter(|&v| v > 0);
-                            }
-                        }
-                    }
+    let result: Result<Option<String>, String> = match op {
+        "update_progress" => {
+            let Some(media_id) = val.get("media_id").and_then(serde_json::Value::as_str) else {
+                write_json_response(stream, "400 Bad Request", br#"{"ok":false}"#);
+                return;
+            };
+            let pos = val
+                .get("last_position_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let completed = val
+                .get("completed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let session: Option<PersistedPlaybackSession> = val
+                .get("session")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            ctx.db
+                .rpc_update_progress(media_id, pos, completed, session.as_ref())
+                .map(|()| None)
+                .map_err(|e| e.to_payload().message)
+        }
+        "upsert_media_batch" => {
+            let items: Vec<MediaItem> = val
+                .get("items")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            if let Ok(mut guard) = ctx.allowlist.lock() {
+                for item in &items {
+                    guard.register_file(Path::new(&item.path));
                 }
             }
+            ctx.db
+                .rpc_upsert_media_batch(&items)
+                .map(|()| None)
+                .map_err(|e| e.to_payload().message)
         }
-        pos = pos.saturating_add(box_size);
-    }
-
-    sidx_fallback_ms
-}
-
-fn probe_wav_duration_ms(file: &mut File, file_len: u64) -> Option<u64> {
-    if file_len < 44 {
-        return None;
-    }
-    let mut riff = [0_u8; 12];
-    if !read_exact_at(file, 0, &mut riff) || &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut pos = 12_u64;
-    let mut byte_rate = 0_u32;
-    let mut data_size = 0_u64;
-    let mut guard = 0_usize;
-    while pos.saturating_add(8) <= file_len && guard < 64 {
-        guard = guard.saturating_add(1);
-        let mut chdr = [0_u8; 8];
-        if !read_exact_at(file, pos, &mut chdr) {
-            break;
+        "delete_media_ids" => {
+            let ids: Vec<String> = val
+                .get("ids")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            ctx.db
+                .rpc_delete_media_ids(&ids)
+                .map(|_| None)
+                .map_err(|e| e.to_payload().message)
         }
-        let cid = [chdr[0], chdr[1], chdr[2], chdr[3]];
-        let csz = u64::from(u32::from_le_bytes([chdr[4], chdr[5], chdr[6], chdr[7]]));
-        if &cid == b"fmt " && csz >= 16 {
-            let mut fmt_buf = [0_u8; 16];
-            if read_exact_at(file, pos.saturating_add(8), &mut fmt_buf) {
-                byte_rate = u32::from_le_bytes([fmt_buf[8], fmt_buf[9], fmt_buf[10], fmt_buf[11]]);
+        "upsert_note" => match val
+            .get("note")
+            .and_then(|v| serde_json::from_value::<Note>(v.clone()).ok())
+        {
+            Some(note) => ctx
+                .db
+                .rpc_upsert_note(&note)
+                .map(|()| None)
+                .map_err(|e| e.to_payload().message),
+            None => Err("Missing valid 'note' payload".to_owned()),
+        },
+        "delete_note" => match val.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) => ctx
+                .db
+                .rpc_delete_note(id)
+                .map(|_| None)
+                .map_err(|e| e.to_payload().message),
+            None => Err("Missing 'id'".to_owned()),
+        },
+        "upsert_playlist" => match val
+            .get("playlist")
+            .and_then(|v| serde_json::from_value::<Playlist>(v.clone()).ok())
+        {
+            Some(pl) => ctx
+                .db
+                .rpc_upsert_playlist(&pl)
+                .map(|()| None)
+                .map_err(|e| e.to_payload().message),
+            None => Err("Missing valid 'playlist' payload".to_owned()),
+        },
+        "delete_playlist" => match val.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) => ctx
+                .db
+                .rpc_delete_playlist(id)
+                .map(|_| None)
+                .map_err(|e| e.to_payload().message),
+            None => Err("Missing 'id'".to_owned()),
+        },
+        "save_settings" => match val
+            .get("settings")
+            .and_then(|v| serde_json::from_value::<AppSettings>(v.clone()).ok())
+        {
+            Some(settings) => {
+                if let Ok(mut guard) = ctx.allowlist.lock() {
+                    guard.sync_enabled_dirs(&settings.source_folders);
+                }
+                ctx.db
+                    .rpc_save_settings(&settings)
+                    .map(|()| None)
+                    .map_err(|e| e.to_payload().message)
             }
-        } else if &cid == b"data" {
-            data_size = csz.min(file_len.saturating_sub(pos.saturating_add(8)));
-            if byte_rate > 0 {
-                break;
-            }
-        }
-        let padded = csz.saturating_add(csz & 1);
-        pos = pos.saturating_add(8).saturating_add(padded);
-    }
-    if byte_rate > 0 && data_size > 0 {
-        let ms = (u128::from(data_size) * 1_000) / u128::from(byte_rate);
-        u64::try_from(ms).ok().filter(|&v| v > 0)
-    } else {
-        None
-    }
-}
+            None => Err("Missing valid 'settings' payload".to_owned()),
+        },
+        "save_session" => match val
+            .get("session")
+            .and_then(|v| serde_json::from_value::<PersistedPlaybackSession>(v.clone()).ok())
+        {
+            Some(session) => ctx
+                .db
+                .rpc_save_playback_session(&session)
+                .map(|()| None)
+                .map_err(|e| e.to_payload().message),
+            None => Err("Missing valid 'session' payload".to_owned()),
+        },
+        "diagnostic_report" => ctx
+            .dispatcher
+            .generate_diagnostic_report()
+            .and_then(|rep| {
+                serde_json::to_string(&rep).map(Some).map_err(|e| {
+                    audora_desktop::error::AppError::internal(e.to_string()).to_payload()
+                })
+            })
+            .map_err(|e| e.message),
+        _ => Err(format!("Unsupported RPC operation '{op}'")),
+    };
 
-fn probe_flac_duration_ms(file: &mut File, file_len: u64) -> Option<u64> {
-    if file_len < 42 {
-        return None;
-    }
-    let mut hdr = [0_u8; 42];
-    if !read_exact_at(file, 0, &mut hdr) || &hdr[0..4] != b"fLaC" || (hdr[4] & 0x7F) != 0 {
-        return None;
-    }
-    let sample_rate =
-        (u32::from(hdr[18]) << 12) | (u32::from(hdr[19]) << 4) | (u32::from(hdr[20]) >> 4);
-    let total_samples = (u64::from(hdr[21] & 0x0F) << 32)
-        | (u64::from(hdr[22]) << 24)
-        | (u64::from(hdr[23]) << 16)
-        | (u64::from(hdr[24]) << 8)
-        | u64::from(hdr[25]);
-    if sample_rate > 0 && total_samples > 0 {
-        let ms = (u128::from(total_samples) * 1_000) / u128::from(sample_rate);
-        u64::try_from(ms).ok().filter(|&v| v > 0)
-    } else {
-        None
+    match result {
+        Ok(Some(custom_data)) => {
+            let body = format!(r#"{{"ok":true,"data":{custom_data}}}"#);
+            write_json_response(stream, "200 OK", body.as_bytes());
+        }
+        Ok(None) => {
+            write_json_response(stream, "200 OK", br#"{"ok":true}"#);
+        }
+        Err(msg) => {
+            let escaped = escape_json_str(&msg);
+            let body = format!(r#"{{"ok":false,"message":"{escaped}"}}"#);
+            write_json_response(stream, "400 Bad Request", body.as_bytes());
+        }
     }
 }
 
 fn probe_media_duration_ms(path: &Path) -> Option<u64> {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let mut file = File::open(path).ok()?;
-    let file_len = file.metadata().ok()?.len();
-    if file_len == 0 {
-        return None;
-    }
-    match ext.as_str() {
-        "mp4" | "m4a" | "m4v" | "mov" => probe_isobmff_duration_ms(&mut file, file_len),
-        "wav" => probe_wav_duration_ms(&mut file, file_len),
-        "flac" => probe_flac_duration_ms(&mut file, file_len),
-        _ => None,
-    }
+    probe_container_duration_ms(path)
 }
 
 fn configure_hidden_windows_command(cmd: &mut Command) -> &mut Command {
@@ -2277,6 +2258,43 @@ mod tests {
                 .resolve_allowed_media_file(&symlink_mp4.to_string_lossy())
                 .is_none());
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowlist_sync_from_relational_state_revokes_disabled_or_removed_source_folders() {
+        let dir = env::temp_dir().join(format!(
+            "audora_rel_allowlist_test_{}",
+            generate_session_token()
+        ));
+        let folder_a = dir.join("folder_a");
+        fs::create_dir_all(&folder_a).unwrap();
+        let track_in_a = folder_a.join("song.flac");
+        fs::write(&track_in_a, b"fLaC-stub").unwrap();
+
+        let mut allowlist = MediaAllowlist::default();
+        let folder_dto = audora_desktop::domain::TrustedSourceFolder {
+            id: "src_a".to_owned(),
+            path: folder_a.to_string_lossy().into_owned(),
+            label: "folder_a".to_owned(),
+            enabled: true,
+            added_at: "1".to_owned(),
+            last_scanned_at: "1".to_owned(),
+            media_count: 1,
+        };
+        allowlist.sync_enabled_dirs(std::slice::from_ref(&folder_dto));
+        assert!(allowlist
+            .resolve_allowed_media_file(&track_in_a.to_string_lossy())
+            .is_some());
+
+        // Disabling folder immediately revokes directory-wide streaming access
+        let mut disabled = folder_dto;
+        disabled.enabled = false;
+        allowlist.sync_enabled_dirs(&[disabled]);
+        assert!(allowlist
+            .resolve_allowed_media_file(&track_in_a.to_string_lossy())
+            .is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

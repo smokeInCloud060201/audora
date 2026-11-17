@@ -210,12 +210,14 @@ impl AudoraAppService {
         let prior_pos = existing.as_ref().map_or(0, |m| m.last_position_ms);
         let prior_completed = existing.as_ref().is_some_and(|m| m.completed);
 
+        let prior_folder = existing.as_ref().and_then(|m| m.source_folder_id.clone());
         let item_to_save = MediaItem {
             id: media_id,
             path: trimmed.to_owned(),
             display_name: file_name,
             media_kind: probed.media_kind,
             duration_ms: probed.duration_ms,
+            duration_probed: probed.duration_ms.is_some(),
             last_position_ms: prior_pos,
             completed: prior_completed,
             file_size_bytes: Some(metadata.len()),
@@ -225,6 +227,7 @@ impl AudoraAppService {
             last_opened_at: Some(now.clone()),
             last_seen_at: now,
             note_count: 0,
+            source_folder_id: prior_folder,
         };
 
         let saved = self.media_repo.upsert_media(&item_to_save)?;
@@ -1036,7 +1039,7 @@ impl AudoraAppService {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             os_family: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
-            schema_version: 3,
+            schema_version: 4,
             media_count,
             missing_media_count,
             total_note_count,

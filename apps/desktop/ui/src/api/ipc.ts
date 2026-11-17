@@ -278,6 +278,10 @@ export class AudoraIpcClient {
   private stagedManifest: ReleaseManifestDto | null = null;
   private hydrationPromise: Promise<void> | null = null;
   private cliBootProcessed = false;
+  private hasNativeRelationalRpc = Boolean(getNativeSessionToken());
+  private rpcQueue: Array<Record<string, unknown>> = [];
+  private isFlushingRpc = false;
+  private rpcFlushPromise: Promise<void> | null = null;
   private pendingNativeSave: string | null = null;
   private isSavingNative = false;
   private seekDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -653,16 +657,23 @@ export class AudoraIpcClient {
     try {
       const res = await nativeFetch("/__audora_state", { method: "GET" });
       if (res.ok) {
+        this.hasNativeRelationalRpc = true;
         const text = await res.text();
         const trimmed = text.trim();
         if (trimmed.startsWith("{") && trimmed !== "{}") {
-          // `audora.sqlite` is the authoritative source of truth over port-scoped localStorage (`C-6`).
+          // `audora.sqlite` relational tables are the authoritative source of truth (`C-6`).
           const parsed = JSON.parse(trimmed) as Partial<PersistedState>;
           this.applyPersistedState(parsed);
-          this.persistToStorage({ skipNative: true });
         } else if (this.media.length > 0 || this.notes.length > 0 || this.playlists.length > 0) {
-          // One-time seed of empty SQLite DB from existing localStorage state.
-          this.persistToStorage();
+          // One-time seed of empty SQLite relational tables from existing localStorage state.
+          this.enqueueNativeStateSave(this.serializePersistedState());
+        }
+        try {
+          if (typeof window !== "undefined" && window.localStorage) {
+            window.localStorage.removeItem(STORAGE_KEY);
+          }
+        } catch {
+          // Ignore storage cleanup errors in restricted webviews.
         }
       }
     } catch {
@@ -756,13 +767,18 @@ export class AudoraIpcClient {
     if (!this.useStorage) {
       return;
     }
+    if (this.hasNativeRelationalRpc && options?.skipNative) {
+      return;
+    }
     const serialized = this.serializePersistedState();
-    try {
-      if (typeof window !== "undefined" && window.localStorage) {
-        window.localStorage.setItem(STORAGE_KEY, serialized);
+    if (!this.hasNativeRelationalRpc) {
+      try {
+        if (typeof window !== "undefined" && window.localStorage) {
+          window.localStorage.setItem(STORAGE_KEY, serialized);
+        }
+      } catch {
+        // Ignore quota errors in restricted webviews.
       }
-    } catch {
-      // Ignore quota errors in restricted webviews.
     }
     if (options?.skipNative) {
       return;
@@ -780,12 +796,119 @@ export class AudoraIpcClient {
     this.enqueueNativeStateSave(serialized);
   }
 
+  private buildSessionDto(): PersistedPlaybackSession {
+    return {
+      active_media_id: this.snapshot.media_id,
+      queue: this.snapshot.queue,
+      volume: this.snapshot.volume,
+      muted: this.snapshot.muted,
+      rate: this.snapshot.rate,
+      repeat_mode: this.snapshot.repeat_mode,
+      shuffle: this.snapshot.shuffle,
+    };
+  }
+
+  private stripStreamUrl(item: MediaItem): Omit<MediaItem, "stream_url"> {
+    const { stream_url: _stream, ...rest } = item;
+    return rest;
+  }
+
+  private dispatchRelationalRpc(
+    opPayload: Record<string, unknown>,
+    options?: { keepalive?: boolean },
+  ): boolean {
+    if (
+      !this.useStorage ||
+      !this.hasNativeRelationalRpc ||
+      !isBrowserRuntime() ||
+      (window.location.hostname !== "127.0.0.1" &&
+        window.location.hostname !== "localhost")
+    ) {
+      return false;
+    }
+
+    if (options?.keepalive) {
+      void nativeFetch("/__audora_rpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(opPayload),
+        keepalive: true,
+      }).catch(() => {});
+      return true;
+    }
+
+    // Coalesce consecutive `update_progress` or `save_session` RPCs in the queue
+    const opName = opPayload.op;
+    if (opName === "update_progress" || opName === "save_session") {
+      const lastIdx = this.rpcQueue.length - 1;
+      if (lastIdx >= 0 && this.rpcQueue[lastIdx]?.op === opName) {
+        this.rpcQueue[lastIdx] = opPayload;
+      } else {
+        this.rpcQueue.push(opPayload);
+      }
+    } else {
+      this.rpcQueue.push(opPayload);
+    }
+
+    if (!this.isFlushingRpc) {
+      this.isFlushingRpc = true;
+      this.rpcFlushPromise = (async () => {
+        try {
+          while (this.rpcQueue.length > 0) {
+            const next = this.rpcQueue.shift()!;
+            await nativeFetch("/__audora_rpc", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(next),
+            }).catch(() => {});
+          }
+        } finally {
+          this.isFlushingRpc = false;
+          this.rpcFlushPromise = null;
+        }
+      })();
+    }
+    return true;
+  }
+
+  private persistProgressAndSession(options?: { immediate?: boolean; keepalive?: boolean }): void {
+    if (!this.useStorage) return;
+    const active = this.media.find((m) => m.id === this.snapshot.media_id);
+    if (active) {
+      if (
+        this.dispatchRelationalRpc(
+          {
+            op: "update_progress",
+            media_id: active.id,
+            last_position_ms: active.last_position_ms,
+            completed: active.completed,
+            session: this.buildSessionDto(),
+          },
+          { keepalive: options?.keepalive },
+        )
+      ) {
+        return;
+      }
+    } else if (
+      this.dispatchRelationalRpc(
+        {
+          op: "save_session",
+          session: this.buildSessionDto(),
+        },
+        { keepalive: options?.keepalive },
+      )
+    ) {
+      return;
+    }
+    this.persistToStorage(options?.immediate ? undefined : { debounceNativeMs: 200 });
+  }
+
   private throttledPersistProgress(): void {
     if (!this.useStorage) return;
     const now = Date.now();
     if (now - this.lastProgressPersistMs >= 2_000) {
       this.lastProgressPersistMs = now;
-      this.persistToStorage();
+      this.persistProgressAndSession();
     }
   }
 
@@ -794,6 +917,10 @@ export class AudoraIpcClient {
     if (this.seekDebounceTimer !== null) {
       clearTimeout(this.seekDebounceTimer);
       this.seekDebounceTimer = null;
+    }
+    if (this.hasNativeRelationalRpc) {
+      this.persistProgressAndSession({ immediate: true, keepalive: true });
+      return;
     }
     const serialized = this.serializePersistedState();
     try {
@@ -820,13 +947,17 @@ export class AudoraIpcClient {
       );
     }
     this.settings = structuredClone(next);
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      this.persistToStorage();
+    }
     return structuredClone(this.settings);
   }
 
   public setWindowMode(mode: WindowMode): AppSettings {
     this.settings.window_mode = mode;
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      this.persistToStorage();
+    }
     postNativeIpcMessage(mode === "minimum" ? "window_mode:minimum" : "window_mode:full");
     return structuredClone(this.settings);
   }
@@ -859,12 +990,12 @@ export class AudoraIpcClient {
         break;
       case "pause":
         this.snapshot.state = "paused";
-        this.persistToStorage();
+        this.persistProgressAndSession({ immediate: true });
         break;
       case "toggle_play_pause":
         if (this.snapshot.state === "playing") {
           this.snapshot.state = "paused";
-          this.persistToStorage();
+          this.persistProgressAndSession({ immediate: true });
         } else if (this.snapshot.media_id) {
           if (
             this.snapshot.state === "ended" &&
@@ -884,7 +1015,7 @@ export class AudoraIpcClient {
           active.last_position_ms = this.snapshot.position_ms;
           active.completed = false;
         }
-        this.persistToStorage({ debounceNativeMs: 150 });
+        this.persistProgressAndSession();
         break;
       }
       case "skip_relative": {
@@ -895,28 +1026,28 @@ export class AudoraIpcClient {
         if (active) {
           active.last_position_ms = this.snapshot.position_ms;
         }
-        this.persistToStorage({ debounceNativeMs: 250 });
+        this.persistProgressAndSession();
         break;
       }
       case "set_rate":
         this.snapshot.rate = cmd.rate;
-        this.persistToStorage({ debounceNativeMs: 250 });
+        this.persistProgressAndSession();
         break;
       case "set_volume":
         this.snapshot.volume = Math.max(0, Math.min(1, cmd.volume));
-        this.persistToStorage({ debounceNativeMs: 250 });
+        this.persistProgressAndSession();
         break;
       case "set_muted":
         this.snapshot.muted = cmd.muted;
-        this.persistToStorage({ debounceNativeMs: 250 });
+        this.persistProgressAndSession();
         break;
       case "set_repeat":
         this.snapshot.repeat_mode = cmd.mode;
-        this.persistToStorage({ debounceNativeMs: 250 });
+        this.persistProgressAndSession();
         break;
       case "set_shuffle":
         this.snapshot.shuffle = cmd.shuffle;
-        this.persistToStorage({ debounceNativeMs: 250 });
+        this.persistProgressAndSession();
         break;
       case "next": {
         const wasPlaying = this.snapshot.state === "playing";
@@ -930,7 +1061,7 @@ export class AudoraIpcClient {
           if (active) {
             active.last_position_ms = 0;
           }
-          this.persistToStorage({ debounceNativeMs: 250 });
+          this.persistProgressAndSession();
         } else if (this.snapshot.media_id) {
           const wasPlaying = this.snapshot.state === "playing";
           const idx = this.snapshot.queue.indexOf(this.snapshot.media_id);
@@ -947,7 +1078,7 @@ export class AudoraIpcClient {
       case "stop":
         this.snapshot.state = "idle";
         this.snapshot.position_ms = 0;
-        this.persistToStorage();
+        this.persistProgressAndSession({ immediate: true });
         break;
     }
     return structuredClone(this.snapshot);
@@ -1031,8 +1162,17 @@ export class AudoraIpcClient {
         active.completed = false;
         active.last_position_ms = 0;
       }
-      this.persistToStorage();
+      this.persistProgressAndSession({ immediate: true });
       return structuredClone(this.snapshot);
+    }
+
+    if (active) {
+      this.dispatchRelationalRpc({
+        op: "update_progress",
+        media_id: active.id,
+        last_position_ms: active.last_position_ms,
+        completed: true,
+      });
     }
 
     const advanced = this.advanceQueue(true);
@@ -1041,8 +1181,12 @@ export class AudoraIpcClient {
         this.snapshot.position_ms = this.snapshot.duration_ms;
       }
       this.snapshot.state = "ended";
+      if (!this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() })) {
+        this.persistToStorage();
+      }
+    } else if (!this.hasNativeRelationalRpc) {
+      this.persistToStorage();
     }
-    this.persistToStorage();
     return structuredClone(this.snapshot);
   }
 
@@ -1111,7 +1255,16 @@ export class AudoraIpcClient {
     if (!this.snapshot.queue.includes(item.id)) {
       this.snapshot.queue.push(item.id);
     }
-    this.persistToStorage();
+    if (
+      !this.dispatchRelationalRpc({
+        op: "upsert_media_batch",
+        items: [this.stripStreamUrl(item)],
+      })
+    ) {
+      this.persistToStorage();
+    } else {
+      this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() });
+    }
     return structuredClone(item);
   }
 
@@ -1224,7 +1377,14 @@ export class AudoraIpcClient {
         item.stream_url = streamUrl;
       }
     }
-    this.persistToStorage();
+    if (
+      !this.dispatchRelationalRpc({
+        op: "upsert_media_batch",
+        items: [this.stripStreamUrl(item)],
+      })
+    ) {
+      this.persistToStorage();
+    }
     return this.selectMediaById(item.id);
   }
 
@@ -1259,6 +1419,9 @@ export class AudoraIpcClient {
     }
     if (!this.snapshot.queue.includes(mediaId)) {
       this.snapshot.queue.push(mediaId);
+      if (!this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() })) {
+        this.persistToStorage({ debounceNativeMs: 200 });
+      }
     }
     return structuredClone(this.snapshot);
   }
@@ -1266,6 +1429,7 @@ export class AudoraIpcClient {
   public removeFromQueue(mediaId: string): PlaybackSnapshot {
     const currentIdx = this.snapshot.queue.indexOf(mediaId);
     this.snapshot.queue = this.snapshot.queue.filter((id) => id !== mediaId);
+    let selectedNext = false;
     if (this.snapshot.media_id === mediaId) {
       if (this.snapshot.queue.length === 0) {
         this.snapshot.media_id = null;
@@ -1274,7 +1438,14 @@ export class AudoraIpcClient {
       } else {
         const nextIdx = Math.min(Math.max(0, currentIdx), this.snapshot.queue.length - 1);
         this.selectMediaById(this.snapshot.queue[nextIdx]);
+        selectedNext = true;
       }
+    }
+    if (
+      !selectedNext &&
+      !this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() })
+    ) {
+      this.persistToStorage({ debounceNativeMs: 200 });
     }
     return structuredClone(this.snapshot);
   }
@@ -1288,7 +1459,14 @@ export class AudoraIpcClient {
     if (this.snapshot.media_id === mediaId) {
       this.snapshot.state = "paused";
     }
-    this.persistToStorage();
+    if (
+      !this.dispatchRelationalRpc({
+        op: "upsert_media_batch",
+        items: [this.stripStreamUrl(item)],
+      })
+    ) {
+      this.persistToStorage();
+    }
     return structuredClone(item);
   }
 
@@ -1382,7 +1560,9 @@ export class AudoraIpcClient {
       updated_at: "Just now",
     };
     this.notes.push(note);
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_note", note })) {
+      this.persistToStorage();
+    }
     return structuredClone(note);
   }
 
@@ -1408,7 +1588,9 @@ export class AudoraIpcClient {
     note.body = trimmed;
     note.is_quick_marker = false;
     note.updated_at = "Just now";
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_note", note })) {
+      this.persistToStorage();
+    }
     return structuredClone(note);
   }
 
@@ -1416,13 +1598,18 @@ export class AudoraIpcClient {
     const idx = this.notes.findIndex((n) => n.id === noteId);
     if (idx < 0) return null;
     const [removed] = this.notes.splice(idx, 1);
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "delete_note", id: noteId })) {
+      this.persistToStorage();
+    }
     return structuredClone(removed);
   }
 
   public restoreNote(note: Note): Note {
-    this.notes.push(structuredClone(note));
-    this.persistToStorage();
+    const copy = structuredClone(note);
+    this.notes.push(copy);
+    if (!this.dispatchRelationalRpc({ op: "upsert_note", note: copy })) {
+      this.persistToStorage();
+    }
     return structuredClone(note);
   }
 
@@ -1620,7 +1807,14 @@ export class AudoraIpcClient {
       }
       this.snapshot.error = null;
     }
-    this.persistToStorage();
+    if (
+      !this.dispatchRelationalRpc({
+        op: "upsert_media_batch",
+        items: [this.stripStreamUrl(target)],
+      })
+    ) {
+      this.persistToStorage();
+    }
     return structuredClone(target);
   }
 
@@ -1647,7 +1841,14 @@ export class AudoraIpcClient {
         this.snapshot = createIdleSnapshot(this.settings.default_playback_speed);
       }
     }
-    this.persistToStorage();
+    if (this.dispatchRelationalRpc({ op: "delete_media_ids", ids: [mediaId] })) {
+      if (removedItem?.source_folder_id && this.settings.source_folders) {
+        this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings });
+      }
+      this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() });
+    } else {
+      this.persistToStorage();
+    }
     return true;
   }
 
@@ -1716,6 +1917,7 @@ export class AudoraIpcClient {
     const supportedVideo = ["mp4", "m4v", "mov", "webm", "mkv"];
     const supportedAudio = ["wav", "flac", "ogg", "opus", "mp3", "m4a", "aac"];
     let importedCount = 0;
+    const upsertedItems: MediaItem[] = [];
 
     for (const f of files) {
       const rawItemPath =
@@ -1756,6 +1958,7 @@ export class AudoraIpcClient {
           stream_url: streamUrl,
         };
         this.media.push(created);
+        upsertedItems.push(created);
         if (!this.snapshot.queue.includes(created.id)) {
           this.snapshot.queue.push(created.id);
         }
@@ -1786,6 +1989,9 @@ export class AudoraIpcClient {
         if (streamUrl) {
           existing.stream_url = streamUrl;
         }
+        if (!upsertedItems.includes(existing)) {
+          upsertedItems.push(existing);
+        }
         if (!this.snapshot.queue.includes(existing.id)) {
           this.snapshot.queue.push(existing.id);
         }
@@ -1801,6 +2007,9 @@ export class AudoraIpcClient {
         (m.path.startsWith(prefixSlash) || m.path.startsWith(prefixBackslash))
       ) {
         m.source_folder_id = folder.id;
+        if (!upsertedItems.includes(m)) {
+          upsertedItems.push(m);
+        }
       }
     }
 
@@ -1816,7 +2025,17 @@ export class AudoraIpcClient {
     }
 
     this.recomputeSourceFolderCounts();
-    this.persistToStorage();
+    if (this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      if (upsertedItems.length > 0) {
+        this.dispatchRelationalRpc({
+          op: "upsert_media_batch",
+          items: upsertedItems.map((m) => this.stripStreamUrl(m)),
+        });
+      }
+      this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() });
+    } else {
+      this.persistToStorage();
+    }
     return {
       folder: structuredClone(folder),
       importedCount,
@@ -1995,7 +2214,7 @@ export class AudoraIpcClient {
     ) {
       return false;
     }
-    let mutated = false;
+    const mutatedItems: MediaItem[] = [];
     for (const item of this.media) {
       if (item.duration_probed || this.isBareFileName(item.path)) {
         continue;
@@ -2025,17 +2244,24 @@ export class AudoraIpcClient {
                 this.snapshot.position_ms = 0;
               }
             }
-            mutated = true;
+            mutatedItems.push(item);
           }
         }
       } catch {
         // Ignore probe failures when running without native bridge
       }
     }
-    if (mutated) {
-      this.persistToStorage();
+    if (mutatedItems.length > 0) {
+      if (
+        !this.dispatchRelationalRpc({
+          op: "upsert_media_batch",
+          items: mutatedItems.map((m) => this.stripStreamUrl(m)),
+        })
+      ) {
+        this.persistToStorage();
+      }
     }
-    return mutated;
+    return mutatedItems.length > 0;
   }
 
   public async rescanSourceFolder(
@@ -2122,7 +2348,11 @@ export class AudoraIpcClient {
       }
     }
     this.recomputeSourceFolderCounts();
-    this.persistToStorage();
+    if (this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() });
+    } else {
+      this.persistToStorage();
+    }
     return structuredClone(folder);
   }
 
@@ -2154,6 +2384,7 @@ export class AudoraIpcClient {
     let removedMediaCount = 0;
     let preservedNotedCount = 0;
     const removedIds = new Set<string>();
+    const preservedItems: MediaItem[] = [];
 
     this.media = this.media.filter((m) => {
       if (m.source_folder_id !== folderId) {
@@ -2161,6 +2392,7 @@ export class AudoraIpcClient {
       }
       if (notedMediaIds.has(m.id)) {
         m.source_folder_id = null;
+        preservedItems.push(m);
         preservedNotedCount += 1;
         return true;
       }
@@ -2193,7 +2425,23 @@ export class AudoraIpcClient {
     }
 
     this.recomputeSourceFolderCounts();
-    this.persistToStorage();
+    if (this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      if (removedIds.size > 0) {
+        this.dispatchRelationalRpc({
+          op: "delete_media_ids",
+          ids: Array.from(removedIds),
+        });
+      }
+      if (preservedItems.length > 0) {
+        this.dispatchRelationalRpc({
+          op: "upsert_media_batch",
+          items: preservedItems.map((m) => this.stripStreamUrl(m)),
+        });
+      }
+      this.dispatchRelationalRpc({ op: "save_session", session: this.buildSessionDto() });
+    } else {
+      this.persistToStorage();
+    }
     return {
       removed: true,
       folderLabel: removedFolder.label,
@@ -2205,25 +2453,27 @@ export class AudoraIpcClient {
   public handleAudioRouteDisconnected(): PlaybackSnapshot {
     if (this.settings.pause_on_headphones_disconnect && this.snapshot.state === "playing") {
       this.snapshot.state = "paused";
-      this.persistToStorage();
+      this.persistProgressAndSession({ immediate: true });
     }
     return structuredClone(this.snapshot);
   }
 
   public createManualBackup(): string {
-    const backupKey = `${STORAGE_KEY}.manual.bak`;
-    try {
-      if (typeof window !== "undefined" && window.localStorage) {
-        const payload: PersistedState = {
-          media: this.media.map(({ stream_url: _stream, ...rest }) => rest),
-          notes: this.notes,
-          playlists: this.playlists,
-          settings: this.settings,
-        };
-        window.localStorage.setItem(backupKey, JSON.stringify(payload));
+    if (!this.hasNativeRelationalRpc) {
+      const backupKey = `${STORAGE_KEY}.manual.bak`;
+      try {
+        if (typeof window !== "undefined" && window.localStorage) {
+          const payload: PersistedState = {
+            media: this.media.map(({ stream_url: _stream, ...rest }) => rest),
+            notes: this.notes,
+            playlists: this.playlists,
+            settings: this.settings,
+          };
+          window.localStorage.setItem(backupKey, JSON.stringify(payload));
+        }
+      } catch {
+        // Ignore quota errors in restricted webviews.
       }
-    } catch {
-      // Ignore quota errors in restricted webviews.
     }
     const sep = getNativePlatformInfo().os === "windows" ? "\\" : "/";
     return `${getNativePlatformInfo().dataDir}${sep}audora.sqlite.manual.bak`;
@@ -2231,7 +2481,14 @@ export class AudoraIpcClient {
 
   public async createManualBackupNative(): Promise<string> {
     const fallbackPath = this.createManualBackup();
-    this.persistToStorage();
+    if (this.hasNativeRelationalRpc) {
+      this.persistProgressAndSession({ immediate: true });
+      if (this.rpcFlushPromise) {
+        await this.rpcFlushPromise;
+      }
+    } else {
+      this.persistToStorage();
+    }
     if (
       isBrowserRuntime() &&
       (window.location.hostname === "127.0.0.1" ||
@@ -2335,7 +2592,9 @@ export class AudoraIpcClient {
       updated_at: "Just now",
     };
     this.playlists.unshift(created);
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: created })) {
+      this.persistToStorage();
+    }
     return structuredClone(created);
   }
 
@@ -2379,7 +2638,9 @@ export class AudoraIpcClient {
     target.name = trimmedName;
     target.description = trimmedDesc;
     target.updated_at = "Just now";
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
+      this.persistToStorage();
+    }
     return structuredClone(target);
   }
 
@@ -2387,7 +2648,9 @@ export class AudoraIpcClient {
     const idx = this.playlists.findIndex((pl) => pl.id === playlistId);
     if (idx < 0) return null;
     const [removed] = this.playlists.splice(idx, 1);
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "delete_playlist", id: playlistId })) {
+      this.persistToStorage();
+    }
     return structuredClone(removed);
   }
 
@@ -2403,7 +2666,9 @@ export class AudoraIpcClient {
     } else {
       this.playlists.unshift(restored);
     }
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: restored })) {
+      this.persistToStorage();
+    }
     return structuredClone(restored);
   }
 
@@ -2424,7 +2689,9 @@ export class AudoraIpcClient {
       }
     }
     target.updated_at = "Just now";
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
+      this.persistToStorage();
+    }
     return structuredClone(target);
   }
 
@@ -2440,7 +2707,9 @@ export class AudoraIpcClient {
     }
     target.item_ids = target.item_ids.filter((id) => id !== mediaId);
     target.updated_at = "Just now";
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
+      this.persistToStorage();
+    }
     return structuredClone(target);
   }
 
@@ -2464,7 +2733,9 @@ export class AudoraIpcClient {
       const bounded = Math.max(0, Math.min(targetIndex, target.item_ids.length));
       target.item_ids.splice(bounded, 0, mediaId);
       target.updated_at = "Just now";
-      this.persistToStorage();
+      if (!this.dispatchRelationalRpc({ op: "upsert_playlist", playlist: target })) {
+        this.persistToStorage();
+      }
     }
     return structuredClone(target);
   }
@@ -2536,6 +2807,7 @@ export class AudoraIpcClient {
     this.selectMediaById(firstId);
     this.snapshot.queue = orderedQueue;
     this.snapshot.shuffle = useShuffle;
+    this.persistProgressAndSession();
     return this.playbackCommand({ action: "play" });
   }
 
@@ -2549,7 +2821,7 @@ export class AudoraIpcClient {
       app_version: this.getCurrentVersion(),
       os_family: plat.os,
       arch: plat.arch,
-      schema_version: 3,
+      schema_version: 4,
       media_count: this.media.length,
       missing_media_count: this.media.filter((m) => m.availability === "missing").length,
       total_note_count: this.notes.length,
@@ -2558,6 +2830,37 @@ export class AudoraIpcClient {
       last_error_code: this.snapshot.error?.code ?? null,
       generated_at: new Date().toISOString(),
     };
+  }
+
+  public async generateDiagnosticReportNative(): Promise<DiagnosticReport> {
+    if (
+      this.hasNativeRelationalRpc &&
+      isBrowserRuntime() &&
+      (window.location.hostname === "127.0.0.1" ||
+        window.location.hostname === "localhost")
+    ) {
+      try {
+        const res = await nativeFetch("/__audora_rpc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ op: "diagnostic_report" }),
+        });
+        if (res.ok) {
+          const parsed = (await res.json()) as { ok?: boolean; data?: DiagnosticReport };
+          if (parsed.ok && parsed.data) {
+            return {
+              ...parsed.data,
+              app_version: this.getCurrentVersion(),
+              playback_state: this.snapshot.state,
+              last_error_code: this.snapshot.error?.code ?? parsed.data.last_error_code,
+            };
+          }
+        }
+      } catch {
+        // Fall back to local report when running outside native shell
+      }
+    }
+    return this.generateDiagnosticReport();
   }
 
   public getCurrentVersion(): string {
@@ -2771,7 +3074,9 @@ export class AudoraIpcClient {
     } catch {
       // Ignore storage errors.
     }
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      this.persistToStorage();
+    }
     return {
       ...status,
       current_version: clean,
@@ -2864,7 +3169,9 @@ export class AudoraIpcClient {
   public dismissUpdate(version: string): AppUpdateStatusDto {
     const clean = version.trim().replace(/^v/i, "");
     this.settings.dismissed_update_version = clean;
-    this.persistToStorage();
+    if (!this.dispatchRelationalRpc({ op: "save_settings", settings: this.settings })) {
+      this.persistToStorage();
+    }
     return this.checkForUpdates(false);
   }
 

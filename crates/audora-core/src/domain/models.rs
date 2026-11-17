@@ -97,6 +97,8 @@ pub struct MediaItem {
     pub display_name: String,
     pub media_kind: MediaKind,
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_probed: bool,
     pub last_position_ms: u64,
     pub completed: bool,
     pub file_size_bytes: Option<u64>,
@@ -106,6 +108,8 @@ pub struct MediaItem {
     pub last_opened_at: Option<String>,
     pub last_seen_at: String,
     pub note_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_folder_id: Option<String>,
 }
 
 impl MediaItem {
@@ -321,6 +325,10 @@ pub struct AppSettings {
     pub dismissed_update_version: Option<String>,
     #[serde(default)]
     pub source_folders: Vec<TrustedSourceFolder>,
+    #[serde(default = "default_true")]
+    pub show_playlists_bar: bool,
+    #[serde(default = "default_true")]
+    pub show_side_panel: bool,
 }
 
 impl Default for AppSettings {
@@ -336,8 +344,51 @@ impl Default for AppSettings {
             installed_version: None,
             dismissed_update_version: None,
             source_folders: Vec::new(),
+            show_playlists_bar: true,
+            show_side_panel: true,
         }
     }
+}
+
+/// Persisted playback queue and transport session state stored in `settings` (`playback_session_v1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedPlaybackSession {
+    pub active_media_id: Option<MediaId>,
+    pub queue: Vec<MediaId>,
+    pub volume: f64,
+    pub muted: bool,
+    pub rate: f64,
+    pub repeat_mode: RepeatMode,
+    pub shuffle: bool,
+}
+
+impl Default for PersistedPlaybackSession {
+    fn default() -> Self {
+        Self {
+            active_media_id: None,
+            queue: Vec::new(),
+            volume: 1.0,
+            muted: false,
+            rate: 1.0,
+            repeat_mode: RepeatMode::Off,
+            shuffle: false,
+        }
+    }
+}
+
+/// Full relational state snapshot exported/imported across `media`, `notes`, `playlists`, and `settings`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelationalAppStateDto {
+    #[serde(default)]
+    pub media: Vec<MediaItem>,
+    #[serde(default)]
+    pub notes: Vec<Note>,
+    #[serde(default)]
+    pub playlists: Vec<Playlist>,
+    #[serde(default)]
+    pub settings: AppSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playback_session: Option<PersistedPlaybackSession>,
 }
 
 /// Release manifest describing an available Audora release asset.

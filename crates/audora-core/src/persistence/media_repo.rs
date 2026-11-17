@@ -23,10 +23,12 @@ impl SqliteMediaRepository {
         let kind_str: String = row.get("media_kind")?;
         let avail_str: String = row.get("availability")?;
         let duration_i64: Option<i64> = row.get("duration_ms")?;
+        let duration_probed_int: i64 = row.get("duration_probed").unwrap_or(0);
         let last_pos_i64: i64 = row.get("last_position_ms")?;
         let completed_int: i64 = row.get("completed")?;
         let size_i64: Option<i64> = row.get("file_size_bytes")?;
         let note_count_i64: i64 = row.get("note_count").unwrap_or(0);
+        let source_folder_id: Option<String> = row.get("source_folder_id").unwrap_or(None);
 
         Ok(MediaItem {
             id: row.get("id")?,
@@ -34,6 +36,7 @@ impl SqliteMediaRepository {
             display_name: row.get("display_name")?,
             media_kind: MediaKind::from_db_str(&kind_str).unwrap_or(MediaKind::Video),
             duration_ms: duration_i64.and_then(|v| u64::try_from(v).ok()),
+            duration_probed: duration_probed_int != 0,
             last_position_ms: u64::try_from(last_pos_i64).unwrap_or(0),
             completed: completed_int != 0,
             file_size_bytes: size_i64.and_then(|v| u64::try_from(v).ok()),
@@ -43,6 +46,7 @@ impl SqliteMediaRepository {
             last_opened_at: row.get("last_opened_at")?,
             last_seen_at: row.get("last_seen_at")?,
             note_count: usize::try_from(note_count_i64).unwrap_or(0),
+            source_folder_id,
         })
     }
     fn escape_like_pattern(raw: &str) -> String {
@@ -81,10 +85,12 @@ impl MediaRepository for SqliteMediaRepository {
                              display_name = ?3,
                              media_kind = ?4,
                              duration_ms = COALESCE(?5, duration_ms),
+                             duration_probed = CASE WHEN ?10 != 0 THEN 1 ELSE duration_probed END,
                              file_size_bytes = COALESCE(?6, file_size_bytes),
                              availability = ?7,
                              last_opened_at = ?8,
-                             last_seen_at = ?9
+                             last_seen_at = ?9,
+                             source_folder_id = COALESCE(?11, source_folder_id)
                          WHERE id = ?1",
                         params![
                             item.id,
@@ -96,6 +102,8 @@ impl MediaRepository for SqliteMediaRepository {
                             item.availability.as_str(),
                             item.last_opened_at,
                             item.last_seen_at,
+                            i64::from(item.duration_probed),
+                            item.source_folder_id,
                         ],
                     )?;
                     tx.commit()?;
@@ -104,24 +112,27 @@ impl MediaRepository for SqliteMediaRepository {
             }
             tx.execute(
                 "INSERT INTO media (
-                    id, path, display_name, media_kind, duration_ms, last_position_ms,
-                    completed, file_size_bytes, fingerprint, availability, added_at,
-                    last_opened_at, last_seen_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    id, path, display_name, media_kind, duration_ms, duration_probed,
+                    last_position_ms, completed, file_size_bytes, fingerprint, availability,
+                    added_at, last_opened_at, last_seen_at, source_folder_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 ON CONFLICT(path) DO UPDATE SET
                     display_name = excluded.display_name,
                     media_kind = excluded.media_kind,
                     duration_ms = COALESCE(excluded.duration_ms, media.duration_ms),
+                    duration_probed = CASE WHEN excluded.duration_probed != 0 THEN 1 ELSE media.duration_probed END,
                     file_size_bytes = COALESCE(excluded.file_size_bytes, media.file_size_bytes),
                     availability = excluded.availability,
-                    last_opened_at = excluded.last_opened_at,
-                    last_seen_at = excluded.last_seen_at",
+                    last_opened_at = COALESCE(excluded.last_opened_at, media.last_opened_at),
+                    last_seen_at = excluded.last_seen_at,
+                    source_folder_id = COALESCE(excluded.source_folder_id, media.source_folder_id)",
                 params![
                     item.id,
                     item.path,
                     item.display_name,
                     item.media_kind.as_str(),
                     item.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                    i64::from(item.duration_probed),
                     i64::try_from(item.last_position_ms).unwrap_or(0),
                     i64::from(item.completed),
                     item.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
@@ -130,6 +141,7 @@ impl MediaRepository for SqliteMediaRepository {
                     item.added_at,
                     item.last_opened_at,
                     item.last_seen_at,
+                    item.source_folder_id,
                 ],
             )?;
             tx.commit()?;

@@ -2,4 +2,4 @@
 
 pub mod playback;
 
-pub use playback::{FakePlaybackBackend, GStreamerBackend};
+pub use playback::{probe_container_duration_ms, FakePlaybackBackend, GStreamerBackend};

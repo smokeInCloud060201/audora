@@ -39,7 +39,9 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Window, WindowBuilder};
 use tracing::{error, info, warn};
-use wry::{BackgroundThrottlingPolicy, DragDropEvent, WebContext, WebViewBuilder};
+use wry::{
+    BackgroundThrottlingPolicy, DragDropEvent, NewWindowResponse, WebContext, WebViewBuilder,
+};
 
 #[derive(Debug, Clone)]
 enum DesktopUserEvent {
@@ -615,7 +617,7 @@ fn main() {
     let allowed_ip_prefix = format!("http://127.0.0.1:{server_port}/");
     let ipc_proxy = proxy.clone();
     let drop_proxy = proxy.clone();
-    let webview = match WebViewBuilder::with_web_context(&mut web_context)
+    let webview = match WebViewBuilder::new_with_web_context(&mut web_context)
         .with_url(&server_url)
         .with_initialization_script_for_main_only(&init_script, true)
         .with_ipc_handler(move |request| {
@@ -659,11 +661,11 @@ fn main() {
             }
             true
         })
-        .with_new_window_req_handler(|uri: String| {
+        .with_new_window_req_handler(|uri: String, _| {
             if uri.starts_with("https://github.com/smokeInCloud060201/audora/") {
                 open_external_https_url(&uri);
             }
-            false
+            NewWindowResponse::Deny
         })
         .with_background_color(bg_color)
         .with_background_throttling(BackgroundThrottlingPolicy::Disabled)

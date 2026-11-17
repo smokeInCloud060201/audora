@@ -62,6 +62,7 @@ pub struct AudoraAppService {
     playback_backend: Arc<dyn PlaybackBackend>,
     snapshot: Mutex<PlaybackSnapshot>,
     app_data_dir: PathBuf,
+    db: Option<crate::persistence::Database>,
 }
 
 impl AudoraAppService {
@@ -113,7 +114,14 @@ impl AudoraAppService {
             playback_backend,
             snapshot: Mutex::new(snapshot),
             app_data_dir,
+            db: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_database(mut self, db: crate::persistence::Database) -> Self {
+        self.db = Some(db);
+        self
     }
 
     #[must_use]
@@ -1398,7 +1406,35 @@ impl AudoraAppService {
 
     /// Cleans all local application caches, update staging files, and database artifacts in `app_data_dir`.
     pub fn cleanup_application_data(&self) -> AppResult<CleanupSummaryDto> {
-        cleanup_all_app_artifacts(&self.app_data_dir)
+        let mut vacuum_reclaimed: u64 = 0;
+        let mut active_db_file: Option<PathBuf> = None;
+        if let Some(ref db) = self.db {
+            if let Some(db_path) = db.db_path().map(Path::to_path_buf) {
+                let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+                let before_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0)
+                    + fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+                let _ = db.reset_all_user_data();
+                let _ = db.with_conn(|conn| {
+                    let _ = conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+                    Ok(())
+                });
+                let after_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0)
+                    + fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+                vacuum_reclaimed = before_bytes.saturating_sub(after_bytes);
+                if before_bytes > 0 {
+                    active_db_file = Some(db_path);
+                }
+            }
+        }
+        let mut summary = cleanup_all_app_artifacts(&self.app_data_dir)?;
+        summary.bytes_reclaimed = summary.bytes_reclaimed.saturating_add(vacuum_reclaimed);
+        if let Some(db_file) = active_db_file {
+            let db_display = db_file.display().to_string();
+            if !summary.removed_paths.iter().any(|p| p == &db_display) {
+                summary.removed_paths.push(db_display);
+            }
+        }
+        Ok(summary)
     }
 }
 
@@ -1558,14 +1594,11 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
                 if matches_arch {
                     if best_arch_match
                         .as_ref()
-                        .map_or(true, |(r, _, _, _)| rank < *r)
+                        .is_none_or(|(r, _, _, _)| rank < *r)
                     {
                         best_arch_match = Some((rank, url.to_owned(), size, asset_sha));
                     }
-                } else if best_os_match
-                    .as_ref()
-                    .map_or(true, |(r, _, _, _)| rank < *r)
-                {
+                } else if best_os_match.as_ref().is_none_or(|(r, _, _, _)| rank < *r) {
                     best_os_match = Some((rank, url.to_owned(), size, asset_sha));
                 }
             }

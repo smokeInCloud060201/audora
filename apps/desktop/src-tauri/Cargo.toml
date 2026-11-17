@@ -16,7 +16,7 @@ name = "audora"
 path = "src/main.rs"
 
 [dependencies]
-audora-core = { path = "../../../crates/audora-core" }
+audora-core.workspace = true
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true

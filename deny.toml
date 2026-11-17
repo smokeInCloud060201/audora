@@ -4,6 +4,10 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # Transitive unmaintained macro crate in frozen upstream Linux `gtk3-rs` (`gtk 0.18` <- `tao`/`wry`); no upstream upgrade exists.
+    { id = "RUSTSEC-2024-0370", reason = "Transitive proc-macro-error 1.0.4 via Linux gtk 0.18 (tao/wry); no safe upstream upgrade exists" },
+]
 
 [licenses]
 version = 2
@@ -27,6 +31,7 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

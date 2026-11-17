@@ -88,7 +88,7 @@ Download the latest signed/verified package for your platform from [**GitHub Rel
 
 #### Prerequisites
 
-- **Rust** `1.80+` (`rustup`)
+- **Rust** `1.89+` (`rustup`)
 - **Node.js** `22+` and **pnpm** `10+`
 - **Linux only** *(Ubuntu/Debian system packages)*:
   ```bash

@@ -55,6 +55,30 @@ impl Default for FakePlaybackBackend {
     }
 }
 
+fn normalize_probe_key(path: &Path) -> PathBuf {
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(canon) => {
+            let lossy = canon.to_string_lossy();
+            if let Some(unc) = lossy.strip_prefix(r"\\?\UNC\") {
+                PathBuf::from(format!(r"\\{unc}"))
+            } else if let Some(stripped) = lossy.strip_prefix(r"\\?\") {
+                PathBuf::from(stripped)
+            } else {
+                canon
+            }
+        }
+        Err(_) => path.to_path_buf(),
+    };
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(resolved.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        resolved
+    }
+}
+
 impl FakePlaybackBackend {
     #[must_use]
     pub fn new() -> Self {
@@ -66,26 +90,29 @@ impl FakePlaybackBackend {
 
     /// Registers a deterministic probe result for a specific file path.
     pub fn register_probe(&self, path: impl Into<PathBuf>, metadata: ProbedMediaMetadata) {
+        let key = normalize_probe_key(&path.into());
         if let Ok(mut map) = self.custom_probes.lock() {
-            map.insert(path.into(), Ok(metadata));
+            map.insert(key, Ok(metadata));
         }
     }
 
     /// Registers an unsupported format failure (`AV-104`) for a specific file path.
     pub fn register_unsupported(&self, path: impl Into<PathBuf>, reason: impl Into<String>) {
+        let key = normalize_probe_key(&path.into());
         if let Ok(mut map) = self.custom_probes.lock() {
-            map.insert(path.into(), Err(reason.into()));
+            map.insert(key, Err(reason.into()));
         }
     }
 }
 
 impl PlaybackBackend for FakePlaybackBackend {
     fn probe_media(&self, path: &Path) -> AppResult<ProbedMediaMetadata> {
+        let key = normalize_probe_key(path);
         let custom = self
             .custom_probes
             .lock()
             .map_err(|_| AppError::internal("Playback probe lock poisoned"))?
-            .get(path)
+            .get(&key)
             .cloned();
 
         if let Some(result) = custom {
@@ -449,7 +476,7 @@ impl PlaybackBackend for GStreamerBackend {
                     "format=duration",
                     "-of",
                     "default=noprint_wrappers=1:nokey=1",
-                    "--",
+                    "-i",
                 ])
                 .arg(path);
                 if let Ok(out) = run_command_with_timeout(&mut cmd, Duration::from_secs(6)) {

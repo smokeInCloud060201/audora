@@ -8,23 +8,24 @@ members = [
 [workspace.package]
 version = "1.0.3"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["Audora Contributors"]
 repository = "https://github.com/smokeInCloud060201/audora"
 
 [workspace.dependencies]
+audora-core = { version = "1.0.3", path = "crates/audora-core" }
 getrandom = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tao = "0.31"
+tao = "0.37"
 tempfile = "3.13"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-wry = "0.48"
+wry = "0.57"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

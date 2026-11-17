@@ -10,11 +10,11 @@ This file documents the third-party open-source components used by Audora and th
 
 | Crate | Version | License | Usage |
 | :--- | :--- | :--- | :--- |
-| `rusqlite` & `libsqlite3-sys` | `0.32.1` / `0.30.1` | `MIT` (SQLite is Public Domain) | Local SQLite WAL persistence, backups, and schema migrations |
+| `rusqlite` & `libsqlite3-sys` | `0.43.0` / `0.40.0` | `MIT` (SQLite is Public Domain) | Local SQLite WAL persistence, backups, and schema migrations |
 | `serde` & `serde_json` | `1.0.229` / `1.0.154` | `MIT OR Apache-2.0` | Typed IPC command, state, and manifest serialization |
 | `sha2` | `0.10.9` | `MIT OR Apache-2.0` | Cryptographic SHA-256 verification and session token generation |
-| `tao` | `0.31.1` | `Apache-2.0` | Cross-platform native OS window creation and event loop |
-| `wry` | `0.48.1` | `Apache-2.0 OR MIT` | Cross-platform system WebView binding (`WKWebView`, `WebView2`, `WebKitGTK`) |
+| `tao` | `0.37.2` | `Apache-2.0` | Cross-platform native OS window creation and event loop |
+| `wry` | `0.57.2` | `Apache-2.0 OR MIT` | Cross-platform system WebView binding (`WKWebView`, `WebView2`, `WebKitGTK`) |
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | Structured `AV-*` domain error definitions |
 | `tracing` & `tracing-subscriber` | `0.1.44` / `0.3.23` | `MIT` | Redacted local diagnostic logging |
 
@@ -27,7 +27,7 @@ All Rust dependencies are audited in CI via [`deny.toml`](deny.toml) (`cargo-den
 | Package | Version | License | Usage |
 | :--- | :--- | :--- | :--- |
 | `react` & `react-dom` | `19.3.1` | `MIT` | User interface rendering (`apps/desktop/ui/`) |
-| `vite` & `vitest` (dev/build only) | `6.4.6` / `2.1.9` | `MIT` | Frontend bundling and unit testing |
+| `vite` & `vitest` (dev/build only) | `6.4.6` / `4.1.12` | `MIT` | Frontend bundling and unit testing |
 | `typescript` (dev/build only) | `5.9.3` | `Apache-2.0` | Static type checking |
 
 ---

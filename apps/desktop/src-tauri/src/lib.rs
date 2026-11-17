@@ -12,7 +12,10 @@ use std::path::PathBuf;
 #[must_use]
 pub fn default_app_data_dir() -> PathBuf {
     if let Ok(custom) = env::var("AUDORA_DATA_DIR") {
-        return PathBuf::from(custom);
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() && !trimmed.chars().any(char::is_control) {
+            return PathBuf::from(trimmed);
+        }
     }
     let home = env::var("HOME")
         .or_else(|_| env::var("USERPROFILE"))
@@ -29,6 +32,12 @@ pub fn default_app_data_dir() -> PathBuf {
             .join("com.audora.desktop")
             .join("data")
     } else {
+        if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+            let trimmed = xdg.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("com.audora.desktop");
+            }
+        }
         PathBuf::from(home)
             .join(".local")
             .join("share")
@@ -40,7 +49,10 @@ pub fn default_app_data_dir() -> PathBuf {
 #[must_use]
 pub fn default_database_path() -> PathBuf {
     if let Ok(custom) = env::var("AUDORA_DB_PATH") {
-        return PathBuf::from(custom);
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() && !trimmed.chars().any(char::is_control) {
+            return PathBuf::from(trimmed);
+        }
     }
     default_app_data_dir().join("audora.sqlite")
 }

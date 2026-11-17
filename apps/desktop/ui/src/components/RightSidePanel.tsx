@@ -1,6 +1,12 @@
 import React from "react";
 import { ipcClient } from "../api/ipc";
-import type { MediaItem, Note, PlaybackSnapshot, SidePanelTab } from "../types/domain";
+import type {
+  MediaItem,
+  Note,
+  PlaybackSnapshot,
+  SidePanelTab,
+  TimestampPrecision,
+} from "../types/domain";
 import { formatDurationMs } from "../utils/format";
 import {
   IconArrowRight,
@@ -31,6 +37,7 @@ interface RightSidePanelProps {
   onOpenSaveQueueModal: () => void;
   onCycleRepeatMode: () => void;
   onCollapse: () => void;
+  timestampPrecision: TimestampPrecision;
 }
 
 export function RightSidePanel({
@@ -51,25 +58,44 @@ export function RightSidePanel({
   onOpenSaveQueueModal,
   onCycleRepeatMode,
   onCollapse,
+  timestampPrecision,
 }: RightSidePanelProps): React.ReactElement {
   return (
     <aside className="side-panel" aria-label="Queue and notes" data-testid="side-panel">
       <div className="panel-tabs" role="tablist">
         <button
+          id="side-tab-queue"
           type="button"
           role="tab"
           aria-selected={sideTab === "queue"}
+          aria-controls="side-tabpanel-queue"
+          tabIndex={sideTab === "queue" ? 0 : -1}
           className="panel-tab-btn"
           onClick={() => onSelectSideTab("queue")}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+              e.preventDefault();
+              onSelectSideTab(sideTab === "queue" ? "notes" : "queue");
+            }
+          }}
         >
           Queue ({snapshot.queue.length})
         </button>
         <button
+          id="side-tab-notes"
           type="button"
           role="tab"
           aria-selected={sideTab === "notes"}
+          aria-controls="side-tabpanel-notes"
+          tabIndex={sideTab === "notes" ? 0 : -1}
           className="panel-tab-btn"
           onClick={() => onSelectSideTab("notes")}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+              e.preventDefault();
+              onSelectSideTab(sideTab === "notes" ? "queue" : "notes");
+            }
+          }}
         >
           Notes ({activeNotes.length})
         </button>
@@ -86,7 +112,12 @@ export function RightSidePanel({
       </div>
 
       {sideTab === "notes" ? (
-        <>
+        <div
+          id="side-tabpanel-notes"
+          role="tabpanel"
+          aria-labelledby="side-tab-notes"
+          style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}
+        >
           <div className="panel-header">
             <div>
               <div style={{ fontSize: 14, fontWeight: 600 }}>Timestamped notes</div>
@@ -148,7 +179,9 @@ export function RightSidePanel({
                           onClick={() => onJumpToNote(note.id)}
                         >
                           <IconPlay size={10} />
-                          <span>{formatDurationMs(note.position_ms)}</span>
+                          <span>
+                            {formatDurationMs(note.position_ms, timestampPrecision)}
+                          </span>
                         </button>
                         {isOutOfRange && (
                           <span
@@ -172,7 +205,7 @@ export function RightSidePanel({
                         <button
                           type="button"
                           className="jump-link-btn"
-                          aria-label={`More actions for note at ${formatDurationMs(note.position_ms)}`}
+                          aria-label={`More actions for note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
                           onClick={() =>
                             onSetOpenNoteMenuId((prev) =>
                               prev === note.id ? null : note.id,
@@ -249,9 +282,14 @@ export function RightSidePanel({
               })
             )}
           </div>
-        </>
+        </div>
       ) : (
-        <>
+        <div
+          id="side-tabpanel-queue"
+          role="tabpanel"
+          aria-labelledby="side-tab-queue"
+          style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}
+        >
           <div className="panel-header">
             <div>
               <div style={{ fontSize: 14, fontWeight: 600 }}>Up next</div>
@@ -380,7 +418,7 @@ export function RightSidePanel({
               );
             })}
           </div>
-        </>
+        </div>
       )}
     </aside>
   );

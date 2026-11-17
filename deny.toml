@@ -1,5 +1,5 @@
 # cargo-deny configuration for Audora (Apache-2.0 project policy)
-# Enforces ADR 0002: permissive dependencies only in Rust crates; no GPL/AGPL.
+# Enforces ADR 0002: permissive and weak-copyleft file-scoped crates only; no GPL/AGPL/SSPL.
 
 [advisories]
 version = 2

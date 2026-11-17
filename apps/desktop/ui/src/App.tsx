@@ -42,7 +42,7 @@ import type {
   SidePanelTab,
   TrustedSourceFolder,
 } from "./types/domain";
-import { formatDurationMs } from "./utils/format";
+import { formatDurationMs, shouldSuppressGlobalShortcut } from "./utils/format";
 
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const WAVEFORM_BAR_HEIGHTS = [24, 42, 68, 52, 88, 60, 34, 76, 94, 64, 46, 82, 58, 38, 72, 50, 32, 22];
@@ -84,6 +84,7 @@ export function App(): React.ReactElement {
   const [pendingMismatchRelink, setPendingMismatchRelink] = useState<{
     mediaId: string;
     newPath: string;
+    probedDurationMs?: number;
     payload: AppErrorPayload;
   } | null>(null);
 
@@ -196,7 +197,20 @@ export function App(): React.ReactElement {
       navigator.mediaDevices.removeEventListener("devicechange", onDeviceChange);
   }, []);
 
-  // Real-time playback clock tick when playing a library item without an external HTML5 media stream
+  // Flush playback position & state immediately on window close / page hide (`C-9`)
+  useEffect(() => {
+    const flush = () => {
+      ipcClient.flushPendingPersistence();
+    };
+    window.addEventListener("beforeunload", flush);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      window.removeEventListener("pagehide", flush);
+    };
+  }, []);
+
+  // Real-time playback clock tick ONLY in non-persisted headless/blob fallback when no native stream exists
   useEffect(() => {
     if (snapshot.state !== "playing") {
       return undefined;
@@ -205,6 +219,17 @@ export function App(): React.ReactElement {
       ? ipcClient.getMediaById(snapshot.media_id)
       : null;
     if (currentMedia?.stream_url) {
+      return undefined;
+    }
+    if (ipcClient.isPersistedRuntime() && currentMedia) {
+      // A persisted bare filename lost its session blob URL; prompt user to locate the file on disk (`C-9`).
+      const marked = ipcClient.markMediaMissing(currentMedia.id);
+      setSnapshot(ipcClient.getPlaybackSnapshot());
+      setMissingMediaTarget(marked);
+      setRelinkPathDraft(marked.path);
+      setRelinkError(null);
+      setSection("library");
+      setLibraryVersion((v) => v + 1);
       return undefined;
     }
     const interval = window.setInterval(() => {
@@ -255,12 +280,12 @@ export function App(): React.ReactElement {
 
   const libraryResult = useMemo(
     () => ipcClient.searchLibrary(searchQuery, libraryFilter),
-    [searchQuery, libraryFilter, snapshot, isNoteModalOpen, deletedNoteToast, libraryVersion],
+    [searchQuery, libraryFilter, isNoteModalOpen, deletedNoteToast, libraryVersion, settings],
   );
 
   const allMedia = useMemo(
     () => ipcClient.searchLibrary("", "all").media_items,
-    [snapshot, isNoteModalOpen, deletedNoteToast, missingMediaTarget, libraryVersion],
+    [isNoteModalOpen, deletedNoteToast, missingMediaTarget, libraryVersion, settings],
   );
 
   const activeMedia = useMemo(
@@ -280,11 +305,12 @@ export function App(): React.ReactElement {
 
   const playlists = useMemo(
     () => ipcClient.listPlaylists(),
-    [settings, snapshot, libraryVersion, deletedPlaylistToast],
+    [settings, libraryVersion, deletedPlaylistToast],
   );
 
   const showPlaylistsBar = settings.show_playlists_bar !== false;
   const showSidePanel = settings.show_side_panel !== false;
+  const timestampPrecision = settings.timestamp_precision;
 
   const togglePlaylistsBar = () => {
     setSettings((prev) =>
@@ -304,99 +330,117 @@ export function App(): React.ReactElement {
     );
   };
 
-  // Global keyboard shortcuts (Section 5 of `docs/UI_DESIGN.md`)
+  const isAnyModalOpen = Boolean(
+    isNoteModalOpen ||
+      pendingMismatchRelink ||
+      addToPlaylistTarget ||
+      isSaveQueueModalOpen ||
+      isUpdateDialogOpen ||
+      (typeof document !== "undefined" && document.querySelector('[role="dialog"]')),
+  );
+
+  const shortcutHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
+  shortcutHandlerRef.current = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null;
+    const inputType = target instanceof HTMLInputElement ? target.type : null;
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      if (settings.window_mode === "minimum") {
+        setSettings(ipcClient.setWindowMode("full"));
+      }
+      setSection("library");
+      setTimeout(() => searchInputRef.current?.focus(), 20);
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+      e.preventDefault();
+      triggerOpenMediaPicker();
+      return;
+    }
+
+    if (e.key === "Escape") {
+      if (addToPlaylistTarget) {
+        setAddToPlaylistTarget(null);
+        return;
+      }
+      if (isSaveQueueModalOpen) {
+        setIsSaveQueueModalOpen(false);
+        return;
+      }
+      if (isUpdateDialogOpen) {
+        setIsUpdateDialogOpen(false);
+        return;
+      }
+      if (pendingMismatchRelink) {
+        setPendingMismatchRelink(null);
+        return;
+      }
+      if (isNoteModalOpen) {
+        setIsNoteModalOpen(false);
+        return;
+      }
+      if (openNoteMenuId) {
+        setOpenNoteMenuId(null);
+        return;
+      }
+      if (openLibraryMenuId) {
+        setOpenLibraryMenuId(null);
+        return;
+      }
+      if (settings.window_mode === "minimum") {
+        setSettings(ipcClient.setWindowMode("full"));
+        return;
+      }
+    }
+
+    if (
+      shouldSuppressGlobalShortcut(
+        target?.tagName,
+        Boolean(target?.isContentEditable),
+        isAnyModalOpen,
+        inputType,
+      )
+    ) {
+      return;
+    }
+
+    if (e.code === "Space") {
+      e.preventDefault();
+      setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: -5000 }));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: 5000 }));
+    } else if (e.key.toLowerCase() === "n" && e.shiftKey) {
+      e.preventDefault();
+      handleCreateQuickMarker();
+    } else if (e.key.toLowerCase() === "n") {
+      e.preventDefault();
+      openAddNoteModal();
+    } else if (e.key.toLowerCase() === "m") {
+      e.preventDefault();
+      setSettings((prev) =>
+        ipcClient.setWindowMode(prev.window_mode === "full" ? "minimum" : "full"),
+      );
+    } else if (e.key === "[") {
+      e.preventDefault();
+      togglePlaylistsBar();
+    } else if (e.key === "]") {
+      e.preventDefault();
+      toggleSidePanel();
+    }
+  };
+
+  // Bind global keydown listener ONCE instead of tearing down on every timeupdate (`H-6`)
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      const isEditable =
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target?.isContentEditable;
-
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setSection("library");
-        setTimeout(() => searchInputRef.current?.focus(), 20);
-        return;
-      }
-
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
-        e.preventDefault();
-        fileInputRef.current?.click();
-        return;
-      }
-
-      if (e.key === "Escape") {
-        if (addToPlaylistTarget) {
-          setAddToPlaylistTarget(null);
-          return;
-        }
-        if (isSaveQueueModalOpen) {
-          setIsSaveQueueModalOpen(false);
-          return;
-        }
-        if (isUpdateDialogOpen) {
-          setIsUpdateDialogOpen(false);
-          return;
-        }
-        if (pendingMismatchRelink) {
-          setPendingMismatchRelink(null);
-          return;
-        }
-        if (isNoteModalOpen) {
-          setIsNoteModalOpen(false);
-          return;
-        }
-        if (openNoteMenuId) {
-          setOpenNoteMenuId(null);
-          return;
-        }
-        if (openLibraryMenuId) {
-          setOpenLibraryMenuId(null);
-          return;
-        }
-        if (settings.window_mode === "minimum") {
-          setSettings(ipcClient.setWindowMode("full"));
-          return;
-        }
-      }
-
-      if (isEditable) {
-        return;
-      }
-
-      if (e.code === "Space") {
-        e.preventDefault();
-        setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
-      } else if (e.key === "ArrowLeft") {
-        e.preventDefault();
-        setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: -5000 }));
-      } else if (e.key === "ArrowRight") {
-        e.preventDefault();
-        setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: 5000 }));
-      } else if (e.key.toLowerCase() === "n" && e.shiftKey) {
-        e.preventDefault();
-        handleCreateQuickMarker();
-      } else if (e.key.toLowerCase() === "n") {
-        e.preventDefault();
-        openAddNoteModal();
-      } else if (e.key.toLowerCase() === "m") {
-        e.preventDefault();
-        setSettings((prev) =>
-          ipcClient.setWindowMode(prev.window_mode === "full" ? "minimum" : "full"),
-        );
-      } else if (e.key === "[") {
-        e.preventDefault();
-        togglePlaylistsBar();
-      } else if (e.key === "]") {
-        e.preventDefault();
-        toggleSidePanel();
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  });
+    const listener = (e: KeyboardEvent) => shortcutHandlerRef.current(e);
+    window.addEventListener("keydown", listener);
+    return () => window.removeEventListener("keydown", listener);
+  }, []);
 
   // Dismiss open row/note action menus when clicking outside
   useEffect(() => {
@@ -566,7 +610,7 @@ export function App(): React.ReactElement {
     }
   };
 
-  const handleSelectLibraryItem = (item: MediaItem) => {
+  const handleSelectLibraryItem = (item: MediaItem, autoPlay = false) => {
     setUnsupportedError(null);
     setOpenLibraryMenuId(null);
     if (item.availability === "missing") {
@@ -577,9 +621,10 @@ export function App(): React.ReactElement {
       return;
     }
     try {
-      ipcClient.selectMediaById(item.id);
+      ipcClient.selectMediaById(item.id, { autoPlay });
       setMissingMediaTarget(null);
       setSnapshot(ipcClient.getPlaybackSnapshot());
+      setLibraryVersion((v) => v + 1);
       setSection("now_playing");
     } catch (err) {
       const payload = err as AppErrorPayload;
@@ -731,24 +776,68 @@ export function App(): React.ReactElement {
     })();
   };
 
-  const handleAttemptRelink = (mediaId: string, newPath: string, confirmMismatch = false) => {
-    try {
-      const relinked = ipcClient.relinkMedia(mediaId, newPath, { confirmMismatch });
-      setPendingMismatchRelink(null);
-      setRelinkError(null);
-      setMissingMediaTarget(null);
-      ipcClient.selectMediaById(relinked.id);
-      setSnapshot(ipcClient.getPlaybackSnapshot());
-      setLibraryVersion((v) => v + 1);
-      setSection("now_playing");
-    } catch (err) {
-      const payload = err as AppErrorPayload;
-      if (payload.code === "AV-202") {
-        setPendingMismatchRelink({ mediaId, newPath, payload });
-      } else {
-        setRelinkError(payload);
+  const handleAttemptRelink = (
+    mediaId: string,
+    newPath: string,
+    confirmMismatch = false,
+    explicitProbedDurationMs?: number,
+  ) => {
+    void (async () => {
+      let probedDurationMs = explicitProbedDurationMs;
+      if (probedDurationMs === undefined) {
+        const probeRes = await ipcClient.probeNativeMediaDuration(newPath);
+        if (probeRes && !probeRes.exists) {
+          setRelinkError({
+            code: "AV-101",
+            category: "MediaUnavailable",
+            title: "Replacement file not found",
+            message:
+              "Selected replacement file does not exist or is not registered yet. Use 'Locate file…' to select it from disk.",
+            recovery_steps: ["Click 'Locate file…' to browse and authorize the relocated file."],
+            recoverable: true,
+          });
+          return;
+        }
+        if (probeRes?.durationMs) {
+          probedDurationMs = probeRes.durationMs;
+        }
       }
-    }
+      try {
+        const relinked = ipcClient.relinkMedia(mediaId, newPath, {
+          confirmMismatch,
+          probedDurationMs,
+        });
+        setPendingMismatchRelink(null);
+        setRelinkError(null);
+        setMissingMediaTarget(null);
+        ipcClient.selectMediaById(relinked.id);
+        setSnapshot(ipcClient.getPlaybackSnapshot());
+        setLibraryVersion((v) => v + 1);
+        setSection("now_playing");
+      } catch (err) {
+        const payload = err as AppErrorPayload;
+        if (payload.code === "AV-202") {
+          setPendingMismatchRelink({ mediaId, newPath, probedDurationMs, payload });
+        } else {
+          setRelinkError(payload);
+        }
+      }
+    })();
+  };
+
+  const handleBrowseRelinkFile = (mediaId: string) => {
+    void (async () => {
+      const picked = await ipcClient.pickSingleMediaFileForRelink();
+      if (!picked.supported) {
+        handleAttemptRelink(mediaId, relinkPathDraft, false);
+        return;
+      }
+      if (picked.cancelled || !picked.file) {
+        return;
+      }
+      setRelinkPathDraft(picked.file.path);
+      handleAttemptRelink(mediaId, picked.file.path, false, picked.file.durationMs);
+    })();
   };
 
   const cyclePlaybackSpeed = () => {
@@ -817,7 +906,7 @@ export function App(): React.ReactElement {
 
   const sourceFolders = useMemo(
     () => ipcClient.getSourceFolders(),
-    [settings, libraryVersion, snapshot],
+    [settings, libraryVersion],
   );
 
   const currentVersion = updateStatus?.current_version || ipcClient.getCurrentVersion();
@@ -887,23 +976,58 @@ export function App(): React.ReactElement {
   };
 
   const handleJumpToNote = (noteId: string) => {
-    const prevMediaId = snapshot.media_id;
-    const nextSnap = ipcClient.activateNote(noteId);
-    setSnapshot(nextSnap);
-    setSection("now_playing");
-    const el = mediaElementRef.current;
-    if (el && prevMediaId === nextSnap.media_id) {
-      try {
-        el.currentTime = nextSnap.position_ms / 1000;
-      } catch {
-        // Element metadata not ready yet; `onLoadedMetadata` will sync position.
+    try {
+      const prevMediaId = snapshot.media_id;
+      const nextSnap = ipcClient.activateNote(noteId);
+      setSnapshot(nextSnap);
+      setSection("now_playing");
+      const el = mediaElementRef.current;
+      if (el && prevMediaId === nextSnap.media_id) {
+        try {
+          el.currentTime = nextSnap.position_ms / 1000;
+        } catch {
+          // Element metadata not ready yet; `onLoadedMetadata` will sync position.
+        }
+        if (el.paused) {
+          void el.play().catch(() => {
+            // Ignore autoplay restrictions in headless browsers
+          });
+        }
       }
-      if (el.paused) {
-        void el.play().catch(() => {
-          // Ignore autoplay restrictions in headless browsers
-        });
+    } catch (err) {
+      const payload = err as AppErrorPayload;
+      if (payload.code === "AV-101") {
+        const noteMedia = allMedia.find((m) =>
+          ipcClient.listNotes(m.id).some((n) => n.id === noteId),
+        );
+        if (noteMedia) {
+          setMissingMediaTarget(noteMedia);
+          setRelinkPathDraft(noteMedia.path);
+          setRelinkError(null);
+          setSection("library");
+        }
       }
+      showTransientUpdateToast(payload.message ?? "Unable to jump to this moment.");
     }
+  };
+
+  const handleMediaStreamError = () => {
+    if (!activeMedia) return;
+    const marked = ipcClient.markMediaMissing(activeMedia.id);
+    setSnapshot(ipcClient.getPlaybackSnapshot());
+    setLibraryVersion((v) => v + 1);
+    if (settings.window_mode === "minimum") {
+      setSettings(ipcClient.setWindowMode("full"));
+    }
+    setMissingMediaTarget(marked);
+    setRelinkPathDraft(marked.path);
+    setRelinkError(null);
+    setSection("library");
+  };
+
+  const handleMediaEndedSync = () => {
+    setSnapshot(ipcClient.handleMediaEnded());
+    setLibraryVersion((v) => v + 1);
   };
 
   const handleMediaLoadedMetadata = (
@@ -935,62 +1059,27 @@ export function App(): React.ReactElement {
     );
     if (nextSnap.state === "ended" && !el.paused) {
       el.pause();
+      setLibraryVersion((v) => v + 1);
     }
     setSnapshot(nextSnap);
   };
 
-  const persistentAudioElement =
-    activeMedia?.media_kind === "audio" && activeMedia.stream_url ? (
-      <audio
-        ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
-        src={activeMedia.stream_url}
-        onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-        onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
-        onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
-      />
-    ) : null;
-
-  // Minimum mode · 360×168 view (Figma Frame 2:103 / 20:2)
-  if (settings.window_mode === "minimum") {
-    return (
-      <>
-        {persistentAudioElement}
-        <MinimumPlayerWindow
-          activeMedia={activeMedia}
-          snapshot={snapshot}
-          isHelpOpen={isMinHelpOpen}
-          onToggleHelp={() => setIsMinHelpOpen((prev) => !prev)}
-          onCloseHelp={() => setIsMinHelpOpen(false)}
-          onUpdateSettings={setSettings}
-          onUpdateSnapshot={setSnapshot}
-          onOpenMediaPicker={triggerOpenMediaPicker}
-          onDropFiles={handleNativeFilesSelected}
-          fileInputRef={fileInputRef}
-          mediaElementRef={mediaElementRef}
-          onMediaLoadedMetadata={handleMediaLoadedMetadata}
-          onMediaTimeUpdate={handleMediaTimeUpdate}
-        />
-      </>
-    );
-  }
+  const isMinimumMode = settings.window_mode === "minimum";
 
   return (
     <>
-      {persistentAudioElement}
-      <div
-        className="audora-shell"
-      onDragOver={(e) => {
-        e.preventDefault();
-        setIsDraggingFiles(true);
-      }}
-      onDragLeave={() => setIsDraggingFiles(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setIsDraggingFiles(false);
-        handleNativeFilesSelected(e.dataTransfer?.files ?? null);
-      }}
-    >
-      {/* Hidden native file picker input */}
+      {activeMedia?.media_kind === "audio" && activeMedia.stream_url && (
+        <audio
+          ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
+          src={activeMedia.stream_url}
+          onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
+          onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
+          onEnded={handleMediaEndedSync}
+          onError={handleMediaStreamError}
+        />
+      )}
+
+      {/* Hidden native fallback file picker input */}
       <input
         ref={fileInputRef}
         type="file"
@@ -999,6 +1088,39 @@ export function App(): React.ReactElement {
         style={{ display: "none" }}
         onChange={(e) => handleNativeFilesSelected(e.target.files)}
       />
+
+      {/* Minimum mode · 360×168 view (Figma Frame 2:103 / 20:2) */}
+      {isMinimumMode && (
+        <MinimumPlayerWindow
+          activeMedia={activeMedia}
+          snapshot={snapshot}
+          timestampPrecision={timestampPrecision}
+          isHelpOpen={isMinHelpOpen}
+          onToggleHelp={() => setIsMinHelpOpen((prev) => !prev)}
+          onCloseHelp={() => setIsMinHelpOpen(false)}
+          onUpdateSettings={setSettings}
+          onUpdateSnapshot={setSnapshot}
+          onOpenMediaPicker={triggerOpenMediaPicker}
+          onDropFiles={handleNativeFilesSelected}
+        />
+      )}
+
+      {/* Keep `.audora-shell` & `<video>` mounted when in Minimum Mode to prevent dual streams or 00:00 resets (`C-7`) */}
+      <div
+        className="audora-shell"
+        aria-hidden={isMinimumMode || undefined}
+        style={isMinimumMode ? { display: "none" } : undefined}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDraggingFiles(true);
+        }}
+        onDragLeave={() => setIsDraggingFiles(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDraggingFiles(false);
+          handleNativeFilesSelected(e.dataTransfer?.files ?? null);
+        }}
+      >
 
       {isDraggingFiles && (
         <div className="drop-zone-overlay" data-testid="drop-zone-overlay">
@@ -1147,7 +1269,7 @@ export function App(): React.ReactElement {
                   setRelinkError(null);
                   setSection("library");
                 }}
-                onOpenLocalFiles={() => fileInputRef.current?.click()}
+                onOpenLocalFiles={triggerOpenMediaPicker}
                 onPlaylistsMutated={(msg) => {
                   setLibraryVersion((v) => v + 1);
                   if (msg) {
@@ -1290,7 +1412,7 @@ export function App(): React.ReactElement {
                       {activeMedia.display_name}
                     </h1>
                     <p className="canvas-subtitle" style={{ zIndex: 1 }}>
-                      Local audio · {formatDurationMs(snapshot.duration_ms)}
+                      Local audio · {formatDurationMs(snapshot.duration_ms, timestampPrecision)}
                     </p>
                   </div>
                 ) : (
@@ -1313,7 +1435,8 @@ export function App(): React.ReactElement {
                         }}
                         onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
                         onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
-                        onEnded={() => setSnapshot(ipcClient.handleMediaEnded())}
+                        onEnded={handleMediaEndedSync}
+                        onError={handleMediaStreamError}
                       />
                     )}
                     {(!activeMedia || !activeMedia.stream_url) && (
@@ -1326,7 +1449,7 @@ export function App(): React.ReactElement {
                         </h1>
                         <p className="canvas-subtitle">
                           {activeMedia
-                            ? `${activeMedia.path} · ${formatDurationMs(snapshot.duration_ms)}`
+                            ? `${activeMedia.path} · ${formatDurationMs(snapshot.duration_ms, timestampPrecision)}`
                             : "Choose an audio or video file from your device to begin."}
                         </p>
                         {!activeMedia && (
@@ -1350,7 +1473,7 @@ export function App(): React.ReactElement {
                 <section className="transport-bar" aria-label="Playback controls">
                   <div className="scrubber-row">
                     <span className="tabular-nums">
-                      {formatDurationMs(snapshot.position_ms)}
+                      {formatDurationMs(snapshot.position_ms, timestampPrecision)}
                     </span>
                     <div className="scrubber-track-wrapper">
                       {snapshot.duration_ms &&
@@ -1369,10 +1492,10 @@ export function App(): React.ReactElement {
                               type="button"
                               className="scrubber-note-marker"
                               style={{ left: `${leftPct}%` }}
-                              title={`${formatDurationMs(note.position_ms)} — ${
+                              title={`${formatDurationMs(note.position_ms, timestampPrecision)} — ${
                                 note.body || "Quick marker"
                               }`}
-                              aria-label={`Jump to note at ${formatDurationMs(note.position_ms)}`}
+                              aria-label={`Jump to note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
                               onClick={() => handleJumpToNote(note.id)}
                             />
                           );
@@ -1395,7 +1518,7 @@ export function App(): React.ReactElement {
                       />
                     </div>
                     <span className="tabular-nums">
-                      {formatDurationMs(snapshot.duration_ms)}
+                      {formatDurationMs(snapshot.duration_ms, timestampPrecision)}
                     </span>
                   </div>
 
@@ -1575,6 +1698,7 @@ export function App(): React.ReactElement {
                   }}
                   onCycleRepeatMode={cycleRepeatMode}
                   onCollapse={toggleSidePanel}
+                  timestampPrecision={timestampPrecision}
                 />
               )}
           </div>
@@ -1609,7 +1733,9 @@ export function App(): React.ReactElement {
               onSetRelinkPathDraft={setRelinkPathDraft}
               relinkError={relinkError}
               onAttemptRelink={handleAttemptRelink}
+              onBrowseRelinkFile={handleBrowseRelinkFile}
               onClearMissingTarget={() => setMissingMediaTarget(null)}
+              timestampPrecision={timestampPrecision}
             />
           )}
 
@@ -1666,7 +1792,7 @@ export function App(): React.ReactElement {
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span className="timestamp-pill tabular-nums">
                 <IconPlay size={10} />
-                <span>{formatDurationMs(capturedTimestampMs)}</span>
+                <span>{formatDurationMs(capturedTimestampMs, timestampPrecision)}</span>
               </span>
               <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
                 Captured timestamp
@@ -1756,6 +1882,7 @@ export function App(): React.ReactElement {
                     pendingMismatchRelink.mediaId,
                     pendingMismatchRelink.newPath,
                     true,
+                    pendingMismatchRelink.probedDurationMs,
                   )
                 }
               >
@@ -1843,6 +1970,7 @@ export function App(): React.ReactElement {
           </form>
         </div>
       )}
+      </div>
 
       {/* Software Update Dialog */}
       {isUpdateDialogOpen && updateStatus && (
@@ -1887,14 +2015,9 @@ export function App(): React.ReactElement {
         </div>
       )}
 
-      {/* Assistive Technology Live Announcement Region */}
+      {/* Assistive Technology Live Announcement Region (announces media & state transitions without spamming every second) */}
       <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {activeMedia
-          ? `${activeMedia.display_name}, ${snapshot.state} at ${formatDurationMs(
-              snapshot.position_ms,
-            )}`
-          : "No media loaded"}
-      </div>
+        {activeMedia ? `${activeMedia.display_name}, ${snapshot.state}` : "No media loaded"}
       </div>
     </>
   );

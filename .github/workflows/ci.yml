@@ -60,6 +60,10 @@ jobs:
       - name: Run Clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Audit Rust licenses, advisories, and sources (cargo-deny)
+        if: matrix.os == 'ubuntu-latest'
+        uses: EmbarkStudios/cargo-deny-action@v2
+
       - name: Run Rust workspace unit & integration tests
         run: cargo test --workspace
 

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { AudoraIpcClient, DEFAULT_GITHUB_RELEASE_REPO } from "../api/ipc";
+import {
+  AudoraIpcClient,
+  compareSemver,
+  DEFAULT_GITHUB_RELEASE_REPO,
+} from "../api/ipc";
 import {
   computeProgressPercent,
   formatTimestamp,
@@ -7,11 +11,13 @@ import {
 } from "./format";
 
 describe("formatTimestamp", () => {
-  it("formats nearest_second and milliseconds accurately", () => {
+  it("formats nearest_second and milliseconds accurately and guards Infinity", () => {
     expect(formatTimestamp(222_000, "nearest_second")).toBe("03:42");
     expect(formatTimestamp(864_000, "nearest_second")).toBe("14:24");
     expect(formatTimestamp(4_328_000, "nearest_second")).toBe("1:12:08");
     expect(formatTimestamp(3_425, "milliseconds")).toBe("00:03.425");
+    expect(formatTimestamp(Number.POSITIVE_INFINITY, "nearest_second")).toBe("00:00");
+    expect(formatTimestamp(Number.NaN, "milliseconds")).toBe("00:00");
   });
 });
 
@@ -42,9 +48,12 @@ describe("computeProgressPercent", () => {
 });
 
 describe("shouldSuppressGlobalShortcut", () => {
-  it("suppresses shortcuts when focused in form inputs or when a modal is open", () => {
+  it("suppresses shortcuts when focused in text inputs or modals, while allowing range sliders", () => {
     expect(shouldSuppressGlobalShortcut("TEXTAREA", false, false)).toBe(true);
     expect(shouldSuppressGlobalShortcut("INPUT", false, false)).toBe(true);
+    expect(shouldSuppressGlobalShortcut("INPUT", false, false, "text")).toBe(true);
+    expect(shouldSuppressGlobalShortcut("INPUT", false, false, "range")).toBe(false);
+    expect(shouldSuppressGlobalShortcut("INPUT", false, true, "range")).toBe(true);
     expect(shouldSuppressGlobalShortcut("DIV", false, true)).toBe(true);
     expect(shouldSuppressGlobalShortcut("BUTTON", false, false)).toBe(false);
   });
@@ -474,5 +483,56 @@ describe("AudoraIpcClient workflows", () => {
     const ended = client.syncMediaElementPosition(true81HoursMs, buggyDoubledElementMs);
     expect(ended.state).toBe("ended");
     expect(ended.position_ms).toBe(true81HoursMs);
+  });
+
+  it("enforces SemVer pre-release ordering, rejects missing SHA-256 digests, and keeps playback continuous across even-length shuffle", () => {
+    expect(compareSemver("0.2.0-rc.1", "0.2.0")).toBeLessThan(0);
+    expect(compareSemver("0.2.0", "0.2.0-rc.1")).toBeGreaterThan(0);
+    expect(compareSemver("0.2.0", "0.1.9")).toBeGreaterThan(0);
+
+    const client = new AudoraIpcClient(false);
+
+    // Release with missing digest must NOT be marked verified or installable
+    const unverified = client.stageGitHubReleaseJson(
+      JSON.stringify({
+        tag_name: "v0.3.0",
+        name: "Audora 0.3.0",
+        assets: [
+          {
+            name: "release-manifest-macos-aarch64.json",
+            browser_download_url: "https://example.com/manifest.json",
+            size: 512,
+            digest:
+              "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          },
+          {
+            name: "Audora_0.3.0_macos-aarch64.dmg",
+            browser_download_url: "https://example.com/Audora_0.3.0.dmg",
+            size: 18_000_000,
+          },
+        ],
+      }),
+    );
+    expect(unverified.verified).toBe(false);
+    expect(unverified.update_available).toBe(false);
+    expect(() => client.installUpdate("0.3.0")).toThrow();
+    expect(() => client.installUpdate("99.0.0")).toThrow();
+
+    // 4-item even-length queue shuffle visits all 4 items and keeps playing on Next
+    const opened = client.openLocalFiles([
+      { name: "T1.mp3", path: "/tmp/T1.mp3", size: 1000, durationMs: 60_000 },
+      { name: "T2.mp3", path: "/tmp/T2.mp3", size: 1000, durationMs: 60_000 },
+      { name: "T3.mp3", path: "/tmp/T3.mp3", size: 1000, durationMs: 60_000 },
+      { name: "T4.mp3", path: "/tmp/T4.mp3", size: 1000, durationMs: 60_000 },
+    ]);
+    client.playbackCommand({ action: "set_shuffle", shuffle: true });
+    client.playbackCommand({ action: "play" });
+    const visited = new Set<string>([client.getPlaybackSnapshot().media_id!]);
+    for (let i = 0; i < 3; i += 1) {
+      const snap = client.playbackCommand({ action: "next" });
+      expect(snap.state).toBe("playing");
+      visited.add(snap.media_id!);
+    }
+    expect(visited.size).toBe(opened.length);
   });
 });

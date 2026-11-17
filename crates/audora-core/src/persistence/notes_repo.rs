@@ -130,22 +130,60 @@ impl NotesRepository for SqliteNotesRepository {
             if trimmed.is_empty() {
                 return Ok(Vec::new());
             }
-            let pattern = format!("%{}%", trimmed.to_lowercase());
             let kind_filter = match filter {
                 LibraryFilter::All => None,
                 LibraryFilter::Video => Some("video"),
                 LibraryFilter::Audio => Some("audio"),
             };
 
+            if !trimmed.is_ascii() {
+                let needle = trimmed.to_lowercase();
+                let mut stmt = conn.prepare(
+                    "SELECT n.id, n.media_id, n.position_ms, n.is_quick_marker, n.body, n.created_at, n.updated_at, m.display_name
+                     FROM notes n
+                     INNER JOIN media m ON m.id = n.media_id
+                     WHERE (?1 IS NULL OR m.media_kind = ?1)
+                     ORDER BY n.updated_at DESC, n.position_ms ASC",
+                )?;
+                let rows = stmt.query_map(params![kind_filter], |row| {
+                    let note = Self::map_row(row)?;
+                    let display_name: String = row.get("display_name")?;
+                    Ok((note, display_name))
+                })?;
+                let mut notes = Vec::new();
+                for row in rows {
+                    let (note, display_name) = row?;
+                    if note.body.to_lowercase().contains(&needle)
+                        || display_name.to_lowercase().contains(&needle)
+                    {
+                        notes.push(note);
+                    }
+                }
+                return Ok(notes);
+            }
+
+            let mut escaped = String::with_capacity(trimmed.len() + 4);
+            escaped.push('%');
+            for ch in trimmed.to_lowercase().chars() {
+                match ch {
+                    '\\' | '%' | '_' => {
+                        escaped.push('\\');
+                        escaped.push(ch);
+                    }
+                    c => escaped.push(c),
+                }
+            }
+            escaped.push('%');
+
             let mut stmt = conn.prepare(
                 "SELECT n.id, n.media_id, n.position_ms, n.is_quick_marker, n.body, n.created_at, n.updated_at
                  FROM notes n
                  INNER JOIN media m ON m.id = n.media_id
-                 WHERE (LOWER(n.body) LIKE ?1 OR LOWER(m.display_name) LIKE ?1)
+                 WHERE (LOWER(n.body) LIKE ?1 ESCAPE '\\' OR LOWER(m.display_name) LIKE ?1 ESCAPE '\\')
                    AND (?2 IS NULL OR m.media_kind = ?2)
                  ORDER BY n.updated_at DESC, n.position_ms ASC",
             )?;
-            let rows = stmt.query_map(params![pattern, kind_filter], Self::map_row)?;
+            let rows = stmt.query_map(params![escaped, kind_filter], Self::map_row)?;
             let mut notes = Vec::new();
             for row in rows {
                 notes.push(row?);

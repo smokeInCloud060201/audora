@@ -45,12 +45,63 @@ impl SqliteMediaRepository {
             note_count: usize::try_from(note_count_i64).unwrap_or(0),
         })
     }
+    fn escape_like_pattern(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len() + 4);
+        out.push('%');
+        for ch in raw.chars() {
+            match ch {
+                '\\' | '%' | '_' => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('%');
+        out
+    }
 }
 
 impl MediaRepository for SqliteMediaRepository {
     fn upsert_media(&self, item: &MediaItem) -> AppResult<MediaItem> {
         self.db.with_conn(|conn| {
             let tx = conn.transaction()?;
+            let existing_by_id: Option<String> = tx
+                .query_row(
+                    "SELECT path FROM media WHERE id = ?1",
+                    params![item.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(old_path) = existing_by_id {
+                if old_path != item.path {
+                    tx.execute(
+                        "UPDATE media
+                         SET path = ?2,
+                             display_name = ?3,
+                             media_kind = ?4,
+                             duration_ms = COALESCE(?5, duration_ms),
+                             file_size_bytes = COALESCE(?6, file_size_bytes),
+                             availability = ?7,
+                             last_opened_at = ?8,
+                             last_seen_at = ?9
+                         WHERE id = ?1",
+                        params![
+                            item.id,
+                            item.path,
+                            item.display_name,
+                            item.media_kind.as_str(),
+                            item.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                            item.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
+                            item.availability.as_str(),
+                            item.last_opened_at,
+                            item.last_seen_at,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
             tx.execute(
                 "INSERT INTO media (
                     id, path, display_name, media_kind, duration_ms, last_position_ms,
@@ -119,22 +170,56 @@ impl MediaRepository for SqliteMediaRepository {
 
     fn list_media(&self, query: Option<&str>, filter: LibraryFilter) -> AppResult<Vec<MediaItem>> {
         self.db.with_conn(|conn| {
-            let search_pattern = query
-                .map(str::trim)
-                .filter(|q| !q.is_empty())
-                .map(|q| format!("%{}%", q.to_lowercase()));
-
+            let clean_query = query.map(str::trim).filter(|q| !q.is_empty());
             let kind_filter = match filter {
                 LibraryFilter::All => None,
                 LibraryFilter::Video => Some("video"),
                 LibraryFilter::Audio => Some("audio"),
             };
 
+            if let Some(q) = clean_query.filter(|q| !q.is_ascii()) {
+                let needle = q.to_lowercase();
+                let mut stmt = conn.prepare(
+                    "SELECT m.*, (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
+                     FROM media m
+                     WHERE (?1 IS NULL OR m.media_kind = ?1)
+                     ORDER BY COALESCE(m.last_opened_at, m.added_at) DESC, m.display_name ASC",
+                )?;
+                let rows = stmt.query_map(params![kind_filter], Self::map_row)?;
+                let mut candidates = Vec::new();
+                for row in rows {
+                    candidates.push(row?);
+                }
+
+                let mut note_stmt =
+                    conn.prepare("SELECT body FROM notes WHERE media_id = ?1")?;
+                let mut matched = Vec::new();
+                for item in candidates {
+                    if item.display_name.to_lowercase().contains(&needle) {
+                        matched.push(item);
+                        continue;
+                    }
+                    let note_rows = note_stmt.query_map(params![item.id], |r| r.get::<_, String>(0))?;
+                    let mut note_hit = false;
+                    for body_res in note_rows {
+                        if body_res?.to_lowercase().contains(&needle) {
+                            note_hit = true;
+                            break;
+                        }
+                    }
+                    if note_hit {
+                        matched.push(item);
+                    }
+                }
+                return Ok(matched);
+            }
+
+            let search_pattern = clean_query.map(|q| Self::escape_like_pattern(&q.to_lowercase()));
             let mut stmt = conn.prepare(
                 "SELECT m.*, (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
                  FROM media m
-                 WHERE (?1 IS NULL OR LOWER(m.display_name) LIKE ?1 OR EXISTS (
-                     SELECT 1 FROM notes n WHERE n.media_id = m.id AND LOWER(n.body) LIKE ?1
+                 WHERE (?1 IS NULL OR LOWER(m.display_name) LIKE ?1 ESCAPE '\\' OR EXISTS (
+                     SELECT 1 FROM notes n WHERE n.media_id = m.id AND LOWER(n.body) LIKE ?1 ESCAPE '\\'
                  ))
                  AND (?2 IS NULL OR m.media_kind = ?2)
                  ORDER BY COALESCE(m.last_opened_at, m.added_at) DESC, m.display_name ASC",
@@ -194,12 +279,17 @@ impl MediaRepository for SqliteMediaRepository {
     fn relink_path(&self, record: &RelinkMediaRecord<'_>) -> AppResult<MediaItem> {
         self.db.with_conn(|conn| {
             let tx = conn.transaction()?;
+            let dur_param = record.duration_ms.and_then(|v| i64::try_from(v).ok());
             let updated = tx.execute(
                 "UPDATE media
                  SET path = ?2,
                      display_name = ?3,
                      media_kind = ?4,
-                     duration_ms = COALESCE(?5, duration_ms),
+                     duration_ms = ?5,
+                     last_position_ms = CASE
+                         WHEN ?5 IS NOT NULL AND last_position_ms > ?5 THEN ?5
+                         ELSE last_position_ms
+                     END,
                      file_size_bytes = COALESCE(?6, file_size_bytes),
                      availability = 'available',
                      last_seen_at = ?7
@@ -209,7 +299,7 @@ impl MediaRepository for SqliteMediaRepository {
                     record.new_path,
                     record.display_name,
                     record.media_kind.as_str(),
-                    record.duration_ms.and_then(|v| i64::try_from(v).ok()),
+                    dur_param,
                     record.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
                     record.updated_at,
                 ],

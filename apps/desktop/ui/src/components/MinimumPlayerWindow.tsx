@@ -1,6 +1,11 @@
 import React from "react";
 import { ipcClient } from "../api/ipc";
-import type { AppSettings, MediaItem, PlaybackSnapshot } from "../types/domain";
+import type {
+  AppSettings,
+  MediaItem,
+  PlaybackSnapshot,
+  TimestampPrecision,
+} from "../types/domain";
 import { formatDurationMs, progressPercent } from "../utils/format";
 import { AudoraLogo } from "./AudoraLogo";
 import { IconExpandMode, IconHelpCircle, IconPause, IconPlay } from "./Icons";
@@ -8,6 +13,7 @@ import { IconExpandMode, IconHelpCircle, IconPause, IconPlay } from "./Icons";
 interface MinimumPlayerWindowProps {
   activeMedia: MediaItem | null;
   snapshot: PlaybackSnapshot;
+  timestampPrecision: TimestampPrecision;
   isHelpOpen: boolean;
   onToggleHelp: () => void;
   onCloseHelp: () => void;
@@ -15,15 +21,12 @@ interface MinimumPlayerWindowProps {
   onUpdateSnapshot: (next: PlaybackSnapshot) => void;
   onOpenMediaPicker: () => void;
   onDropFiles: (files: FileList | null) => void;
-  fileInputRef: React.RefObject<HTMLInputElement | null>;
-  mediaElementRef: React.RefObject<HTMLVideoElement | HTMLAudioElement | null>;
-  onMediaLoadedMetadata: (el: HTMLVideoElement | HTMLAudioElement) => void;
-  onMediaTimeUpdate: (el: HTMLVideoElement | HTMLAudioElement) => void;
 }
 
 export function MinimumPlayerWindow({
   activeMedia,
   snapshot,
+  timestampPrecision,
   isHelpOpen,
   onToggleHelp,
   onCloseHelp,
@@ -31,10 +34,6 @@ export function MinimumPlayerWindow({
   onUpdateSnapshot,
   onOpenMediaPicker,
   onDropFiles,
-  fileInputRef,
-  mediaElementRef,
-  onMediaLoadedMetadata,
-  onMediaTimeUpdate,
 }: MinimumPlayerWindowProps): React.ReactElement {
   const pct = progressPercent(snapshot.position_ms, snapshot.duration_ms);
 
@@ -49,24 +48,6 @@ export function MinimumPlayerWindow({
         onDropFiles(e.dataTransfer?.files ?? null);
       }}
     >
-      <input
-        ref={fileInputRef}
-        type="file"
-        multiple
-        accept="audio/*,video/*,.mp4,.mov,.webm,.mkv,.mp3,.wav,.flac,.ogg,.opus,.m4a,.aac"
-        style={{ display: "none" }}
-        onChange={(e) => onDropFiles(e.target.files)}
-      />
-
-      {activeMedia?.media_kind === "video" && activeMedia.stream_url && (
-        <audio
-          ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
-          src={activeMedia.stream_url}
-          onLoadedMetadata={(e) => onMediaLoadedMetadata(e.currentTarget)}
-          onTimeUpdate={(e) => onMediaTimeUpdate(e.currentTarget)}
-          onEnded={() => onUpdateSnapshot(ipcClient.handleMediaEnded())}
-        />
-      )}
 
       <div className="minimum-player-card" data-node-id="20:2">
         <header
@@ -169,10 +150,13 @@ export function MinimumPlayerWindow({
           <div className="minimum-time-column">
             <div className="minimum-time-row">
               <span className="minimum-time-current tabular-nums" data-node-id="20:15">
-                {formatDurationMs(snapshot.position_ms)}
+                {formatDurationMs(snapshot.position_ms, timestampPrecision)}
               </span>
               <span className="minimum-time-total tabular-nums" data-node-id="20:16">
-                / {activeMedia ? formatDurationMs(snapshot.duration_ms) : "00:00"}
+                /{" "}
+                {activeMedia
+                  ? formatDurationMs(snapshot.duration_ms, timestampPrecision)
+                  : "00:00"}
               </span>
             </div>
 

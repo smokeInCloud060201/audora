@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type {
   AppErrorPayload,
@@ -65,6 +65,22 @@ export function PlaylistsView({
   const [pickerSearch, setPickerSearch] = useState<string>("");
   const [pickerFilter, setPickerFilter] = useState<LibraryFilter>("all");
   const [selectedMediaIds, setSelectedMediaIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!composerMode && !isAddMediaOpen) return undefined;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        if (isAddMediaOpen) {
+          setIsAddMediaOpen(false);
+        } else if (composerMode) {
+          setComposerMode(null);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [composerMode, isAddMediaOpen]);
 
   const mediaMap = useMemo(() => {
     const map = new Map<string, MediaItem>();
@@ -348,7 +364,10 @@ export function PlaylistsView({
                           className="playlist-quick-play-btn"
                           aria-label={`Play ${pl.name}`}
                           title={`Play ${pl.name}`}
-                          onClick={() => onPlayPlaylist(pl.id, { shuffle: false })}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onPlayPlaylist(pl.id, { shuffle: false });
+                          }}
                         >
                           <IconPlay size={13} />
                         </button>

@@ -64,17 +64,37 @@ if (missing > 0) {
   process.exit(1);
 }
 
-// Verify Tauri CSP enforces object-src 'none' and has no wildcard connect-src
+// Verify CSP in both tauri.conf.json AND runtime main.rs HTTP header enforces object-src 'none' and has no wildcard connect-src
 const tauriConf = JSON.parse(
   readFileSync(join(rootDir, "apps/desktop/src-tauri/tauri.conf.json"), "utf8"),
 );
 const csp = tauriConf?.app?.security?.csp ?? "";
+const mainRs = readFileSync(
+  join(rootDir, "apps/desktop/src-tauri/src/main.rs"),
+  "utf8",
+);
+const hasWildcardConnect = (policy) => {
+  const match = policy.match(/connect-src\s+([^;]+)/i);
+  if (!match) return true;
+  return match[1].split(/\s+/).some((tok) => tok === "*" || tok.includes("*"));
+};
 if (
   !csp.includes("object-src 'none'") ||
   !csp.includes("connect-src 'self'") ||
-  csp.includes("connect-src *")
+  hasWildcardConnect(csp)
 ) {
   console.error("[FAIL] Tauri CSP does not enforce strict connect-src/object-src policy");
+  process.exit(1);
+}
+if (
+  !mainRs.includes("Content-Security-Policy:") ||
+  !mainRs.includes("object-src 'none'") ||
+  !mainRs.includes("frame-ancestors 'none'") ||
+  !/x-audora-token/i.test(mainRs)
+) {
+  console.error(
+    "[FAIL] Runtime loopback server in main.rs is missing Content-Security-Policy or session token enforcement",
+  );
   process.exit(1);
 }
 

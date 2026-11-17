@@ -878,4 +878,133 @@ Properties:
         db.clear_ui_state().expect("clear ui state");
         assert_eq!(db.get_ui_state_json().expect("cleared"), None);
     }
+
+    #[test]
+    fn release_verification_rejects_missing_digest_sidecars_and_arbitrary_versions() {
+        use crate::services::{compare_semver, parse_github_release_json};
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_semver("0.2.0-rc.1", "0.2.0"), Ordering::Less);
+        assert_eq!(compare_semver("0.2.0", "0.2.0-rc.1"), Ordering::Greater);
+        assert_eq!(compare_semver("0.2.0", "0.1.9"), Ordering::Greater);
+
+        // Missing digest must NOT fabricate a fake SHA-256 (`verified == false`).
+        let unverified_json = r#"{
+            "tag_name": "v0.3.0",
+            "name": "Audora 0.3.0",
+            "body": "Unsigned test payload",
+            "published_at": "2026-11-16T00:00:00Z",
+            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v0.3.0",
+            "assets": [
+                {
+                    "name": "release-manifest-macos-aarch64.json",
+                    "browser_download_url": "https://example.com/manifest.json",
+                    "size": 512,
+                    "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                },
+                {
+                    "name": "Audora_0.3.0_macos-aarch64.dmg",
+                    "browser_download_url": "https://example.com/Audora_0.3.0_macos-aarch64.dmg",
+                    "size": 20000000,
+                    "digest": null
+                }
+            ]
+        }"#;
+
+        let parsed = parse_github_release_json(unverified_json).expect("parse unverified");
+        assert!(
+            parsed.download_url.ends_with(".dmg"),
+            "must skip .json sidecar and pick installer"
+        );
+        assert!(
+            parsed.sha256.is_empty(),
+            "must not bleed sidecar digest or fabricate SHA-256"
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora.sqlite");
+        let dispatcher = build_production_dispatcher(&db_path).expect("dispatcher");
+
+        // Arbitrary unstaged version install must fail.
+        assert!(dispatcher.install_update("99.0.0").is_err());
+
+        let status = dispatcher
+            .stage_github_release_json(unverified_json)
+            .expect("stage unverified");
+        assert!(!status.verified);
+        assert!(!status.update_available);
+        assert!(dispatcher.install_update("0.3.0").is_err());
+    }
+
+    #[test]
+    fn unicode_search_wildcard_escaping_even_shuffle_and_safe_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let user_doc = temp.path().join("Important_User_Document.pdf");
+        fs::write(&user_doc, b"never-delete-user-files").expect("write user doc");
+
+        let db_path = temp.path().join("audora.sqlite");
+        let dispatcher = build_production_dispatcher(&db_path).expect("dispatcher");
+
+        let f1 = create_dummy_media_file(&temp, "01_Über_Konzert.mp3", b"a1");
+        let f2 = create_dummy_media_file(&temp, "02_Mix_100%_Final.wav", b"a2");
+        let f3 = create_dummy_media_file(&temp, "03_Mix_1000_Draft.wav", b"a3");
+        let f4 = create_dummy_media_file(&temp, "04_Outro.flac", b"a4");
+
+        let opened = dispatcher
+            .open_media_batch(&[
+                f1.to_string_lossy().into_owned(),
+                f2.to_string_lossy().into_owned(),
+                f3.to_string_lossy().into_owned(),
+                f4.to_string_lossy().into_owned(),
+            ])
+            .expect("open 4 tracks");
+        assert_eq!(opened.len(), 4);
+
+        // Non-ASCII uppercase 'Ü' matches lowercase 'über'
+        let unicode_res = dispatcher
+            .search_library(Some("über"), LibraryFilter::All)
+            .expect("unicode search");
+        assert_eq!(unicode_res.media_items.len(), 1);
+        assert_eq!(unicode_res.media_items[0].id, opened[0].id);
+
+        // Escaped '%' matches literal '100%' and NOT '1000'
+        let pct_res = dispatcher
+            .search_library(Some("100%"), LibraryFilter::All)
+            .expect("escaped wildcard search");
+        assert_eq!(pct_res.media_items.len(), 1);
+        assert_eq!(pct_res.media_items[0].id, opened[1].id);
+
+        // Even-length queue (4 items) shuffle visits all 4 items without starving odd indices
+        dispatcher
+            .playback_command(PlaybackCommand::SetShuffle { shuffle: true })
+            .expect("enable shuffle");
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(
+            dispatcher
+                .get_playback_snapshot()
+                .expect("snap")
+                .media_id
+                .expect("active id"),
+        );
+        for _ in 0..3 {
+            let next_snap = dispatcher
+                .playback_command(PlaybackCommand::Next)
+                .expect("shuffle next");
+            visited.insert(next_snap.media_id.expect("next media id"));
+        }
+        assert_eq!(
+            visited.len(),
+            4,
+            "even-length shuffle must visit all 4 tracks"
+        );
+
+        // Cleanup removes Audora DB files while preserving unrelated user files in the same folder
+        let _ = dispatcher
+            .cleanup_application_data()
+            .expect("cleanup app data");
+        assert!(
+            user_doc.is_file(),
+            "unrelated user files must never be deleted by cleanup"
+        );
+    }
 }

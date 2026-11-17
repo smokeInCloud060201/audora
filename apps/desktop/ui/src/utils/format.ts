@@ -7,7 +7,7 @@ export function formatTimestamp(
   ms: number | null | undefined,
   precision: TimestampPrecision = "nearest_second",
 ): string {
-  if (ms === null || ms === undefined || Number.isNaN(ms) || ms < 0) {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) {
     return "00:00";
   }
 
@@ -70,6 +70,7 @@ export function shouldSuppressGlobalShortcut(
   targetTagName: string | null | undefined,
   isContentEditable: boolean,
   isModalOpen: boolean,
+  inputType?: string | null,
 ): boolean {
   if (isModalOpen || isContentEditable) {
     return true;
@@ -78,5 +79,12 @@ export function shouldSuppressGlobalShortcut(
     return false;
   }
   const normalized = targetTagName.toUpperCase();
-  return normalized === "INPUT" || normalized === "TEXTAREA" || normalized === "SELECT";
+  if (normalized === "INPUT") {
+    const t = (inputType ?? "").toLowerCase();
+    if (t === "range" || t === "checkbox" || t === "button") {
+      return false;
+    }
+    return true;
+  }
+  return normalized === "TEXTAREA" || normalized === "SELECT";
 }

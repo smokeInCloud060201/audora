@@ -1,20 +1,14 @@
 #!/bin/sh
-# Audora Debian/Ubuntu postrm hook
+# Audora Debian/Ubuntu postrm hook (Debian Policy §10.7.3 compliant: never touches $HOME user data)
 set -e
 
 case "$1" in
-  purge|remove)
-    if [ -n "${SUDO_USER:-}" ]; then
-      USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    else
-      USER_HOME="${HOME:-}"
+  purge|remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
     fi
-
-    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
-      rm -rf "$USER_HOME/.local/share/com.audora.desktop"
-      rm -rf "$USER_HOME/.local/share/audora"
-      rm -rf "$USER_HOME/.cache/com.audora.desktop"
-      rm -rf "$USER_HOME/.config/com.audora.desktop"
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
     fi
     ;;
 esac

@@ -3,10 +3,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode as SqliteErrorCode, TransactionBehavior};
 
-use crate::error::{AppError, AppResult};
+use crate::error::{redact_path, AppError, AppResult};
 
 /// Embedded SQL for migration `0001_initial.sql`.
 pub const MIGRATION_0001_INITIAL_SQL: &str = include_str!("../../migrations/0001_initial.sql");
@@ -59,57 +60,135 @@ impl Database {
         Self::open_with_migrations(path, BUILTIN_MIGRATIONS)
     }
 
-    /// Opens an on-disk SQLite database, or if the file is corrupted, preserves the damaged file
-    /// at `<name>.sqlite.corrupt.bak` and restores from the latest available backup or initializes
-    /// a fresh database so user files are never silently overwritten (`Sprint 5.1`).
+    /// Opens an on-disk SQLite database, or if the file is genuinely corrupted, preserves the
+    /// damaged file at `<db_path>.corrupt.bak` and restores from the most recent valid backup
+    /// or initializes a fresh database (`Sprint 5.1`).
+    ///
+    /// Lock contention (`SQLITE_BUSY` / `SQLITE_LOCKED`), permission errors, and rolled-back
+    /// migration errors return `Err` directly without touching live `-wal`/`-shm` files.
     pub fn open_or_recover(path: impl AsRef<Path>) -> AppResult<Self> {
         let db_path = path.as_ref().to_path_buf();
-        match Self::open(&db_path) {
-            Ok(db) => {
-                if db.verify_integrity().unwrap_or(false) {
-                    return Ok(db);
+        match Self::open_internal(&db_path, BUILTIN_MIGRATIONS) {
+            Ok(db) => match db.verify_integrity() {
+                Ok(true) => return Ok(db),
+                Ok(false) => {
+                    tracing::warn!(
+                        path = %redact_path(&db_path),
+                        "Database integrity_check failed; preserving corrupt file before recovery"
+                    );
                 }
-            }
-            Err(err) => {
+                Err(err) => return Err(err),
+            },
+            Err((err, is_corrupt)) => {
+                if !is_corrupt {
+                    return Err(err);
+                }
                 tracing::warn!(
                     code = err.code().as_str(),
-                    "Database open failed; preserving corrupt file before recovery"
+                    path = %redact_path(&db_path),
+                    "Database file corrupted; preserving corrupt file before recovery"
                 );
             }
         }
 
+        let corrupt_bak = Self::backup_path_for(&db_path, "corrupt.bak");
         if db_path.exists() {
-            let corrupt_bak = db_path.with_extension("sqlite.corrupt.bak");
-            let _ = fs::copy(&db_path, &corrupt_bak);
+            let file_len = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+            if file_len > 0 {
+                fs::copy(&db_path, &corrupt_bak).map_err(|io_err| {
+                    tracing::error!(
+                        path = %redact_path(&db_path),
+                        "Failed to preserve corrupt SQLite file before recovery: {io_err}"
+                    );
+                    AppError::persistence(
+                        "Database file appears damaged and could not be backed up safely.",
+                    )
+                })?;
+            }
             let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
             let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
             let _ = fs::remove_file(&wal_path);
             let _ = fs::remove_file(&shm_path);
 
-            let manual_bak = db_path.with_extension("sqlite.manual.bak");
-            let pre_v3_bak = db_path.with_extension("sqlite.pre-v3.bak");
-            let pre_v2_bak = db_path.with_extension("sqlite.pre-v2.bak");
-            let pre_v1_bak = db_path.with_extension("sqlite.pre-v1.bak");
-
-            if manual_bak.exists() {
-                let _ = fs::copy(&manual_bak, &db_path);
-            } else if pre_v3_bak.exists() {
-                let _ = fs::copy(&pre_v3_bak, &db_path);
-            } else if pre_v2_bak.exists() {
-                let _ = fs::copy(&pre_v2_bak, &db_path);
-            } else if pre_v1_bak.exists() {
-                let _ = fs::copy(&pre_v1_bak, &db_path);
-            } else {
-                let _ = fs::remove_file(&db_path);
+            let candidates = Self::discover_backup_candidates(&db_path);
+            let mut restored_ok = false;
+            for candidate in candidates {
+                if fs::copy(&candidate, &db_path).is_ok() {
+                    if let Ok(mut db) = Self::open(&db_path) {
+                        if db.verify_integrity().unwrap_or(false) {
+                            if corrupt_bak.exists() {
+                                db.last_backup_path = Some(corrupt_bak);
+                            }
+                            return Ok(db);
+                        }
+                    }
+                    let _ = fs::remove_file(&wal_path);
+                    let _ = fs::remove_file(&shm_path);
+                }
+                if !restored_ok {
+                    let _ = fs::remove_file(&db_path);
+                }
+                let _ = &mut restored_ok;
             }
+            let _ = fs::remove_file(&db_path);
         }
 
         let mut recovered = Self::open(&db_path)?;
-        let corrupt_bak = db_path.with_extension("sqlite.corrupt.bak");
         if corrupt_bak.exists() {
             recovered.last_backup_path = Some(corrupt_bak);
         }
         Ok(recovered)
+    }
+
+    fn backup_path_for(db_path: &Path, suffix: &str) -> PathBuf {
+        PathBuf::from(format!("{}.{suffix}", db_path.display()))
+    }
+
+    fn discover_backup_candidates(db_path: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+        let Some(parent) = db_path.parent() else {
+            return Vec::new();
+        };
+        let Some(file_name) = db_path.file_name().and_then(|s| s.to_str()) else {
+            return Vec::new();
+        };
+        let manual_prefix = format!("{file_name}.manual.bak");
+        let pre_prefix = format!("{file_name}.pre-v");
+
+        let read_dir_parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(entries) = fs::read_dir(read_dir_parent) {
+            for entry in entries.filter_map(Result::ok) {
+                let p = entry.path();
+                let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let is_backup = name == manual_prefix
+                    || (name.starts_with(&pre_prefix) && name.ends_with(".bak"));
+                if is_backup && p.is_file() {
+                    let mtime = entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    found.push((mtime, p));
+                }
+            }
+        }
+
+        found.sort_by_key(|b| std::cmp::Reverse(b.0));
+        found.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` so committed WAL frames are flushed cleanly before exit.
+    pub fn checkpoint_wal(&self) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })
     }
 
     /// Runs `PRAGMA integrity_check` to verify SQLite B-tree and page consistency.
@@ -120,7 +199,7 @@ impl Database {
         })
     }
 
-    /// Creates an on-demand manual backup snapshot (`<name>.sqlite.manual.bak`) after checkpointing WAL.
+    /// Creates an on-demand manual backup snapshot (`<db_path>.manual.bak`) atomically while holding the DB lock.
     pub fn create_manual_backup(&self) -> AppResult<Option<PathBuf>> {
         let Some(ref db_path) = self.db_path else {
             return Ok(None);
@@ -128,13 +207,34 @@ impl Database {
         if !db_path.exists() {
             return Ok(None);
         }
+        let backup_path = Self::backup_path_for(db_path, "manual.bak");
+        let tmp_backup = Self::backup_path_for(db_path, "manual.bak.tmp");
         self.with_conn(|conn| {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            let _ = fs::remove_file(&tmp_backup);
+            let vacuum_ok = tmp_backup
+                .to_str()
+                .is_some_and(|s| conn.execute("VACUUM INTO ?1;", [s]).is_ok());
+            if vacuum_ok {
+                fs::rename(&tmp_backup, &backup_path).map_err(|io_err| {
+                    let _ = fs::remove_file(&tmp_backup);
+                    tracing::error!(
+                        path = %redact_path(&backup_path),
+                        "Failed to finalize manual database backup: {io_err}"
+                    );
+                    AppError::persistence("Failed to create manual database backup.")
+                })?;
+            } else {
+                let _ = fs::remove_file(&tmp_backup);
+                fs::copy(db_path, &backup_path).map_err(|io_err| {
+                    tracing::error!(
+                        path = %redact_path(&backup_path),
+                        "Failed to copy manual database backup: {io_err}"
+                    );
+                    AppError::persistence("Failed to create manual database backup.")
+                })?;
+            }
             Ok(())
-        })?;
-        let backup_path = db_path.with_extension("sqlite.manual.bak");
-        fs::copy(db_path, &backup_path).map_err(|e| {
-            AppError::persistence(format!("Failed to create manual database backup: {e}"))
         })?;
         Ok(Some(backup_path))
     }
@@ -144,31 +244,79 @@ impl Database {
         path: impl AsRef<Path>,
         migrations: &[MigrationSpec],
     ) -> AppResult<Self> {
-        let db_path = path.as_ref().to_path_buf();
+        Self::open_internal(path.as_ref(), migrations).map_err(|(err, _)| err)
+    }
+
+    fn is_sqlite_corruption_error(err: &rusqlite::Error) -> bool {
+        matches!(
+            err,
+            rusqlite::Error::SqliteFailure(inner, _)
+                if matches!(
+                    inner.code,
+                    SqliteErrorCode::DatabaseCorrupt | SqliteErrorCode::NotADatabase
+                )
+        )
+    }
+
+    fn open_internal(
+        db_path_ref: &Path,
+        migrations: &[MigrationSpec],
+    ) -> Result<Self, (AppError, bool)> {
+        let db_path = db_path_ref.to_path_buf();
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    AppError::persistence(format!("Failed to create database directory: {e}"))
+                fs::create_dir_all(parent).map_err(|io_err| {
+                    tracing::error!(
+                        path = %redact_path(parent),
+                        "Failed to create database directory: {io_err}"
+                    );
+                    (
+                        AppError::persistence("Failed to create application database directory."),
+                        false,
+                    )
                 })?;
             }
         }
 
-        let conn = Connection::open(&db_path)?;
-        Self::configure_pragmas(&conn)?;
-        Self::ensure_migrations_table(&conn)?;
+        let conn = Connection::open(&db_path).map_err(|e| {
+            let corrupt = Self::is_sqlite_corruption_error(&e);
+            (AppError::from(e), corrupt)
+        })?;
+        if let Err(e) = Self::configure_base_pragmas(&conn) {
+            let corrupt = Self::is_sqlite_corruption_error(&e);
+            return Err((AppError::from(e), corrupt));
+        }
+        if let Err(e) = Self::ensure_migrations_table(&conn) {
+            let corrupt = Self::is_sqlite_corruption_error(&e);
+            return Err((AppError::from(e), corrupt));
+        }
 
-        let current_version = Self::current_schema_version(&conn)?;
+        let current_version = match Self::current_schema_version(&conn) {
+            Ok(v) => v,
+            Err(e) => {
+                let corrupt = Self::is_sqlite_corruption_error(&e);
+                return Err((AppError::from(e), corrupt));
+            }
+        };
         let has_pending = migrations.iter().any(|m| m.version > current_version);
 
-        // If the database file already has tables/data and new migrations are pending, create an
-        // atomic pre-migration backup before running migrations (`docs/ARCHITECTURE.md`).
+        // Checkpoint WAL first so any committed frames are included in the pre-migration backup (`H-1`).
         let mut last_backup_path = None;
         if has_pending && current_version >= 1 && db_path.exists() {
-            let backup_path = db_path.with_extension(format!("sqlite.pre-v{current_version}.bak"));
-            fs::copy(&db_path, &backup_path).map_err(|e| {
-                AppError::persistence(format!(
-                    "Failed to create pre-migration backup before upgrading schema: {e}"
-                ))
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            let backup_path =
+                Self::backup_path_for(&db_path, &format!("pre-v{current_version}.bak"));
+            fs::copy(&db_path, &backup_path).map_err(|io_err| {
+                tracing::error!(
+                    path = %redact_path(&backup_path),
+                    "Failed to create pre-migration backup: {io_err}"
+                );
+                (
+                    AppError::persistence(
+                        "Failed to create pre-migration backup before upgrading schema.",
+                    ),
+                    false,
+                )
             })?;
             last_backup_path = Some(backup_path);
         }
@@ -178,14 +326,15 @@ impl Database {
             db_path: Some(db_path),
             last_backup_path,
         };
-        db.apply_migrations(migrations)?;
+        db.apply_migrations(migrations).map_err(|e| (e, false))?;
+        db.enable_foreign_keys().map_err(|e| (e, false))?;
         Ok(db)
     }
 
     /// Opens an in-memory SQLite database with built-in migrations applied (for fast unit tests).
     pub fn open_in_memory() -> AppResult<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::configure_pragmas(&conn)?;
+        Self::configure_base_pragmas(&conn)?;
         Self::ensure_migrations_table(&conn)?;
         let mut db = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -193,6 +342,7 @@ impl Database {
             last_backup_path: None,
         };
         db.apply_migrations(BUILTIN_MIGRATIONS)?;
+        db.enable_foreign_keys()?;
         Ok(db)
     }
 
@@ -222,7 +372,7 @@ impl Database {
 
     /// Returns the highest applied migration version (`0` if none applied).
     pub fn schema_version(&self) -> AppResult<i64> {
-        self.with_conn(|conn| Self::current_schema_version(conn))
+        self.with_conn(|conn| Self::current_schema_version(conn).map_err(AppError::from))
     }
 
     /// Reads the canonical persisted UI state JSON snapshot from `app_ui_state`, if present.
@@ -263,14 +413,38 @@ impl Database {
         })
     }
 
-    fn configure_pragmas(conn: &Connection) -> AppResult<()> {
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+    /// Wipes all user records across relational tables and `app_ui_state`, then checkpoints WAL.
+    pub fn reset_all_user_data(&self) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch(
+                "DELETE FROM notes;
+                 DELETE FROM playlist_items;
+                 DELETE FROM playlists;
+                 DELETE FROM media;
+                 DELETE FROM settings;
+                 DELETE FROM app_ui_state;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )?;
+            Ok(())
+        })
+    }
+
+    fn configure_base_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+        conn.busy_timeout(Duration::from_millis(5_000))?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
         Ok(())
     }
 
-    fn ensure_migrations_table(conn: &Connection) -> AppResult<()> {
+    fn enable_foreign_keys(&self) -> AppResult<()> {
+        self.with_conn(|conn| {
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            Ok(())
+        })
+    }
+
+    fn ensure_migrations_table(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY NOT NULL,
@@ -281,7 +455,7 @@ impl Database {
         Ok(())
     }
 
-    fn current_schema_version(conn: &Connection) -> AppResult<i64> {
+    fn current_schema_version(conn: &Connection) -> rusqlite::Result<i64> {
         let version: Option<i64> =
             conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
                 row.get(0)
@@ -296,7 +470,7 @@ impl Database {
                 if migration.version <= current {
                     continue;
                 }
-                let tx = conn.transaction()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if let Err(err) = tx.execute_batch(migration.sql) {
                     tracing::error!(
                         version = migration.version,
@@ -309,7 +483,7 @@ impl Database {
                     )));
                 }
                 tx.execute(
-                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, datetime('now'))",
+                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
                     rusqlite::params![migration.version, migration.name],
                 )?;
                 tx.commit()?;

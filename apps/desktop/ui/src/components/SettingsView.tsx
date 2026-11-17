@@ -581,8 +581,10 @@ export function SettingsView({
                 }}
               >
                 Audora stores your library, playlists, and notes locally in a SQLite WAL
-                database with automatic pre-migration backups (`.pre-vN.bak`). Audora makes
-                zero background network requests and never modifies your media files.
+                database with automatic pre-migration backups (`.pre-vN.bak`). Audora sends
+                zero telemetry or analytics; network requests occur only when checking for or
+                downloading GitHub release updates (configurable in About), and your media
+                files on disk are never modified.
               </p>
               <div
                 style={{
@@ -596,7 +598,11 @@ export function SettingsView({
                 <div style={{ color: "var(--text-tertiary)", marginBottom: 4 }}>
                   Local database path
                 </div>
-                <code>~/Library/Application Support/com.audora.desktop/audora.sqlite</code>
+                <code>
+                  {ipcClient.getAppDataDirectoryDisplay()}
+                  {ipcClient.getAppDataDirectoryDisplay().includes("\\") ? "\\" : "/"}
+                  audora.sqlite
+                </code>
               </div>
 
               <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 4 }}>

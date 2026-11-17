@@ -281,9 +281,8 @@ function audoraLocalDevBridge(): Plugin {
           const origin = String(req.headers.origin ?? "").trim();
           const crossSite =
             (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") ||
-            (origin &&
-              origin !== "null" &&
-              !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin));
+            origin.toLowerCase() === "null" ||
+            (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin));
           if (crossSite) {
             res.statusCode = 403;
             res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -306,12 +305,22 @@ function audoraLocalDevBridge(): Plugin {
           return;
         }
 
-        if (urlObj.pathname === "/__audora_pick_files") {
+        if (
+          urlObj.pathname === "/__audora_pick_files" ||
+          urlObj.pathname === "/__audora_pick_single_file"
+        ) {
+          const isSingle = urlObj.pathname === "/__audora_pick_single_file";
           const sendPickedFiles = (rawStdout: string | null) => {
             res.statusCode = 200;
             res.setHeader("Content-Type", "application/json; charset=utf-8");
             if (!rawStdout) {
-              res.end(JSON.stringify({ ok: true, cancelled: true, files: [] }));
+              res.end(
+                JSON.stringify(
+                  isSingle
+                    ? { ok: true, cancelled: true, file: null }
+                    : { ok: true, cancelled: true, files: [] },
+                ),
+              );
               return;
             }
             const files: Array<{
@@ -338,6 +347,16 @@ function audoraLocalDevBridge(): Plugin {
                 // Skip invalid selection line
               }
             }
+            if (isSingle) {
+              res.end(
+                JSON.stringify({
+                  ok: true,
+                  cancelled: files.length === 0,
+                  file: files[0] ?? null,
+                }),
+              );
+              return;
+            }
             res.end(
               JSON.stringify({
                 ok: true,
@@ -348,14 +367,16 @@ function audoraLocalDevBridge(): Plugin {
           };
 
           if (process.platform === "darwin") {
-            const script = [
-              'set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed',
-              'set outText to ""',
-              "repeat with f in chosenFiles",
-              "  set outText to outText & (POSIX path of f) & linefeed",
-              "end repeat",
-              "return outText",
-            ].join("\n");
+            const script = isSingle
+              ? 'POSIX path of (choose file with prompt "Locate the moved audio or video file")'
+              : [
+                  'set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed',
+                  'set outText to ""',
+                  "repeat with f in chosenFiles",
+                  "  set outText to outText & (POSIX path of f) & linefeed",
+                  "end repeat",
+                  "return outText",
+                ].join("\n");
             execFile("/usr/bin/osascript", ["-e", script], (err, stdout) => {
               sendPickedFiles(err ? null : stdout);
             });
@@ -363,12 +384,14 @@ function audoraLocalDevBridge(): Plugin {
           }
 
           if (process.platform === "win32") {
+            const multiFlag = isSingle ? "$false" : "$true";
             execFile(
               "powershell",
               [
                 "-NoProfile",
+                "-Sta",
                 "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = $true; if ($d.ShowDialog() -eq 'OK') { $d.FileNames | ForEach-Object { Write-Output $_ } }",
+                `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = ${multiFlag}; if ($d.ShowDialog() -eq 'OK') { $d.FileNames | ForEach-Object { Write-Output $_ } }`,
               ],
               (err, stdout) => {
                 sendPickedFiles(err ? null : stdout);
@@ -377,13 +400,12 @@ function audoraLocalDevBridge(): Plugin {
             return;
           }
 
-          execFile(
-            "zenity",
-            ["--file-selection", "--multiple", "--separator=\n"],
-            (err, stdout) => {
-              sendPickedFiles(err ? null : stdout);
-            },
-          );
+          const zenityArgs = isSingle
+            ? ["--file-selection", "--separator=\n"]
+            : ["--file-selection", "--multiple", "--separator=\n"];
+          execFile("zenity", zenityArgs, (err, stdout) => {
+            sendPickedFiles(err ? null : stdout);
+          });
           return;
         }
 

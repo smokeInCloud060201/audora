@@ -7,8 +7,9 @@ import type {
   MediaItem,
   Note,
   PlaybackSnapshot,
+  TimestampPrecision,
 } from "../types/domain";
-import { formatDurationMs, progressPercent } from "../utils/format";
+import { computeProgressPercent, formatDurationMs } from "../utils/format";
 import {
   IconArrowRight,
   IconFolderOpen,
@@ -28,7 +29,7 @@ interface MediaLibraryViewProps {
   sourceFolderCount: number;
   onOpenLocalSourcesSettings: () => void;
   onOpenMediaPicker: () => void;
-  onSelectLibraryItem: (item: MediaItem) => void;
+  onSelectLibraryItem: (item: MediaItem, autoPlay?: boolean) => void;
   onJumpToNote: (noteId: string) => void;
   onAddToPlaylist: (item: MediaItem) => void;
   onUpdateSnapshot: (next: PlaybackSnapshot) => void;
@@ -43,7 +44,9 @@ interface MediaLibraryViewProps {
   onSetRelinkPathDraft: (draft: string) => void;
   relinkError: AppErrorPayload | null;
   onAttemptRelink: (mediaId: string, newPath: string, confirmMismatch?: boolean) => void;
+  onBrowseRelinkFile: (mediaId: string) => void;
   onClearMissingTarget: () => void;
+  timestampPrecision: TimestampPrecision;
 }
 
 export function MediaLibraryView({
@@ -72,7 +75,9 @@ export function MediaLibraryView({
   onSetRelinkPathDraft,
   relinkError,
   onAttemptRelink,
+  onBrowseRelinkFile,
   onClearMissingTarget,
+  timestampPrecision,
 }: MediaLibraryViewProps): React.ReactElement {
   return (
     <div className="content-page library-page">
@@ -169,15 +174,23 @@ export function MediaLibraryView({
               </div>
             )}
 
-            <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
               <button
                 type="button"
                 className="btn-primary"
+                onClick={() => onBrowseRelinkFile(missingMediaTarget.id)}
+              >
+                <IconFolderOpen size={14} />
+                <span>Locate file…</span>
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
                 onClick={() =>
                   onAttemptRelink(missingMediaTarget.id, relinkPathDraft, false)
                 }
               >
-                Locate file…
+                Relink path
               </button>
               <button
                 type="button"
@@ -253,7 +266,7 @@ export function MediaLibraryView({
                       marginRight: 8,
                     }}
                   >
-                    {formatDurationMs(n.position_ms)}
+                    {formatDurationMs(n.position_ms, timestampPrecision)}
                   </span>
                   <span style={{ color: "var(--text-secondary)" }}>
                     {n.body || "Quick marker"}
@@ -393,7 +406,7 @@ export function MediaLibraryView({
                   </thead>
                   <tbody>
                     {libraryResult.media_items.map((item) => {
-                      const pct = progressPercent(item.last_position_ms, item.duration_ms);
+                      const pct = computeProgressPercent(item);
                       const isMissing = item.availability === "missing";
                       const isMenuOpen = openLibraryMenuId === item.id;
                       return (
@@ -487,7 +500,7 @@ export function MediaLibraryView({
                                 <button
                                   type="button"
                                   className="btn-secondary"
-                                  onClick={() => onSelectLibraryItem(item)}
+                                  onClick={() => onSelectLibraryItem(item, true)}
                                 >
                                   Play now
                                 </button>

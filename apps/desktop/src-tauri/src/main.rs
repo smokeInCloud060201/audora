@@ -5,21 +5,29 @@
     windows_subsystem = "windows"
 )]
 
+use std::collections::hash_map::RandomState;
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
+use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use audora_desktop::{
     build_production_dispatcher_with_db, default_app_data_dir, default_database_path,
     domain::DEFAULT_GITHUB_RELEASE_REPO, persistence::Database,
     services::cleanup_all_app_artifacts,
 };
+use sha2::{Digest, Sha256};
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -35,12 +43,133 @@ enum DesktopUserEvent {
 }
 
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CONCURRENT_HTTP_CONNECTIONS: usize = 64;
 const DEFAULT_FULL_WIDTH: f64 = 1440.0;
 const DEFAULT_FULL_HEIGHT: f64 = 900.0;
 const MIN_FULL_WIDTH: f64 = 1040.0;
 const MIN_FULL_HEIGHT: f64 = 640.0;
 const MINIMUM_WIDGET_WIDTH: f64 = 360.0;
 const MINIMUM_WIDGET_HEIGHT: f64 = 168.0;
+
+const RUNTIME_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' https://api.github.com https://github.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+
+#[derive(Default)]
+struct MediaAllowlist {
+    files: HashSet<PathBuf>,
+    dirs: HashSet<PathBuf>,
+}
+
+impl MediaAllowlist {
+    fn register_file(&mut self, path: &Path) {
+        if let Some(canon) = canonical_existing_path(path) {
+            self.files.insert(canon);
+        }
+    }
+
+    fn register_dir(&mut self, path: &Path) {
+        if let Some(canon) = canonical_existing_path(path) {
+            self.dirs.insert(canon);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.files.clear();
+        self.dirs.clear();
+    }
+
+    fn register_from_ui_state_value(&mut self, val: &serde_json::Value) {
+        if let Some(media_arr) = val.get("media").and_then(serde_json::Value::as_array) {
+            for item in media_arr {
+                if let Some(p) = item.get("path").and_then(serde_json::Value::as_str) {
+                    let trimmed = p.trim();
+                    if !trimmed.is_empty() {
+                        self.register_file(Path::new(trimmed));
+                    }
+                }
+            }
+        }
+        if let Some(folders) = val
+            .get("settings")
+            .and_then(|s| s.get("source_folders"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for folder in folders {
+                if let Some(p) = folder.get("path").and_then(serde_json::Value::as_str) {
+                    let trimmed = p.trim();
+                    if !trimmed.is_empty() {
+                        self.register_dir(Path::new(trimmed));
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_allowed_media_file(&self, raw_path: &str) -> Option<PathBuf> {
+        let candidate = Path::new(raw_path.trim());
+        if !candidate.is_absolute() {
+            return None;
+        }
+        let canon = canonical_existing_path(candidate)?;
+        let meta = fs::metadata(&canon).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let ext = canon
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !is_supported_media_extension(&ext) {
+            return None;
+        }
+        if self.files.contains(&canon) || self.dirs.iter().any(|d| canon.starts_with(d)) {
+            Some(canon)
+        } else {
+            None
+        }
+    }
+}
+
+struct ConnectionSlotGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn generate_session_token() -> String {
+    let mut hasher = Sha256::new();
+    let mut urandom_bytes = [0_u8; 32];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut urandom_bytes);
+    }
+    hasher.update(urandom_bytes);
+    for _ in 0..4 {
+        let seed = RandomState::new().build_hasher().finish();
+        hasher.update(seed.to_le_bytes());
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -87,16 +216,28 @@ fn main() {
     };
 
     // One-time seamless migration of legacy `ui-state.json` into `audora.sqlite`
-    let legacy_state_file = default_app_data_dir().join("ui-state.json");
+    let app_data_dir = default_app_data_dir();
+    let legacy_state_file = app_data_dir.join("ui-state.json");
     if legacy_state_file.is_file() {
         if let Ok(None) = db.get_ui_state_json() {
             if let Ok(raw) = fs::read_to_string(&legacy_state_file) {
-                if raw.trim().starts_with('{') && db.set_ui_state_json(&raw).is_ok() {
+                if serde_json::from_str::<serde_json::Value>(&raw).is_ok_and(|v| v.is_object())
+                    && db.set_ui_state_json(&raw).is_ok()
+                {
                     let _ = fs::remove_file(&legacy_state_file);
                 }
             }
         } else {
             let _ = fs::remove_file(&legacy_state_file);
+        }
+    }
+
+    let allowlist = Arc::new(Mutex::new(MediaAllowlist::default()));
+    if let Ok(Some(saved_json)) = db.get_ui_state_json() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&saved_json) {
+            if let Ok(mut guard) = allowlist.lock() {
+                guard.register_from_ui_state_value(&val);
+            }
         }
     }
 
@@ -106,6 +247,7 @@ fn main() {
         .filter(|arg| !arg.starts_with('-'))
         .cloned()
         .collect();
+    let mut cli_boot_files: Vec<(String, String, u64, Option<u64>)> = Vec::new();
     if !cli_paths.is_empty() {
         if let Err(err) = dispatcher.open_media_batch(&cli_paths) {
             warn!(
@@ -113,11 +255,48 @@ fn main() {
                 "Failed to open CLI media arguments"
             );
         }
+        for raw_cli in &cli_paths {
+            let pb = PathBuf::from(raw_cli);
+            if pb.is_dir() {
+                if let Ok(mut guard) = allowlist.lock() {
+                    guard.register_dir(&pb);
+                }
+                collect_media_files_in_dir(&pb, 0, 1, 200, &mut cli_boot_files);
+            } else if pb.is_file() {
+                if let Ok(meta) = fs::metadata(&pb) {
+                    if meta.len() > 0 {
+                        let ext = pb
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if is_supported_media_extension(&ext) {
+                            if let Ok(mut guard) = allowlist.lock() {
+                                guard.register_file(&pb);
+                            }
+                            let name = pb
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(raw_cli)
+                                .to_owned();
+                            let dur = probe_media_duration_ms(&pb);
+                            cli_boot_files.push((
+                                canonical_path_string(&pb),
+                                name,
+                                meta.len(),
+                                dur,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if args.iter().any(|arg| arg == "--headless-check") {
         match dispatcher.check_for_updates() {
             Ok(update_status) => {
+                let _ = db.checkpoint_wal();
                 info!(
                     version = %update_status.current_version,
                     verified = update_status.verified,
@@ -144,8 +323,16 @@ fn main() {
 
     let event_loop = EventLoopBuilder::<DesktopUserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let session_token = Arc::new(generate_session_token());
+    let exit_db = db.clone();
 
-    let Some(server_url) = start_local_ui_server(ui_dist, proxy.clone(), db) else {
+    let Some((server_url, server_port)) = start_local_ui_server(
+        ui_dist,
+        proxy.clone(),
+        db,
+        Arc::clone(&session_token),
+        Arc::clone(&allowlist),
+    ) else {
         error!("Failed to bind local UI loopback server");
         std::process::exit(1);
     };
@@ -170,30 +357,66 @@ fn main() {
         LogicalSize::new(DEFAULT_FULL_WIDTH, DEFAULT_FULL_HEIGHT),
     );
 
-    let init_script = r#"
-      window.close = function() {
-        if (window.ipc && typeof window.ipc.postMessage === 'function') {
-          window.ipc.postMessage('quit');
+    let mut cli_json = String::from("[");
+    for (idx, (p, name, sz, dur)) in cli_boot_files.iter().enumerate() {
+        if idx > 0 {
+            cli_json.push(',');
         }
-      };
-      window.addEventListener('keydown', function(e) {
-        if ((e.metaKey || e.ctrlKey) && e.key && e.key.toLowerCase() === 'q') {
-          e.preventDefault();
-          if (window.ipc && typeof window.ipc.postMessage === 'function') {
-            window.ipc.postMessage('quit');
-          }
-        }
-      });
-    "#;
+        let ep = escape_json_str(p);
+        let en = escape_json_str(name);
+        let dur_json = dur.map_or_else(|| "null".to_owned(), |d| d.to_string());
+        cli_json.push_str(&format!(
+            r#"{{"path":"{ep}","name":"{en}","size":{sz},"duration_ms":{dur_json}}}"#
+        ));
+    }
+    cli_json.push(']');
+    let escaped_data_dir = escape_json_str(&app_data_dir.display().to_string());
+    let os_name = env::consts::OS;
+    let arch_name = env::consts::ARCH;
 
-    let webview_data_dir = default_app_data_dir().join("webview");
+    let init_script = format!(
+        r#"
+      Object.defineProperty(window, '__AUDORA_SESSION_TOKEN__', {{
+        value: '{session_token}',
+        writable: false,
+        configurable: false
+      }});
+      Object.defineProperty(window, '__AUDORA_PLATFORM__', {{
+        value: Object.freeze({{
+          os: '{os_name}',
+          arch: '{arch_name}',
+          data_dir: "{escaped_data_dir}",
+          cli_files: {cli_json}
+        }}),
+        writable: false,
+        configurable: false
+      }});
+      window.close = function() {{
+        if (window.ipc && typeof window.ipc.postMessage === 'function') {{
+          window.ipc.postMessage('quit');
+        }}
+      }};
+      window.addEventListener('keydown', function(e) {{
+        if ((e.metaKey || e.ctrlKey) && e.key && e.key.toLowerCase() === 'q') {{
+          e.preventDefault();
+          if (window.ipc && typeof window.ipc.postMessage === 'function') {{
+            window.ipc.postMessage('quit');
+          }}
+        }}
+      }});
+    "#
+    );
+
+    let webview_data_dir = app_data_dir.join("webview");
     let _ = fs::create_dir_all(&webview_data_dir);
     let mut web_context = WebContext::new(Some(webview_data_dir));
 
+    let allowed_ip_prefix = format!("http://127.0.0.1:{server_port}/");
+    let allowed_local_prefix = format!("http://localhost:{server_port}/");
     let ipc_proxy = proxy.clone();
     let webview = match WebViewBuilder::with_web_context(&mut web_context)
         .with_url(&server_url)
-        .with_initialization_script(init_script)
+        .with_initialization_script(&init_script)
         .with_ipc_handler(move |request| match request.body().as_str() {
             "quit" => {
                 let _ = ipc_proxy.send_event(DesktopUserEvent::Quit);
@@ -213,9 +436,9 @@ fn main() {
         .with_background_throttling(BackgroundThrottlingPolicy::Disabled)
         .with_clipboard(true)
         .with_devtools(cfg!(debug_assertions))
-        .with_navigation_handler(|uri: String| {
-            uri.starts_with("http://127.0.0.1:")
-                || uri.starts_with("http://localhost:")
+        .with_navigation_handler(move |uri: String| {
+            uri.starts_with(&allowed_ip_prefix)
+                || uri.starts_with(&allowed_local_prefix)
                 || uri.starts_with("about:blank")
                 || uri.starts_with("blob:")
         })
@@ -247,6 +470,7 @@ fn main() {
                 drop(webview.take());
                 drop(web_context.take());
                 drop(window.take());
+                let _ = exit_db.checkpoint_wal();
                 *control_flow = ControlFlow::Exit;
                 std::process::exit(0);
             }
@@ -379,48 +603,81 @@ fn resolve_ui_dist_dir() -> Option<PathBuf> {
 struct ParsedHttpRequest {
     method: String,
     raw_target: String,
+    host: Option<String>,
     range_header: Option<String>,
     origin: Option<String>,
     sec_fetch_site: Option<String>,
+    auth_token: Option<String>,
     body: Vec<u8>,
+}
+
+struct LoopbackServerContext {
+    root: PathBuf,
+    proxy: EventLoopProxy<DesktopUserEvent>,
+    db: Database,
+    local_port: u16,
+    session_token: Arc<String>,
+    allowlist: Arc<Mutex<MediaAllowlist>>,
 }
 
 fn start_local_ui_server(
     ui_dist: PathBuf,
     proxy: EventLoopProxy<DesktopUserEvent>,
     db: Database,
-) -> Option<String> {
+    session_token: Arc<String>,
+    allowlist: Arc<Mutex<MediaAllowlist>>,
+) -> Option<(String, u16)> {
     let listener = (41957..=41966)
         .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
         .or_else(|| TcpListener::bind(("127.0.0.1", 0)).ok())?;
     let local_addr = listener.local_addr().ok()?;
     let local_port = local_addr.port();
     let url = format!("http://127.0.0.1:{local_port}/");
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let ctx = Arc::new(LoopbackServerContext {
+        root: ui_dist,
+        proxy,
+        db,
+        local_port,
+        session_token,
+        allowlist,
+    });
 
     thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let root = ui_dist.clone();
-            let stream_proxy = proxy.clone();
-            let stream_db = db.clone();
+        for mut stream in listener.incoming().flatten() {
+            let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+            if prev >= MAX_CONCURRENT_HTTP_CONNECTIONS {
+                active_connections.fetch_sub(1, Ordering::AcqRel);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
+            let slot_guard = ConnectionSlotGuard {
+                counter: Arc::clone(&active_connections),
+            };
+            let conn_ctx = Arc::clone(&ctx);
             thread::spawn(move || {
-                handle_http_connection(stream, &root, &stream_proxy, &stream_db, local_port);
+                let _guard = slot_guard;
+                handle_http_connection(stream, &conn_ctx);
             });
         }
     });
 
-    Some(url)
+    Some((url, local_port))
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<ParsedHttpRequest> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+
     let mut header_buf = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
         let n = stream.read(&mut chunk).ok()?;
         if n == 0 {
-            if header_buf.is_empty() {
-                return None;
-            }
-            break header_buf.len();
+            // Never parse incomplete HTTP headers on premature EOF (`C-5`).
+            return None;
         }
         header_buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -433,28 +690,32 @@ fn read_http_request(stream: &mut TcpStream) -> Option<ParsedHttpRequest> {
 
     let header_str = String::from_utf8_lossy(&header_buf[..header_end]);
     let mut lines = header_str.lines();
-    let request_line = lines.next().unwrap_or("GET / HTTP/1.1");
+    let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET").to_ascii_uppercase();
-    let raw_target = parts.next().unwrap_or("/").to_owned();
+    let method = parts.next()?.to_ascii_uppercase();
+    let raw_target = parts.next()?.to_owned();
 
     let mut content_length = 0_usize;
+    let mut host: Option<String> = None;
     let mut range_header: Option<String> = None;
     let mut origin: Option<String> = None;
     let mut sec_fetch_site: Option<String> = None;
+    let mut auth_token: Option<String> = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
             if key.eq_ignore_ascii_case("content-length") {
-                if let Ok(parsed) = v.trim().parse::<usize>() {
-                    content_length = parsed;
-                }
+                content_length = v.trim().parse::<usize>().ok()?;
+            } else if key.eq_ignore_ascii_case("host") {
+                host = Some(v.trim().to_owned());
             } else if key.eq_ignore_ascii_case("range") {
                 range_header = Some(v.trim().to_owned());
             } else if key.eq_ignore_ascii_case("origin") {
                 origin = Some(v.trim().to_owned());
             } else if key.eq_ignore_ascii_case("sec-fetch-site") {
                 sec_fetch_site = Some(v.trim().to_ascii_lowercase());
+            } else if key.eq_ignore_ascii_case("x-audora-token") {
+                auth_token = Some(v.trim().to_owned());
             }
         }
     }
@@ -470,7 +731,8 @@ fn read_http_request(stream: &mut TcpStream) -> Option<ParsedHttpRequest> {
     while body.len() < content_length {
         let n = stream.read(&mut chunk).ok()?;
         if n == 0 {
-            break;
+            // Premature EOF before full Content-Length must abort (`C-5`).
+            return None;
         }
         body.extend_from_slice(&chunk[..n]);
     }
@@ -479,17 +741,30 @@ fn read_http_request(stream: &mut TcpStream) -> Option<ParsedHttpRequest> {
     Some(ParsedHttpRequest {
         method,
         raw_target,
+        host,
         range_header,
         origin,
         sec_fetch_site,
+        auth_token,
         body,
     })
+}
+
+fn is_valid_host_header(local_port: u16, host: Option<&str>) -> bool {
+    let Some(h) = host else {
+        return false;
+    };
+    let expected_ip = format!("127.0.0.1:{local_port}");
+    let expected_local = format!("localhost:{local_port}");
+    h.eq_ignore_ascii_case(&expected_ip) || h.eq_ignore_ascii_case(&expected_local)
 }
 
 fn is_trusted_loopback_request(
     local_port: u16,
     origin: Option<&str>,
     sec_fetch_site: Option<&str>,
+    provided_token: Option<&str>,
+    expected_token: &str,
 ) -> bool {
     if let Some(site) = sec_fetch_site {
         if site != "same-origin" && site != "none" {
@@ -498,7 +773,10 @@ fn is_trusted_loopback_request(
     }
     if let Some(orig) = origin {
         let trimmed = orig.trim();
-        if !trimmed.is_empty() && trimmed != "null" {
+        if trimmed.eq_ignore_ascii_case("null") {
+            return false;
+        }
+        if !trimmed.is_empty() {
             let expected_ip = format!("http://127.0.0.1:{local_port}");
             let expected_local = format!("http://localhost:{local_port}");
             if !trimmed.eq_ignore_ascii_case(&expected_ip)
@@ -508,12 +786,15 @@ fn is_trusted_loopback_request(
             }
         }
     }
-    true
+    let Some(tok) = provided_token else {
+        return false;
+    };
+    constant_time_eq(tok.as_bytes(), expected_token.as_bytes())
 }
 
 fn write_json_response(stream: &mut TcpStream, status: &str, body: &[u8]) {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -526,6 +807,10 @@ fn is_safe_semver(v: &str) -> bool {
         && v.len() <= 32
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
+fn is_valid_sha256_hex(v: &str) -> bool {
+    v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn escape_json_str(raw: &str) -> String {
@@ -544,16 +829,20 @@ fn escape_json_str(raw: &str) -> String {
     out
 }
 
-fn handle_http_connection(
-    mut stream: TcpStream,
-    root: &Path,
-    proxy: &EventLoopProxy<DesktopUserEvent>,
-    db: &Database,
-    local_port: u16,
-) {
+fn handle_http_connection(mut stream: TcpStream, ctx: &LoopbackServerContext) {
     let Some(req) = read_http_request(&mut stream) else {
         return;
     };
+
+    if !is_valid_host_header(ctx.local_port, req.host.as_deref()) {
+        write_json_response(
+            &mut stream,
+            "403 Forbidden",
+            br#"{"ok":false,"message":"Invalid Host header rejected."}"#,
+        );
+        return;
+    }
+
     let method = req.method;
     let raw_target = req.raw_target;
     let range_header = req.range_header;
@@ -563,22 +852,38 @@ fn handle_http_connection(
         .split_once('?')
         .map_or((raw_target.as_str(), ""), |(p, q)| (p, q));
 
-    if raw_path.starts_with("/__audora_")
-        && !is_trusted_loopback_request(
-            local_port,
+    let mut query_token: Option<String> = None;
+    for pair in raw_query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "token" {
+                query_token = Some(percent_decode(v));
+            }
+        }
+    }
+
+    if raw_path.starts_with("/__audora_") {
+        let effective_token = req.auth_token.as_deref().or(query_token.as_deref());
+        if !is_trusted_loopback_request(
+            ctx.local_port,
             req.origin.as_deref(),
             req.sec_fetch_site.as_deref(),
-        )
-    {
-        write_json_response(
-            &mut stream,
-            "403 Forbidden",
-            br#"{"ok":false,"message":"Cross-origin loopback request blocked."}"#,
-        );
-        return;
+            effective_token,
+            &ctx.session_token,
+        ) {
+            write_json_response(
+                &mut stream,
+                "403 Forbidden",
+                br#"{"ok":false,"message":"Unauthorized loopback bridge request blocked."}"#,
+            );
+            return;
+        }
     }
 
     if raw_path == "/__audora_media" {
+        if method != "GET" && method != "HEAD" {
+            write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
+            return;
+        }
         let mut media_path_str = String::new();
         for pair in raw_query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -587,7 +892,16 @@ fn handle_http_connection(
                 }
             }
         }
-        stream_local_media_file(&mut stream, &media_path_str, range_header.as_deref());
+        let allowed_canon = ctx
+            .allowlist
+            .lock()
+            .ok()
+            .and_then(|g| g.resolve_allowed_media_file(&media_path_str));
+        let Some(canon_path) = allowed_canon else {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            return;
+        };
+        stream_local_media_file(&mut stream, &canon_path, range_header.as_deref());
         return;
     }
 
@@ -600,24 +914,32 @@ fn handle_http_connection(
                 }
             }
         }
-        let candidate = Path::new(media_path_str.trim());
-        if !candidate.is_absolute() || !candidate.is_file() {
+        let allowed_canon = ctx
+            .allowlist
+            .lock()
+            .ok()
+            .and_then(|g| g.resolve_allowed_media_file(&media_path_str));
+        let Some(candidate) = allowed_canon else {
             write_json_response(
                 &mut stream,
                 "404 Not Found",
                 br#"{"ok":false,"duration_ms":null}"#,
             );
             return;
-        }
-        let dur_json =
-            probe_media_duration_ms(candidate).map_or_else(|| "null".to_owned(), |d| d.to_string());
+        };
+        let dur_json = probe_media_duration_ms(&candidate)
+            .map_or_else(|| "null".to_owned(), |d| d.to_string());
         let body = format!(r#"{{"ok":true,"duration_ms":{dur_json}}}"#);
         write_json_response(&mut stream, "200 OK", body.as_bytes());
         return;
     }
 
     if raw_path == "/__audora_pick_files" {
-        let picked = pick_native_media_files();
+        if method != "POST" {
+            write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
+            return;
+        }
+        let picked = pick_native_media_files(true);
         if picked.is_empty() {
             write_json_response(
                 &mut stream,
@@ -625,6 +947,11 @@ fn handle_http_connection(
                 br#"{"ok":true,"cancelled":true,"files":[]}"#,
             );
         } else {
+            if let Ok(mut guard) = ctx.allowlist.lock() {
+                for (p, _, _, _) in &picked {
+                    guard.register_file(Path::new(p));
+                }
+            }
             let mut files_json = String::from("[");
             for (idx, (p, name, sz, dur)) in picked.iter().enumerate() {
                 if idx > 0 {
@@ -644,9 +971,43 @@ fn handle_http_connection(
         return;
     }
 
+    if raw_path == "/__audora_pick_single_file" {
+        if method != "POST" {
+            write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
+            return;
+        }
+        let picked = pick_native_media_files(false);
+        if let Some((p, name, sz, dur)) = picked.first() {
+            if let Ok(mut guard) = ctx.allowlist.lock() {
+                guard.register_file(Path::new(p));
+            }
+            let ep = escape_json_str(p);
+            let en = escape_json_str(name);
+            let dur_json = dur.map_or_else(|| "null".to_owned(), |d| d.to_string());
+            let body = format!(
+                r#"{{"ok":true,"cancelled":false,"file":{{"path":"{ep}","name":"{en}","size":{sz},"duration_ms":{dur_json}}}}}"#
+            );
+            write_json_response(&mut stream, "200 OK", body.as_bytes());
+        } else {
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                br#"{"ok":true,"cancelled":true,"file":null}"#,
+            );
+        }
+        return;
+    }
+
     if raw_path == "/__audora_pick_folder" {
+        if method != "POST" {
+            write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
+            return;
+        }
         match pick_native_folder() {
             Some(selected) => {
+                if let Ok(mut guard) = ctx.allowlist.lock() {
+                    guard.register_dir(Path::new(&selected));
+                }
                 let escaped = escape_json_str(&selected);
                 let body = format!(r#"{{"ok":true,"cancelled":false,"path":"{escaped}"}}"#);
                 write_json_response(&mut stream, "200 OK", body.as_bytes());
@@ -671,31 +1032,47 @@ fn handle_http_connection(
                 }
             }
         }
-        handle_scan_folder_request(&mut stream, &folder_path_str);
+        handle_scan_folder_request(&mut stream, &folder_path_str, &ctx.allowlist);
         return;
     }
 
     if raw_path == "/__audora_update" {
-        let mut version = String::new();
-        for pair in raw_query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "version" {
-                    version = percent_decode(v);
-                }
-            }
+        if method != "POST" {
+            write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
+            return;
         }
+        let body_json: Option<serde_json::Value> = std::str::from_utf8(&req_body)
+            .ok()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let raw_ver = body_json
+            .as_ref()
+            .and_then(|v| v.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let expected_sha = body_json
+            .as_ref()
+            .and_then(|v| v.get("sha256"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
 
-        let clean_ver = version.trim().trim_start_matches(['v', 'V']).to_owned();
-        if !is_safe_semver(&clean_ver) {
+        let clean_ver = raw_ver.trim().trim_start_matches(['v', 'V']).to_owned();
+        if !is_safe_semver(&clean_ver) || !is_valid_sha256_hex(&expected_sha) {
             write_json_response(
                 &mut stream,
                 "400 Bad Request",
-                br#"{"ok":false,"status":"invalid_parameters","message":"Invalid target version parameter."}"#,
+                br#"{"ok":false,"status":"invalid_parameters","message":"Verified target version and 64-hex SHA-256 digest are required."}"#,
             );
             return;
         }
 
-        match perform_native_self_update(DEFAULT_GITHUB_RELEASE_REPO, &clean_ver, proxy) {
+        match perform_native_self_update(
+            DEFAULT_GITHUB_RELEASE_REPO,
+            &clean_ver,
+            &expected_sha,
+            &ctx.proxy,
+        ) {
             Ok((status_code, msg)) => {
                 let escaped = escape_json_str(&msg);
                 let body =
@@ -713,7 +1090,7 @@ fn handle_http_connection(
     }
 
     if raw_path == "/__audora_backup" && method == "POST" {
-        match db.create_manual_backup() {
+        match ctx.db.create_manual_backup() {
             Ok(Some(backup_path)) => {
                 let escaped = escape_json_str(&backup_path.display().to_string());
                 let body = format!(r#"{{"ok":true,"backup_path":"{escaped}"}}"#);
@@ -733,7 +1110,7 @@ fn handle_http_connection(
     if raw_path == "/__audora_state" {
         let legacy_state_file = default_app_data_dir().join("ui-state.json");
         match method.as_str() {
-            "GET" => match db.get_ui_state_json() {
+            "GET" => match ctx.db.get_ui_state_json() {
                 Ok(Some(json)) => {
                     write_json_response(&mut stream, "200 OK", json.as_bytes());
                 }
@@ -747,18 +1124,62 @@ fn handle_http_connection(
             },
             "POST" => {
                 if let Ok(json_str) = std::str::from_utf8(&req_body) {
-                    if json_str.trim().starts_with('{') && db.set_ui_state_json(json_str).is_ok() {
-                        let _ = fs::remove_file(&legacy_state_file);
-                        write_json_response(&mut stream, "200 OK", br#"{"ok":true}"#);
-                        return;
+                    if let Ok(parsed_val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if parsed_val.is_object() && ctx.db.set_ui_state_json(json_str).is_ok() {
+                            if let Ok(mut guard) = ctx.allowlist.lock() {
+                                guard.register_from_ui_state_value(&parsed_val);
+                            }
+                            let _ = fs::remove_file(&legacy_state_file);
+                            write_json_response(&mut stream, "200 OK", br#"{"ok":true}"#);
+                            return;
+                        }
                     }
                 }
-                write_json_response(&mut stream, "500 Internal Server Error", br#"{"ok":false}"#);
+                write_json_response(&mut stream, "400 Bad Request", br#"{"ok":false}"#);
             }
             "DELETE" => {
-                let _ = db.clear_ui_state();
+                let _ = ctx.db.reset_all_user_data();
+                if let Ok(mut guard) = ctx.allowlist.lock() {
+                    guard.clear();
+                }
                 let _ = fs::remove_file(&legacy_state_file);
-                write_json_response(&mut stream, "200 OK", br#"{"ok":true}"#);
+                let data_dir = default_app_data_dir();
+                let mut removed_paths = vec![data_dir.join("audora.sqlite").display().to_string()];
+                let mut bytes_reclaimed: u64 = 0;
+                for sub in ["updates", "logs", "cache"] {
+                    let target = data_dir.join(sub);
+                    if target.exists() {
+                        if let Ok(meta) = fs::symlink_metadata(&target) {
+                            if !meta.file_type().is_symlink() && meta.is_dir() {
+                                let _ = fs::remove_dir_all(&target);
+                                removed_paths.push(target.display().to_string());
+                            }
+                        }
+                    }
+                }
+                if let Ok(entries) = fs::read_dir(&data_dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        let p = entry.path();
+                        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                            if name.starts_with("audora.sqlite.") && name.ends_with(".bak") {
+                                let sz = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                                if fs::remove_file(&p).is_ok() {
+                                    bytes_reclaimed = bytes_reclaimed.saturating_add(sz);
+                                    removed_paths.push(p.display().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                let paths_json: Vec<String> = removed_paths
+                    .iter()
+                    .map(|p| format!("\"{}\"", escape_json_str(p)))
+                    .collect();
+                let body = format!(
+                    r#"{{"ok":true,"removed_paths":[{}],"bytes_reclaimed":{bytes_reclaimed}}}"#,
+                    paths_json.join(",")
+                );
+                write_json_response(&mut stream, "200 OK", body.as_bytes());
             }
             _ => {
                 write_json_response(&mut stream, "405 Method Not Allowed", br#"{"ok":false}"#);
@@ -770,7 +1191,7 @@ fn handle_http_connection(
     let decoded = percent_decode(raw_path);
     let trimmed = decoded.trim_start_matches('/');
 
-    let mut candidate = root.to_path_buf();
+    let mut candidate = ctx.root.clone();
     if trimmed.is_empty() {
         candidate.push("index.html");
     } else {
@@ -782,7 +1203,7 @@ fn handle_http_connection(
     }
 
     if !candidate.is_file() {
-        candidate = root.join("index.html");
+        candidate = ctx.root.join("index.html");
     }
 
     let Ok(body) = fs::read(&candidate) else {
@@ -792,7 +1213,7 @@ fn handle_http_connection(
 
     let content_type = mime_type_for_path(&candidate);
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Security-Policy: {RUNTIME_CSP}\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -800,26 +1221,45 @@ fn handle_http_connection(
     let _ = stream.flush();
 }
 
+fn compute_file_sha256_hex(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 65_536];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 fn perform_native_self_update(
     repo: &str,
     version: &str,
+    expected_sha256: &str,
     proxy: &EventLoopProxy<DesktopUserEvent>,
 ) -> Result<(&'static str, String), (&'static str, String)> {
     let tag = format!("v{version}");
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let staging_dir = env::temp_dir().join(format!("audora-update-{version}-{stamp}"));
-    fs::create_dir_all(&staging_dir).map_err(|e| {
+    let rand_suffix = RandomState::new().build_hasher().finish();
+    let staging_dir = default_app_data_dir()
+        .join("updates")
+        .join(format!("staging-{version}-{rand_suffix:016x}"));
+    fs::create_dir_all(&staging_dir).map_err(|_| {
         (
             "staging_failed",
-            format!("Failed to create temporary update directory: {e}"),
+            "Failed to create secure update staging directory.".to_owned(),
         )
     })?;
 
     if cfg!(target_os = "macos") {
-        let archive_name = format!("Audora_{version}_macos-aarch64.app.tar.gz");
+        let mac_arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        let archive_name = format!("Audora_{version}_macos-{mac_arch}.app.tar.gz");
         let archive_url =
             format!("https://github.com/{repo}/releases/download/{tag}/{archive_name}");
         let archive_path = staging_dir.join(&archive_name);
@@ -834,6 +1274,15 @@ fn perform_native_self_update(
             .unwrap_or(false);
 
         if curl_ok && archive_path.is_file() {
+            let actual_sha = compute_file_sha256_hex(&archive_path).unwrap_or_default();
+            if !constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes()) {
+                let _ = fs::remove_dir_all(&staging_dir);
+                return Err((
+                    "checksum_verification_failed",
+                    "Downloaded update bundle failed SHA-256 integrity verification.".to_owned(),
+                ));
+            }
+
             let tar_ok = Command::new("/usr/bin/tar")
                 .arg("-xzf")
                 .arg(&archive_path)
@@ -845,14 +1294,7 @@ fn perform_native_self_update(
 
             let staged_app = staging_dir.join("Audora.app");
             if tar_ok && staged_app.is_dir() {
-                let _ = Command::new("/usr/bin/xattr")
-                    .arg("-cr")
-                    .arg(&staged_app)
-                    .status();
-                let _ = Command::new("/usr/bin/codesign")
-                    .args(["--force", "--deep", "--sign", "-"])
-                    .arg(&staged_app)
-                    .status();
+                // Verify bundle code signature directly WITHOUT re-signing (`C-2`).
                 let verify_ok = Command::new("/usr/bin/codesign")
                     .args(["--verify", "--deep", "--strict"])
                     .arg(&staged_app)
@@ -860,6 +1302,7 @@ fn perform_native_self_update(
                     .map(|s| s.success())
                     .unwrap_or(false);
                 if !verify_ok {
+                    let _ = fs::remove_dir_all(&staging_dir);
                     return Err((
                         "signature_verification_failed",
                         "Downloaded macOS bundle failed codesign verification.".to_owned(),
@@ -868,16 +1311,21 @@ fn perform_native_self_update(
 
                 let target_app = resolve_current_macos_app_bundle()
                     .unwrap_or_else(|| PathBuf::from("/Applications/Audora.app"));
+                let backup_app = target_app.with_extension("app.previous");
+                let _ = fs::remove_dir_all(&backup_app);
 
-                if target_app.exists() {
-                    let _ = fs::remove_dir_all(&target_app);
+                if target_app.exists() && fs::rename(&target_app, &backup_app).is_err() {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err((
+                        "install_permission_denied",
+                        format!(
+                            "Insufficient permissions to replace {}. Move Audora to a writable folder or install manually.",
+                            target_app.display()
+                        ),
+                    ));
                 }
-                let moved = Command::new("/bin/mv")
-                    .arg(&staged_app)
-                    .arg(&target_app)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
+
+                let moved = fs::rename(&staged_app, &target_app).is_ok()
                     || Command::new("/bin/cp")
                         .arg("-R")
                         .arg(&staged_app)
@@ -887,50 +1335,69 @@ fn perform_native_self_update(
                         .unwrap_or(false);
 
                 if moved {
+                    let _ = fs::remove_dir_all(&backup_app);
                     let _ = fs::remove_dir_all(&staging_dir);
-                    let target_str = target_app.to_string_lossy().into_owned();
-                    let _ = Command::new("/bin/sh")
-                        .args([
-                            "-c",
-                            &format!("sleep 0.6 && /usr/bin/open -n \"{target_str}\""),
-                        ])
-                        .spawn();
+                    // Spawn `/usr/bin/open` directly without `/bin/sh -c` interpolation (`C-2`).
+                    let target_for_relaunch = target_app.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(600));
+                        let _ = Command::new("/usr/bin/open")
+                            .arg("-n")
+                            .arg(&target_for_relaunch)
+                            .spawn();
+                    });
                     let _ = proxy.send_event(DesktopUserEvent::Quit);
 
                     return Ok((
                         "restarting",
                         format!(
-                            "Audora {version} verified, installed to {}, and restarting…",
+                            "Audora {version} SHA-256 & signature verified, installed to {}, and restarting…",
                             target_app.display()
                         ),
                     ));
                 }
+
+                if backup_app.exists() {
+                    let _ = fs::rename(&backup_app, &target_app);
+                }
             }
         }
 
-        let dmg_name = format!("Audora_{version}_macos-aarch64.dmg");
+        let dmg_name = format!("Audora_{version}_macos-{mac_arch}.dmg");
         let dmg_url = format!("https://github.com/{repo}/releases/download/{tag}/{dmg_name}");
-        let downloads_dir = env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Downloads"))
-            .unwrap_or_else(|| staging_dir.clone());
-        let dmg_path = downloads_dir.join(&dmg_name);
+        let dmg_staged = staging_dir.join(&dmg_name);
 
         let dmg_ok = Command::new("/usr/bin/curl")
             .args(["-fSL", "--retry", "2", "-o"])
-            .arg(&dmg_path)
+            .arg(&dmg_staged)
             .arg(&dmg_url)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
 
-        if dmg_ok && dmg_path.is_file() {
-            let _ = Command::new("/usr/bin/open").arg(&dmg_path).spawn();
-            return Ok((
-                "downloaded_installer",
-                format!("Downloaded {dmg_name} to ~/Downloads and mounted installer."),
+        if dmg_ok && dmg_staged.is_file() {
+            let actual_sha = compute_file_sha256_hex(&dmg_staged).unwrap_or_default();
+            if constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes()) {
+                let downloads_dir = env::var_os("HOME")
+                    .map(|h| PathBuf::from(h).join("Downloads"))
+                    .unwrap_or_else(|| staging_dir.clone());
+                let dmg_dest = downloads_dir.join(&dmg_name);
+                let _ = fs::copy(&dmg_staged, &dmg_dest);
+                let _ = fs::remove_dir_all(&staging_dir);
+                let _ = Command::new("/usr/bin/open").arg(&dmg_dest).spawn();
+                return Ok((
+                    "downloaded_installer",
+                    format!("Verified SHA-256 and mounted {dmg_name} in ~/Downloads."),
+                ));
+            }
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err((
+                "checksum_verification_failed",
+                "Downloaded DMG failed SHA-256 integrity verification.".to_owned(),
             ));
         }
 
+        let _ = fs::remove_dir_all(&staging_dir);
         let release_page = format!("https://github.com/{repo}/releases/tag/{tag}");
         let _ = Command::new("/usr/bin/open").arg(&release_page).spawn();
         return Ok((
@@ -940,30 +1407,39 @@ fn perform_native_self_update(
     }
 
     if cfg!(target_os = "windows") {
-        let msi_name = format!("Audora_{version}_windows-x86_64.msi");
-        let msi_url = format!("https://github.com/{repo}/releases/download/{tag}/{msi_name}");
-        let msi_path = staging_dir.join(&msi_name);
+        let setup_name = format!("Audora_{version}_windows-x86_64-setup.exe");
+        let setup_url = format!("https://github.com/{repo}/releases/download/{tag}/{setup_name}");
+        let setup_path = staging_dir.join(&setup_name);
         let curl_ok = Command::new("curl.exe")
             .args(["-fSL", "--retry", "2", "-o"])
-            .arg(&msi_path)
-            .arg(&msi_url)
+            .arg(&setup_path)
+            .arg(&setup_url)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
 
-        if curl_ok && msi_path.is_file() {
-            let _ = Command::new("msiexec.exe").arg("/i").arg(&msi_path).spawn();
+        if curl_ok && setup_path.is_file() {
+            let actual_sha = compute_file_sha256_hex(&setup_path).unwrap_or_default();
+            if !constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes()) {
+                let _ = fs::remove_dir_all(&staging_dir);
+                return Err((
+                    "checksum_verification_failed",
+                    "Downloaded Windows installer failed SHA-256 integrity verification."
+                        .to_owned(),
+                ));
+            }
+            let _ = Command::new(&setup_path).spawn();
             let _ = proxy.send_event(DesktopUserEvent::Quit);
-            return Ok(("restarting", format!("Launched {msi_name} installer.")));
+            return Ok(("restarting", format!("Verified and launched {setup_name}.")));
         }
 
+        let _ = fs::remove_dir_all(&staging_dir);
         let release_page = format!("https://github.com/{repo}/releases/tag/{tag}");
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", &release_page])
-            .spawn();
+        let _ = Command::new("explorer.exe").arg(&release_page).spawn();
         return Ok(("opened_release", format!("Opened {release_page}.")));
     }
 
+    let _ = fs::remove_dir_all(&staging_dir);
     let release_page = format!("https://github.com/{repo}/releases/tag/{tag}");
     let _ = Command::new("xdg-open").arg(&release_page).spawn();
     Ok((
@@ -1022,19 +1498,44 @@ fn is_supported_media_extension(ext: &str) -> bool {
     )
 }
 
-fn stream_local_media_file(stream: &mut TcpStream, raw_path: &str, range_header: Option<&str>) {
-    let candidate = Path::new(raw_path.trim());
-    let ext = candidate
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if !candidate.is_absolute() || !is_supported_media_extension(&ext) || !candidate.is_file() {
-        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-        return;
+fn parse_http_byte_range(spec: &str, total_len: u64) -> Result<(u64, u64), ()> {
+    if total_len == 0 {
+        return Err(());
     }
+    let range_spec = spec.trim().strip_prefix("bytes=").ok_or(())?;
+    // Ignore multi-range requests by falling back to first range or rejecting invalid syntax
+    let first_range = range_spec.split(',').next().unwrap_or("").trim();
+    let (start_str, end_str) = first_range.split_once('-').ok_or(())?;
+    let start_trimmed = start_str.trim();
+    let end_trimmed = end_str.trim();
 
+    if start_trimmed.is_empty() {
+        // Suffix byte-range-spec (`bytes=-500`)
+        let suffix_len: u64 = end_trimmed.parse().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = total_len.saturating_sub(suffix_len);
+        Ok((start, total_len - 1))
+    } else {
+        let start: u64 = start_trimmed.parse().map_err(|_| ())?;
+        if start >= total_len {
+            return Err(());
+        }
+        let end = if end_trimmed.is_empty() {
+            total_len - 1
+        } else {
+            let parsed_end: u64 = end_trimmed.parse().map_err(|_| ())?;
+            if parsed_end < start {
+                return Err(());
+            }
+            parsed_end.min(total_len - 1)
+        };
+        Ok((start, end))
+    }
+}
+
+fn stream_local_media_file(stream: &mut TcpStream, candidate: &Path, range_header: Option<&str>) {
     let Ok(mut file) = File::open(candidate) else {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
         return;
@@ -1046,26 +1547,6 @@ fn stream_local_media_file(stream: &mut TcpStream, raw_path: &str, range_header:
     let total_len = meta.len();
     let content_type = mime_type_for_path(candidate);
 
-    let mut start = 0_u64;
-    let mut end = total_len.saturating_sub(1);
-    let mut is_partial = false;
-
-    if let Some(range_val) = range_header {
-        if let Some(spec) = range_val.strip_prefix("bytes=") {
-            if let Some((start_str, end_str)) = spec.split_once('-') {
-                if let Ok(parsed_start) = start_str.trim().parse::<u64>() {
-                    if parsed_start < total_len {
-                        start = parsed_start;
-                        if let Ok(parsed_end) = end_str.trim().parse::<u64>() {
-                            end = parsed_end.min(total_len.saturating_sub(1));
-                        }
-                        is_partial = true;
-                    }
-                }
-            }
-        }
-    }
-
     if total_len == 0 {
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1074,6 +1555,22 @@ fn stream_local_media_file(stream: &mut TcpStream, raw_path: &str, range_header:
         let _ = stream.flush();
         return;
     }
+
+    let (start, end, is_partial) = if let Some(range_val) = range_header {
+        match parse_http_byte_range(range_val, total_len) {
+            Ok((s, e)) => (s, e, true),
+            Err(()) => {
+                let header = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total_len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.flush();
+                return;
+            }
+        }
+    } else {
+        (0_u64, total_len - 1, false)
+    };
 
     if file.seek(SeekFrom::Start(start)).is_err() {
         let _ =
@@ -1159,16 +1656,21 @@ fn normalize_folder_path(raw: &str) -> String {
     }
 }
 
-fn canonical_path_string(p: &Path) -> String {
-    let raw = fs::canonicalize(p)
-        .unwrap_or_else(|_| p.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+fn canonical_existing_path(p: &Path) -> Option<PathBuf> {
+    let canon = fs::canonicalize(p).ok()?;
+    let raw = canon.to_string_lossy();
     if let Some(stripped) = raw.strip_prefix(r"\\?\") {
-        stripped.to_owned()
+        Some(PathBuf::from(stripped))
     } else {
-        raw
+        Some(canon)
     }
+}
+
+fn canonical_path_string(p: &Path) -> String {
+    canonical_existing_path(p)
+        .unwrap_or_else(|| p.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn read_exact_at(file: &mut File, offset: u64, buf: &mut [u8]) -> bool {
@@ -1398,16 +1900,32 @@ fn probe_media_duration_ms(path: &Path) -> Option<u64> {
     }
 }
 
-fn pick_native_media_files() -> Vec<(String, String, u64, Option<u64>)> {
+fn configure_hidden_windows_command(cmd: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+fn pick_native_media_files(multiselect: bool) -> Vec<(String, String, u64, Option<u64>)> {
     let raw_lines: Vec<String> = if cfg!(target_os = "macos") {
-        let script = r#"
-            set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed
-            set outText to ""
-            repeat with f in chosenFiles
-                set outText to outText & (POSIX path of f) & linefeed
-            end repeat
-            return outText
-        "#;
+        let script = if multiselect {
+            r#"
+                set chosenFiles to choose file with prompt "Select local audio or video files for Audora" with multiple selections allowed
+                set outText to ""
+                repeat with f in chosenFiles
+                    set outText to outText & (POSIX path of f) & linefeed
+                end repeat
+                return outText
+            "#
+        } else {
+            r#"
+                set chosenFile to choose file with prompt "Locate the moved audio or video file"
+                return POSIX path of chosenFile
+            "#
+        };
         Command::new("/usr/bin/osascript")
             .args(["-e", script])
             .output()
@@ -1422,12 +1940,13 @@ fn pick_native_media_files() -> Vec<(String, String, u64, Option<u64>)> {
             })
             .unwrap_or_default()
     } else if cfg!(target_os = "windows") {
-        Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = $true; $d.Filter = 'Media Files|*.mp4;*.m4v;*.mov;*.webm;*.mkv;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac|All Files|*.*'; if ($d.ShowDialog() -eq 'OK') { $d.FileNames | ForEach-Object { Write-Output $_ } }",
-            ])
+        let multi_flag = if multiselect { "$true" } else { "$false" };
+        let ps_script = format!(
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Multiselect = {multi_flag}; $d.Filter = 'Media Files|*.mp4;*.m4v;*.mov;*.webm;*.mkv;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac|All Files|*.*'; if ($d.ShowDialog() -eq 'OK') {{ $d.FileNames | ForEach-Object {{ Write-Output $_ }} }}"
+        );
+        let mut cmd = Command::new("powershell");
+        configure_hidden_windows_command(&mut cmd);
+        cmd.args(["-NoProfile", "-Sta", "-Command", &ps_script])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -1440,13 +1959,16 @@ fn pick_native_media_files() -> Vec<(String, String, u64, Option<u64>)> {
             })
             .unwrap_or_default()
     } else {
+        let mut args = vec![
+            "--file-selection",
+            "--separator=\n",
+            "--title=Select local audio or video files for Audora",
+        ];
+        if multiselect {
+            args.insert(1, "--multiple");
+        }
         Command::new("zenity")
-            .args([
-                "--file-selection",
-                "--multiple",
-                "--separator=\n",
-                "--title=Select local audio or video files for Audora",
-            ])
+            .args(&args)
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -1497,15 +2019,18 @@ fn pick_native_folder() -> Option<String> {
         if chosen.is_empty() || !Path::new(&chosen).is_dir() {
             return None;
         }
-        return Some(chosen);
+        return Some(canonical_path_string(Path::new(&chosen)));
     }
 
     if cfg!(target_os = "windows") {
-        let output = Command::new("powershell")
+        let mut cmd = Command::new("powershell");
+        configure_hidden_windows_command(&mut cmd);
+        let output = cmd
             .args([
                 "-NoProfile",
+                "-Sta",
                 "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select a local media folder for Audora'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select a local media folder for Audora'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
             ])
             .output()
             .ok()?;
@@ -1516,7 +2041,7 @@ fn pick_native_folder() -> Option<String> {
         if chosen.is_empty() || !Path::new(&chosen).is_dir() {
             return None;
         }
-        return Some(chosen);
+        return Some(canonical_path_string(Path::new(&chosen)));
     }
 
     for (bin, args) in [
@@ -1534,7 +2059,7 @@ fn pick_native_folder() -> Option<String> {
             if output.status.success() {
                 let chosen = normalize_folder_path(&String::from_utf8_lossy(&output.stdout));
                 if !chosen.is_empty() && Path::new(&chosen).is_dir() {
-                    return Some(chosen);
+                    return Some(canonical_path_string(Path::new(&chosen)));
                 }
             }
         }
@@ -1599,7 +2124,11 @@ fn collect_media_files_in_dir(
     }
 }
 
-fn handle_scan_folder_request(stream: &mut TcpStream, raw_path: &str) {
+fn handle_scan_folder_request(
+    stream: &mut TcpStream,
+    raw_path: &str,
+    allowlist: &Mutex<MediaAllowlist>,
+) {
     let normalized = normalize_folder_path(raw_path);
     let candidate = Path::new(&normalized);
     if normalized.is_empty() || !candidate.is_absolute() || !candidate.is_dir() {
@@ -1611,14 +2140,25 @@ fn handle_scan_folder_request(stream: &mut TcpStream, raw_path: &str) {
         return;
     }
 
-    let folder_name = candidate
+    if let Ok(mut guard) = allowlist.lock() {
+        guard.register_dir(candidate);
+    }
+
+    let canon_folder = canonical_path_string(candidate);
+    let folder_name = Path::new(&canon_folder)
         .file_name()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or(&normalized);
+        .unwrap_or(&canon_folder);
 
     let mut discovered: Vec<(String, String, u64, Option<u64>)> = Vec::new();
     collect_media_files_in_dir(candidate, 0, 4, 2_000, &mut discovered);
+
+    if let Ok(mut guard) = allowlist.lock() {
+        for (fp, _, _, _) in &discovered {
+            guard.register_file(Path::new(fp));
+        }
+    }
 
     let mut files_json = String::from("[");
     for (idx, (file_path, file_name, size, dur)) in discovered.iter().enumerate() {
@@ -1634,10 +2174,110 @@ fn handle_scan_folder_request(stream: &mut TcpStream, raw_path: &str) {
     }
     files_json.push(']');
 
-    let escaped_folder_path = escape_json_str(&normalized);
+    let escaped_folder_path = escape_json_str(&canon_folder);
     let escaped_folder_name = escape_json_str(folder_name);
     let body = format!(
         r#"{{"ok":true,"folder_path":"{escaped_folder_path}","folder_name":"{escaped_folder_name}","files":{files_json}}}"#
     );
     write_json_response(stream, "200 OK", body.as_bytes());
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_header_and_session_token_block_dns_rebinding_and_null_origin() {
+        let tok = generate_session_token();
+        assert_eq!(tok.len(), 64);
+
+        assert!(is_valid_host_header(41957, Some("127.0.0.1:41957")));
+        assert!(is_valid_host_header(41957, Some("localhost:41957")));
+        assert!(!is_valid_host_header(41957, Some("attacker.tld:41957")));
+        assert!(!is_valid_host_header(41957, None));
+
+        // Missing token or wrong token rejected
+        assert!(!is_trusted_loopback_request(41957, None, None, None, &tok));
+        assert!(!is_trusted_loopback_request(
+            41957,
+            Some("http://127.0.0.1:41957"),
+            Some("same-origin"),
+            Some("wrong"),
+            &tok
+        ));
+
+        // Origin: null rejected even with valid token
+        assert!(!is_trusted_loopback_request(
+            41957,
+            Some("null"),
+            Some("cross-site"),
+            Some(&tok),
+            &tok
+        ));
+        assert!(!is_trusted_loopback_request(
+            41957,
+            Some("null"),
+            None,
+            Some(&tok),
+            &tok
+        ));
+
+        // Valid same-origin + token accepted
+        assert!(is_trusted_loopback_request(
+            41957,
+            Some("http://127.0.0.1:41957"),
+            Some("same-origin"),
+            Some(&tok),
+            &tok
+        ));
+    }
+
+    #[test]
+    fn rfc9110_byte_ranges_handle_suffix_and_reject_inverted_or_oob() {
+        assert_eq!(parse_http_byte_range("bytes=0-499", 1000), Ok((0, 499)));
+        assert_eq!(parse_http_byte_range("bytes=500-", 1000), Ok((500, 999)));
+        assert_eq!(parse_http_byte_range("bytes=-200", 1000), Ok((800, 999)));
+        assert_eq!(parse_http_byte_range("bytes=-5000", 1000), Ok((0, 999)));
+        assert!(parse_http_byte_range("bytes=500-100", 1000).is_err());
+        assert!(parse_http_byte_range("bytes=1000-1005", 1000).is_err());
+        assert!(parse_http_byte_range("bytes=-0", 1000).is_err());
+    }
+
+    #[test]
+    fn media_allowlist_blocks_unregistered_files_and_symlinks_to_non_media() {
+        let dir = env::temp_dir().join(format!(
+            "audora_allowlist_test_{}",
+            generate_session_token()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let valid_mp4 = dir.join("clip.mp4");
+        let secret_txt = dir.join("id_rsa");
+        fs::write(&valid_mp4, b"fake-mp4").unwrap();
+        fs::write(&secret_txt, b"private-key").unwrap();
+
+        let mut allowlist = MediaAllowlist::default();
+        // Unregistered media file blocked
+        assert!(allowlist
+            .resolve_allowed_media_file(&valid_mp4.to_string_lossy())
+            .is_none());
+
+        allowlist.register_file(&valid_mp4);
+        assert!(allowlist
+            .resolve_allowed_media_file(&valid_mp4.to_string_lossy())
+            .is_some());
+
+        #[cfg(unix)]
+        {
+            let symlink_mp4 = dir.join("leak.mp4");
+            std::os::unix::fs::symlink(&secret_txt, &symlink_mp4).unwrap();
+            allowlist.register_dir(&dir);
+            // Symlink named .mp4 pointing to `id_rsa` MUST be blocked because canonical extension is empty!
+            assert!(allowlist
+                .resolve_allowed_media_file(&symlink_mp4.to_string_lossy())
+                .is_none());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

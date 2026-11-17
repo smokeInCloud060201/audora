@@ -8,9 +8,9 @@ Welcome to **Audora**, a local-first desktop audio and video player built for ca
 
 | Platform | Package Format | Installation Steps |
 | :--- | :--- | :--- |
-| **macOS 13+** (`arm64` / `x86_64`) | `Audora_<version>_universal.dmg` | Open the `.dmg` and drag `Audora.app` to `/Applications`. |
-| **Windows 10/11** (`x86_64`) | `Audora_<version>_x64-setup.msi` | Run the `.msi` installer and launch Audora from the Start Menu. |
-| **Linux** (`Ubuntu 22.04+`, `Fedora 40+`) | `.AppImage` or `.deb` | Mark `.AppImage` executable (`chmod +x`) or install via `sudo apt install ./audora_<version>_amd64.deb`. |
+| **macOS 13+** (`arm64` / `x86_64`) | `Audora_<version>_macos-aarch64.dmg` | Open the `.dmg` and drag `Audora.app` to `/Applications`. |
+| **Windows 10/11** (`x86_64`) | `Audora_<version>_windows-x86_64-setup.exe` / `-portable.zip` | Run the `-setup.exe` per-user installer and launch Audora from the Start Menu, or extract `-portable.zip`. |
+| **Linux** (`Ubuntu 22.04+`, `Debian 12+`) | `Audora_<version>_linux-x86_64.deb` / `.tar.gz` | Install via `sudo apt install ./Audora_<version>_linux-x86_64.deb` or extract `.tar.gz`. |
 
 ---
 
@@ -33,9 +33,9 @@ Welcome to **Audora**, a local-first desktop audio and video player built for ca
 
 Audora stores your library records, playback progress, and timestamped notes locally in a SQLite WAL database:
 
-- **macOS:** `~/Library/Application Support/com.audora.app/audora.sqlite`
-- **Windows:** `%APPDATA%\com.audora.app\data\audora.sqlite`
-- **Linux:** `~/.local/share/audora/audora.sqlite`
+- **macOS:** `~/Library/Application Support/com.audora.desktop/audora.sqlite`
+- **Windows:** `%APPDATA%\com.audora.desktop\data\audora.sqlite`
+- **Linux:** `$XDG_DATA_HOME/com.audora.desktop/audora.sqlite` (`~/.local/share/com.audora.desktop/audora.sqlite`)
 
 ### Automatic & Manual Backups
 - **Pre-Migration Backups:** Before applying any database schema upgrade, Audora automatically creates `audora.sqlite.pre-v<N>.bak`.

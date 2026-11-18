@@ -4,6 +4,7 @@ version.workspace = true
 description = "Audora cross-platform local media player, timestamped notes, and update lifecycle core"
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 

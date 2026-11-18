@@ -449,13 +449,11 @@ impl AudoraAppService {
             }
             return None;
         }
-        for candidate_idx in (idx + 1)..len {
-            let candidate_id = &snap.queue[candidate_idx];
-            if self.check_queued_item_playable(candidate_id) {
-                return Some(candidate_id.clone());
-            }
-        }
-        None
+        snap.queue
+            .iter()
+            .skip(idx.saturating_add(1))
+            .find(|candidate_id| self.check_queued_item_playable(candidate_id))
+            .cloned()
     }
 
     fn resolve_previous_playable_queue_id(
@@ -463,23 +461,26 @@ impl AudoraAppService {
         snap: &PlaybackSnapshot,
         idx: usize,
     ) -> Option<String> {
-        let len = snap.queue.len();
-        if len == 0 {
+        if snap.queue.is_empty() {
             return None;
         }
-        for candidate_idx in (0..idx).rev() {
-            let candidate_id = &snap.queue[candidate_idx];
-            if self.check_queued_item_playable(candidate_id) {
-                return Some(candidate_id.clone());
-            }
+        if let Some(found) = snap
+            .queue
+            .iter()
+            .take(idx)
+            .rev()
+            .find(|candidate_id| self.check_queued_item_playable(candidate_id))
+        {
+            return Some(found.clone());
         }
         if snap.repeat_mode == RepeatMode::All {
-            for candidate_idx in (idx..len).rev() {
-                let candidate_id = &snap.queue[candidate_idx];
-                if self.check_queued_item_playable(candidate_id) {
-                    return Some(candidate_id.clone());
-                }
-            }
+            return snap
+                .queue
+                .iter()
+                .skip(idx)
+                .rev()
+                .find(|candidate_id| self.check_queued_item_playable(candidate_id))
+                .cloned();
         }
         None
     }

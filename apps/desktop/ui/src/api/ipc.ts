@@ -35,7 +35,7 @@ export const DEFAULT_GITHUB_RELEASE_REPO = "smokeInCloud060201/audora";
 const BASE_APP_VERSION: string =
   (typeof import.meta !== "undefined" &&
     (import.meta.env?.VITE_APP_VERSION as string | undefined)?.trim()) ||
-  "1.1.2";
+  "1.1.3";
 
 const LEGACY_MOCK_MEDIA_IDS = new Set([
   "med_listening",

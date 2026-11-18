@@ -707,9 +707,9 @@ Properties:
         let db_path = temp.path().join("audora.sqlite");
         let dispatcher = build_production_dispatcher(&db_path).expect("dispatcher");
 
-        // 1. Initial check reports 1.1.2 with no update available and default GitHub repo.
+        // 1. Initial check reports 1.1.3 with no update available and default GitHub repo.
         let initial = dispatcher.check_for_updates().expect("initial check");
-        assert_eq!(initial.current_version, "1.1.2");
+        assert_eq!(initial.current_version, "1.1.3");
         assert_eq!(initial.github_repo, "smokeInCloud060201/audora");
         assert!(!initial.update_available);
         assert!(initial.verified);

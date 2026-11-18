@@ -2,6 +2,23 @@
 
 All notable changes to Audora are documented in this file.
 
+## [1.1.3] - 2026-11-18
+
+### Fixed
+- **Self-Update Automatic Relaunch (macOS, Windows, Linux):** Replaced the in-process `900ms` relaunch thread on macOS (previously terminated early on app exit) with detached OS relaunch helpers that wait for the old PID and SQLite WAL checkpoint to finish before reopening `Audora.app`, added silent `/S` NSIS and portable `.zip` auto-relaunch on Windows (preserving custom `InstallLocation`), and added in-place portable `.tar.gz` and `pkexec dpkg -i` `.deb` update/reopen support on Linux.
+- **Linux Wayland Startup & Native OS Integration:** Fixed immediate startup exit (`UnsupportedWindowHandle`) on Wayland sessions via `WebViewBuilderExtUnix::build_gtk`, added macOS Finder `Event::Opened` ("Open With") and native `Cmd+V`/`C`/`X` clipboard support (`/__audora_clipboard`), fixed Linux `zenity`/`kdialog` file and folder picker fallbacks, and added native 32×32 window and Windows `.ico` icons.
+- **Playback, Scrubbing, Relinking & Hydration:** Fenced cold-start `Event::Opened` and picker actions on `GET /__audora_state` hydration, prevented mid-drag scrubber EOF auto-advance, fixed SQLite `COALESCE` retaining stale durations on relink, forced media element reload on same-path relink, auto-detected audio-only `.mp4`/`.mov`/`.webm` containers with generation-fenced `<video>` teardown, implemented finite-permutation Shuffle queues, preserved audio preferences across idle transitions, captured target media on Note Composer open, and fixed `v3 -> v4` duplicate-path note and playlist remapping.
+- **Container Probers & Accessibility:** Fixed UTF-8 slicing in `parse_gst_duration_ms`, improved ISO-BMFF (`moov > 128 KiB`, hybrid `mvhd`/`mehd`), AAC, VBR MP3, Ogg EOS, and RF64 WAV duration probing, fixed `AddToPlaylistModal` dialog semantics, deferred modal focus restoration across `inert` teardown, added `role="menu"` keyboard navigation, and tuned Dark/Light control and track tokens to meet WCAG 2.1 AA `>= 3:1` non-text contrast.
+
+### Added
+- `"Check for updates…"` action in **Settings → About**, `"Copy JSON"` on diagnostic report previews, and confirmation modals before **Remove from library** and **Clean up app data & cache**.
+
+### Security
+- Hardened `MediaAllowlist` (forward/mixed-slash UNC pre-checks, detached note track preservation on source-folder removal, symlinked folder revocation, bounded scan depth, and non-blocking canonicalization), qualified Windows `<SystemRoot>\System32` subprocess paths with fail-closed Authenticode checks, enforced `curl` HTTPS redirect/size caps and staged bundle symlink checks, wrapped batch RPCs in atomic `IMMEDIATE` transactions with non-stalling shutdown drain, and removed unnecessary JIT/unsigned-memory entitlements on macOS.
+
+### Documentation & Packaging
+- Recorded ADR 0004 (`tao` + `wry` + authenticated loopback architecture), aligned `.docs/*` and `DEVELOPMENT.md`, synchronized `sbom.cdx.json` and `THIRD_PARTY_NOTICES.md` with automated `Cargo.lock` parity checks in `verify-release.mjs`, added macOS `CFBundleDocumentTypes` and inside-out signing, added Linux `.deb` `postinst` and expanded MIME types, and added multi-target `cargo-deny` and `pnpm audit` CI gates.
+
 ## [1.1.2] - 2026-11-18
 
 ### Fixed

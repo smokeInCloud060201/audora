@@ -23,8 +23,8 @@ interface MinimumPlayerWindowProps {
   onToggleHelp: () => void;
   onCloseHelp: () => void;
   onUpdateSettings: (next: AppSettings) => void;
-  onUpdateSnapshot: (next: PlaybackSnapshot) => void;
-  onScrubPointerDown: () => void;
+  onTogglePlayPause: () => void;
+  onScrubPointerDown: (e: React.PointerEvent<HTMLInputElement>) => void;
   onScrubChange: (posMs: number) => void;
   onScrubCommit: (posMs: number) => void;
   onOpenMediaPicker: () => void;
@@ -40,7 +40,7 @@ export const MinimumPlayerWindow = React.memo(function MinimumPlayerWindow({
   onToggleHelp,
   onCloseHelp,
   onUpdateSettings,
-  onUpdateSnapshot,
+  onTogglePlayPause,
   onScrubPointerDown,
   onScrubChange,
   onScrubCommit,
@@ -159,7 +159,7 @@ export const MinimumPlayerWindow = React.memo(function MinimumPlayerWindow({
                 onOpenMediaPicker();
                 return;
               }
-              onUpdateSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
+              onTogglePlayPause();
             }}
           >
             {snapshot.state === "playing" ? <IconPause size={18} /> : <IconPlay size={18} />}

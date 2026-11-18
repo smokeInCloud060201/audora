@@ -47,7 +47,9 @@ const requiredFiles = [
   "assets/icons/icon-1024.svg",
   "assets/icons/icon-32.svg",
   "assets/icons/icon.png",
+  "assets/icons/icon.ico",
   "assets/icons/32x32.png",
+  "assets/icons/32x32.rgba",
   "assets/icons/16x16.png",
   "apps/desktop/ui/public/favicon.svg",
   "apps/desktop/ui/dist/index.html",
@@ -93,6 +95,28 @@ if (!cargoVersion || uniqueVersions.size !== 1) {
 }
 if (!Array.isArray(sbom.components) || sbom.components.length < 50) {
   console.error("[FAIL] sbom.cdx.json is incomplete; expected full resolved dependency list");
+  process.exit(1);
+}
+
+// Verify every non-workspace Cargo.lock package is represented in sbom.cdx.json (`R2-M12`)
+const cargoLock = readFileSync(join(rootDir, "Cargo.lock"), "utf8");
+const sbomCargoKeys = new Set(
+  sbom.components
+    .filter((c) => typeof c.purl === "string" && c.purl.startsWith("pkg:cargo/"))
+    .map((c) => `${c.name}@${c.version}`),
+);
+const missingSbomCargo = [];
+for (const m of cargoLock.matchAll(/\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"/g)) {
+  const pkgName = m[1];
+  const pkgVer = m[2];
+  if (pkgName === "audora-core" || pkgName === "audora-desktop") continue;
+  const key = `${pkgName}@${pkgVer}`;
+  if (!sbomCargoKeys.has(key)) {
+    missingSbomCargo.push(key);
+  }
+}
+if (missingSbomCargo.length > 0) {
+  console.error("[FAIL] Cargo.lock packages missing from sbom.cdx.json:", missingSbomCargo);
   process.exit(1);
 }
 

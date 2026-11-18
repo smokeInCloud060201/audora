@@ -1,9 +1,10 @@
 //! SQLite implementation of `MediaRepository`.
 
-use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 
 use crate::domain::{
-    Availability, LibraryFilter, MediaItem, MediaKind, MediaRepository, RelinkMediaRecord,
+    validate_local_media_path_str, Availability, LibraryFilter, MediaItem, MediaKind,
+    MediaRepository, RelinkMediaRecord,
 };
 use crate::error::{AppError, AppResult};
 use crate::persistence::Database;
@@ -17,6 +18,30 @@ impl SqliteMediaRepository {
     #[must_use]
     pub const fn new(db: Database) -> Self {
         Self { db }
+    }
+
+    fn load_by_id_conn(conn: &Connection, id: &str) -> AppResult<Option<MediaItem>> {
+        let item = conn
+            .query_row(
+                "SELECT m.*, (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
+                 FROM media m WHERE m.id = ?1",
+                params![id],
+                Self::map_row,
+            )
+            .optional()?;
+        Ok(item)
+    }
+
+    fn load_by_path_conn(conn: &Connection, path: &str) -> AppResult<Option<MediaItem>> {
+        let item = conn
+            .query_row(
+                "SELECT m.*, (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
+                 FROM media m WHERE m.path = ?1",
+                params![path],
+                Self::map_row,
+            )
+            .optional()?;
+        Ok(item)
     }
 
     fn map_row(row: &Row<'_>) -> rusqlite::Result<MediaItem> {
@@ -68,43 +93,23 @@ impl SqliteMediaRepository {
 
 impl MediaRepository for SqliteMediaRepository {
     fn upsert_media(&self, item: &MediaItem) -> AppResult<MediaItem> {
+        let clean_path = validate_local_media_path_str(&item.path)?.to_owned();
         self.db.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            Database::reconcile_upsert_media_in_tx(&tx, item, false)?;
+            let _ = Database::reconcile_upsert_media_in_tx(&tx, item, false)?;
             tx.commit()?;
-            Ok(())
-        })?;
-
-        self.get_by_path(&item.path)?
-            .ok_or_else(|| AppError::persistence("Upserted media record could not be reloaded"))
+            Self::load_by_path_conn(conn, &clean_path)?
+                .ok_or_else(|| AppError::persistence("Upserted media record could not be reloaded"))
+        })
     }
 
     fn get_by_id(&self, id: &str) -> AppResult<Option<MediaItem>> {
-        self.db.with_conn(|conn| {
-            let item = conn
-                .query_row(
-                    "SELECT m.*, (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
-                     FROM media m WHERE m.id = ?1",
-                    params![id],
-                    Self::map_row,
-                )
-                .optional()?;
-            Ok(item)
-        })
+        self.db.with_conn(|conn| Self::load_by_id_conn(conn, id))
     }
 
     fn get_by_path(&self, path: &str) -> AppResult<Option<MediaItem>> {
-        self.db.with_conn(|conn| {
-            let item = conn
-                .query_row(
-                    "SELECT m.*, (SELECT COUNT(*) FROM notes n WHERE n.media_id = m.id) AS note_count
-                     FROM media m WHERE m.path = ?1",
-                    params![path],
-                    Self::map_row,
-                )
-                .optional()?;
-            Ok(item)
-        })
+        self.db
+            .with_conn(|conn| Self::load_by_path_conn(conn, path))
     }
 
     fn list_media(&self, query: Option<&str>, filter: LibraryFilter) -> AppResult<Vec<MediaItem>> {
@@ -226,6 +231,18 @@ impl MediaRepository for SqliteMediaRepository {
     fn relink_path(&self, record: &RelinkMediaRecord<'_>) -> AppResult<MediaItem> {
         self.db.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let conflict: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM media WHERE path = ?1 AND id != ?2",
+                    params![record.new_path, record.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if conflict.is_some() {
+                return Err(AppError::relink_conflict(
+                    "Target file path already belongs to another item in your library.",
+                ));
+            }
             let dur_param = record
                 .duration_ms
                 .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
@@ -264,11 +281,9 @@ impl MediaRepository for SqliteMediaRepository {
                 )));
             }
             tx.commit()?;
-            Ok(())
-        })?;
-
-        self.get_by_id(record.id)?
-            .ok_or_else(|| AppError::persistence("Relinked media record could not be loaded"))
+            Self::load_by_id_conn(conn, record.id)?
+                .ok_or_else(|| AppError::persistence("Relinked media record could not be loaded"))
+        })
     }
 
     fn delete_media(&self, id: &str) -> AppResult<bool> {

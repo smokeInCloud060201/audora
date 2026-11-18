@@ -588,4 +588,60 @@ describe("AudoraIpcClient workflows", () => {
       }),
     ).toThrow();
   });
+
+  it("maps movePlaylistItem targetIndex accurately against visible tracks when a source folder is disabled", () => {
+    const client = new AudoraIpcClient(false);
+    const hiddenFolder = client.addSourceFolderWithFiles("/tmp/HiddenFolder", [
+      { name: "Hidden1.mp3", path: "/tmp/HiddenFolder/Hidden1.mp3", size: 1000, durationMs: 10_000 },
+      { name: "Hidden2.mp3", path: "/tmp/HiddenFolder/Hidden2.mp3", size: 1000, durationMs: 10_000 },
+    ]);
+    const [visA, visB, visC] = client.openLocalFiles([
+      { name: "VisA.mp3", path: "/tmp/VisA.mp3", size: 1000, durationMs: 10_000 },
+      { name: "VisB.mp3", path: "/tmp/VisB.mp3", size: 1000, durationMs: 10_000 },
+      { name: "VisC.mp3", path: "/tmp/VisC.mp3", size: 1000, durationMs: 10_000 },
+    ]);
+    const hiddenItems = client
+      .searchLibrary("", "all")
+      .media_items.filter((m) => m.source_folder_id === hiddenFolder.folder.id);
+
+    const pl = client.createPlaylist({
+      name: "Mixed Sources",
+      initial_item_ids: [
+        hiddenItems[0]!.id,
+        visA!.id,
+        hiddenItems[1]!.id,
+        visB!.id,
+        visC!.id,
+      ],
+    });
+
+    client.toggleSourceFolder(hiddenFolder.folder.id, false);
+    expect(client.getPlaylist(pl.id)?.item_ids).toEqual([visA!.id, visB!.id, visC!.id]);
+
+    // Move visA down from visible index 0 -> visible index 1 (must swap past hiddenItems[1]!)
+    client.movePlaylistItem(pl.id, visA!.id, 1);
+    expect(client.getPlaylist(pl.id)?.item_ids).toEqual([visB!.id, visA!.id, visC!.id]);
+
+    // Move visC up from visible index 2 -> visible index 1
+    client.movePlaylistItem(pl.id, visC!.id, 1);
+    expect(client.getPlaylist(pl.id)?.item_ids).toEqual([visB!.id, visC!.id, visA!.id]);
+
+    // Re-enabling hidden folder preserves hidden tracks in the playlist without losing them
+    client.toggleSourceFolder(hiddenFolder.folder.id, true);
+    expect(client.getPlaylist(pl.id)?.item_ids).toHaveLength(5);
+  });
+
+  it("guards restoreNote when parent media was removed", () => {
+    const client = new AudoraIpcClient(false);
+    const media = client.openMediaPath("/tmp/Temporary.wav", { durationMs: 30_000 });
+    const note = client.createNote({
+      media_id: media.id,
+      position_ms: 5_000,
+      is_quick_marker: false,
+      body: "Ephemeral observation",
+    });
+    const deleted = client.deleteNote(note.id)!;
+    client.removeMedia(media.id);
+    expect(() => client.restoreNote(deleted)).toThrowError(/no longer in your library/i);
+  });
 });

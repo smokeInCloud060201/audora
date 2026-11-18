@@ -68,12 +68,15 @@ export function App(): React.ReactElement {
 
   // Add/Edit Note modal state (Frame 4:88)
   const [isNoteModalOpen, setIsNoteModalOpen] = useState<boolean>(false);
+  const [noteModalMedia, setNoteModalMedia] = useState<MediaItem | null>(null);
   const [editingNote, setEditingNote] = useState<Note | null>(null);
   const [capturedTimestampMs, setCapturedTimestampMs] = useState<number>(0);
   const [noteBodyDraft, setNoteBodyDraft] = useState<string>("");
   const [isQuickMarkerDraft, setIsQuickMarkerDraft] = useState<boolean>(false);
   const [noteModalError, setNoteModalError] = useState<string | null>(null);
+  const [isSavingNote, setIsSavingNote] = useState<boolean>(false);
   const [openNoteMenuId, setOpenNoteMenuId] = useState<string | null>(null);
+  const [mediaReloadNonce, setMediaReloadNonce] = useState<number>(0);
 
   // Drag-and-drop state
   const [isDraggingFiles, setIsDraggingFiles] = useState<boolean>(false);
@@ -141,6 +144,7 @@ export function App(): React.ReactElement {
   const deletedPlaylistToastTimerRef = useRef<number | null>(null);
 
   const userNavigatedRef = useRef<boolean>(false);
+  const isSavingNoteRef = useRef<boolean>(false);
   const seekGenerationRef = useRef<number>(0);
   const appliedSeekGenRef = useRef<number>(0);
   const isPointerScrubbingRef = useRef<boolean>(false);
@@ -191,7 +195,10 @@ export function App(): React.ReactElement {
     seekGenerationRef.current += 1;
   }, []);
 
-  const handleScrubPointerDown = useCallback(() => {
+  const handleScrubPointerDown = useCallback((e: React.PointerEvent<HTMLInputElement>) => {
+    if (e.pointerType === "mouse" && e.button !== 0) {
+      return;
+    }
     isPointerScrubbingRef.current = true;
     setIsPointerScrubbing(true);
   }, []);
@@ -211,7 +218,18 @@ export function App(): React.ReactElement {
           const el = mediaElementRef.current;
           if (el) {
             try {
-              el.currentTime = clamped / 1000;
+              const dur =
+                snapshot.duration_ms ??
+                (Number.isFinite(el.duration) && el.duration > 0
+                  ? Math.round(el.duration * 1000)
+                  : null);
+              const previewMs =
+                dur !== null && dur > 0
+                  ? dur > 250
+                    ? Math.min(clamped, dur - 200)
+                    : Math.max(0, Math.min(clamped, dur - 1))
+                  : clamped;
+              el.currentTime = previewMs / 1000;
             } catch {
               // Ignore seek before ready state
             }
@@ -270,13 +288,13 @@ export function App(): React.ReactElement {
   }, [isPointerScrubbing, bumpExplicitSeek]);
 
   useEffect(() => {
-    if (!snapshot.media_id && (isPointerScrubbingRef.current || scrubPreviewMsRef.current !== null)) {
+    if (isPointerScrubbingRef.current || scrubPreviewMsRef.current !== null) {
       isPointerScrubbingRef.current = false;
       scrubPreviewMsRef.current = null;
       setIsPointerScrubbing(false);
       setScrubPreviewMs(null);
     }
-  }, [snapshot.media_id]);
+  }, [snapshot.media_id, snapshot.generation]);
 
   // Hydrate persisted native state IMMEDIATELY (`C-6`), then sync enabled folders & probe container durations in background
   useEffect(() => {
@@ -327,7 +345,10 @@ export function App(): React.ReactElement {
     if (typeof window === "undefined") return undefined;
     const win = window as Window & {
       __AUDORA_ON_DRAG_STATE__?: (dragging: boolean) => void;
-      __AUDORA_ON_NATIVE_DROP__?: (entries: Array<string | NativeDroppedEntry>) => void;
+      __AUDORA_ON_NATIVE_DROP__?: (
+        entries: Array<string | NativeDroppedEntry>,
+        autoPlay?: boolean,
+      ) => void;
     };
     const extractFirstDropFileName = (
       first: string | NativeDroppedEntry | undefined,
@@ -348,12 +369,17 @@ export function App(): React.ReactElement {
     win.__AUDORA_ON_DRAG_STATE__ = (dragging: boolean) => {
       setIsDraggingFiles(Boolean(dragging));
     };
-    win.__AUDORA_ON_NATIVE_DROP__ = (entries: Array<string | NativeDroppedEntry>) => {
+    win.__AUDORA_ON_NATIVE_DROP__ = (
+      entries: Array<string | NativeDroppedEntry>,
+      autoPlay?: boolean,
+    ) => {
       setIsDraggingFiles(false);
       if (!Array.isArray(entries) || entries.length === 0) return;
       void (async () => {
         try {
-          const res = await ipcClient.ingestNativeDroppedPaths(entries);
+          const res = await ipcClient.ingestNativeDroppedPaths(entries, {
+            autoPlay: Boolean(autoPlay),
+          });
           if (res.openedItems.length > 0 || res.importedFolderCount > 0) {
             setUnsupportedError(null);
             setMissingMediaTarget(null);
@@ -367,6 +393,9 @@ export function App(): React.ReactElement {
           if (err && typeof err === "object" && "code" in err) {
             const payload = err as AppErrorPayload & { firstFileName?: string };
             if (payload.code === "AV-104" || payload.code === "AV-103") {
+              if (ipcClient.getSettings().window_mode === "minimum") {
+                setSettings(ipcClient.setWindowMode("full"));
+              }
               const fileName = payload.firstFileName ?? extractFirstDropFileName(entries[0]);
               setUnsupportedError({ fileName, payload });
               setSection("now_playing");
@@ -506,6 +535,38 @@ export function App(): React.ReactElement {
     return () => window.clearInterval(interval);
   }, [snapshot.state, snapshot.media_id, snapshot.rate]);
 
+  const allMedia = useMemo(
+    () => ipcClient.searchLibrary("", "all").media_items,
+    [libraryVersion, settings.source_folders],
+  );
+
+  const libraryResult = useMemo(() => {
+    if (!searchQuery.trim() && libraryFilter === "all") {
+      return { media_items: allMedia, matching_notes: [] };
+    }
+    return ipcClient.searchLibrary(searchQuery, libraryFilter);
+  }, [allMedia, searchQuery, libraryFilter, libraryVersion]);
+
+  const activeMedia = useMemo(
+    () => allMedia.find((m) => m.id === snapshot.media_id) ?? null,
+    [allMedia, snapshot.media_id],
+  );
+
+  const activeNotes = useMemo(
+    () => (activeMedia ? ipcClient.listNotes(activeMedia.id) : []),
+    [activeMedia, libraryVersion],
+  );
+
+  const missingTargetNotes = useMemo(
+    () => (missingMediaTarget ? ipcClient.listNotes(missingMediaTarget.id) : []),
+    [missingMediaTarget, libraryVersion],
+  );
+
+  const playlists = useMemo(
+    () => ipcClient.listPlaylists(),
+    [settings.source_folders, libraryVersion],
+  );
+
   // Sync HTML5 `<video>` / `<audio>` element when a real media stream is active (`H-8`)
   useEffect(() => {
     const el = mediaElementRef.current;
@@ -548,44 +609,13 @@ export function App(): React.ReactElement {
     snapshot.media_id,
     snapshot.position_ms,
     settings.window_mode,
+    activeMedia?.media_kind,
   ]);
 
   // Keep native desktop window dimensions & chrome synchronized with Full vs Minimum (360×168) mode
   useEffect(() => {
     ipcClient.syncNativeWindowMode(settings.window_mode);
   }, [settings.window_mode]);
-
-  const allMedia = useMemo(
-    () => ipcClient.searchLibrary("", "all").media_items,
-    [libraryVersion, settings.source_folders],
-  );
-
-  const libraryResult = useMemo(() => {
-    if (!searchQuery.trim() && libraryFilter === "all") {
-      return { media_items: allMedia, matching_notes: [] };
-    }
-    return ipcClient.searchLibrary(searchQuery, libraryFilter);
-  }, [allMedia, searchQuery, libraryFilter, libraryVersion]);
-
-  const activeMedia = useMemo(
-    () => allMedia.find((m) => m.id === snapshot.media_id) ?? null,
-    [allMedia, snapshot.media_id],
-  );
-
-  const activeNotes = useMemo(
-    () => (activeMedia ? ipcClient.listNotes(activeMedia.id) : []),
-    [activeMedia, libraryVersion],
-  );
-
-  const missingTargetNotes = useMemo(
-    () => (missingMediaTarget ? ipcClient.listNotes(missingMediaTarget.id) : []),
-    [missingMediaTarget, libraryVersion],
-  );
-
-  const playlists = useMemo(
-    () => ipcClient.listPlaylists(),
-    [settings.source_folders, libraryVersion],
-  );
 
   const showPlaylistsBar = settings.show_playlists_bar !== false;
   const showSidePanel = settings.show_side_panel !== false;
@@ -620,6 +650,39 @@ export function App(): React.ReactElement {
       isSettingsModalOpen ||
       (typeof document !== "undefined" && document.querySelector('[role="dialog"]')),
   );
+
+  const handleTogglePlayPause = useCallback(() => {
+    const prevSnap = ipcClient.getPlaybackSnapshot();
+    const hadError = prevSnap.error !== null;
+    try {
+      const nextSnap = ipcClient.playbackCommand({ action: "toggle_play_pause" });
+      if (hadError && nextSnap.state === "playing") {
+        setUnsupportedError(null);
+        setMediaReloadNonce((n) => n + 1);
+        bumpExplicitSeek();
+      }
+      setSnapshot(nextSnap);
+    } catch (err) {
+      if (err && typeof err === "object" && "code" in err) {
+        const payload = err as AppErrorPayload;
+        if (payload.code === "AV-101") {
+          const current = prevSnap.media_id
+            ? ipcClient.getMediaById(prevSnap.media_id)
+            : null;
+          if (ipcClient.getSettings().window_mode === "minimum") {
+            setSettings(ipcClient.setWindowMode("full"));
+          }
+          if (current) {
+            setMissingMediaTarget(current);
+            setRelinkPathDraft(current.path);
+            setRelinkError(null);
+            setSection("library");
+          }
+        }
+        showTransientUpdateToast(payload.message || "Unable to start playback.");
+      }
+    }
+  }, [bumpExplicitSeek, showTransientUpdateToast]);
 
   const shortcutHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
   shortcutHandlerRef.current = (e: KeyboardEvent) => {
@@ -664,6 +727,7 @@ export function App(): React.ReactElement {
       }
       if (isNoteModalOpen) {
         setIsNoteModalOpen(false);
+        setNoteModalMedia(null);
         return;
       }
       if (openNoteMenuId) {
@@ -708,7 +772,7 @@ export function App(): React.ReactElement {
         return;
       }
       e.preventDefault();
-      setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
+      handleTogglePlayPause();
     } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       if (
         target instanceof HTMLInputElement &&
@@ -794,6 +858,11 @@ export function App(): React.ReactElement {
     return snapshot.position_ms;
   };
 
+  const closeNoteModal = () => {
+    setIsNoteModalOpen(false);
+    setNoteModalMedia(null);
+  };
+
   const openAddNoteModal = () => {
     if (!activeMedia) return;
     const capturedMs = getLivePlayheadMs();
@@ -801,21 +870,28 @@ export function App(): React.ReactElement {
       setIsMinHelpOpen(false);
       setSettings(ipcClient.setWindowMode("full"));
     }
+    setNoteModalMedia(activeMedia);
     setEditingNote(null);
     setCapturedTimestampMs(capturedMs);
     setNoteBodyDraft("");
     setIsQuickMarkerDraft(false);
     setNoteModalError(null);
+    isSavingNoteRef.current = false;
+    setIsSavingNote(false);
     setIsNoteModalOpen(true);
     setTimeout(() => noteTextareaRef.current?.focus(), 20);
   };
 
   const openEditNoteModal = (note: Note) => {
+    const targetMedia = allMedia.find((m) => m.id === note.media_id) ?? activeMedia ?? null;
+    setNoteModalMedia(targetMedia);
     setEditingNote(note);
     setCapturedTimestampMs(note.position_ms);
     setNoteBodyDraft(note.body);
     setIsQuickMarkerDraft(note.is_quick_marker);
     setNoteModalError(null);
+    isSavingNoteRef.current = false;
+    setIsSavingNote(false);
     setOpenNoteMenuId(null);
     setIsNoteModalOpen(true);
     setTimeout(() => noteTextareaRef.current?.focus(), 20);
@@ -848,9 +924,17 @@ export function App(): React.ReactElement {
   };
 
   const handleSaveNote = () => {
-    if (!activeMedia) return;
+    if (isSavingNoteRef.current) return;
+    const targetMedia = noteModalMedia ?? activeMedia;
+    if (!editingNote && !targetMedia) return;
+    isSavingNoteRef.current = true;
+    setIsSavingNote(true);
     void (async () => {
       try {
+        const clampedPos =
+          !editingNote && targetMedia?.duration_ms != null
+            ? Math.max(0, Math.min(capturedTimestampMs, targetMedia.duration_ms))
+            : Math.max(0, capturedTimestampMs);
         const saved = editingNote
           ? await ipcClient.saveNoteVerified({
               mode: "update",
@@ -859,13 +943,14 @@ export function App(): React.ReactElement {
             })
           : await ipcClient.saveNoteVerified({
               mode: "create",
-              media_id: activeMedia.id,
-              position_ms: capturedTimestampMs,
+              media_id: targetMedia!.id,
+              position_ms: clampedPos,
               is_quick_marker: isQuickMarkerDraft,
               body: noteBodyDraft,
             });
         setNoteModalError(null);
         setIsNoteModalOpen(false);
+        setNoteModalMedia(null);
         setSideTab("notes");
         if (!showSidePanel) {
           setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
@@ -878,6 +963,9 @@ export function App(): React.ReactElement {
       } catch (err) {
         const payload = err as AppErrorPayload;
         setNoteModalError(payload.message ?? "Unable to save note.");
+      } finally {
+        isSavingNoteRef.current = false;
+        setIsSavingNote(false);
       }
     })();
   };
@@ -904,7 +992,12 @@ export function App(): React.ReactElement {
       window.clearTimeout(deletedNoteToastTimerRef.current);
       deletedNoteToastTimerRef.current = null;
     }
-    ipcClient.restoreNote(deletedNoteToast);
+    try {
+      ipcClient.restoreNote(deletedNoteToast);
+    } catch (err) {
+      const payload = err as AppErrorPayload;
+      showTransientUpdateToast(payload.message ?? "Unable to restore deleted note.");
+    }
     setDeletedNoteToast(null);
     setLibraryVersion((v) => v + 1);
   };
@@ -939,10 +1032,16 @@ export function App(): React.ReactElement {
   ) => {
     try {
       const prevMediaId = snapshot.media_id;
+      const hadError = snapshot.error !== null;
       const nextSnap = ipcClient.playPlaylist(playlistId, options);
       setUnsupportedError(null);
       setMissingMediaTarget(null);
+      if (hadError) {
+        setMediaReloadNonce((n) => n + 1);
+      }
+      bumpExplicitSeek();
       setSnapshot(nextSnap);
+      setLibraryVersion((v) => v + 1);
       setSection("now_playing");
       const el = mediaElementRef.current;
       if (el && prevMediaId === nextSnap.media_id) {
@@ -982,7 +1081,14 @@ export function App(): React.ReactElement {
     }
   };
 
-  const handleSelectLibraryItem = (item: MediaItem, autoPlay = false) => {
+  const handleSelectLibraryItem = (
+    item: MediaItem,
+    optionsOrAutoPlay: boolean | { autoPlay?: boolean; preserveShuffleOrder?: boolean } = false,
+  ) => {
+    const opts =
+      typeof optionsOrAutoPlay === "boolean"
+        ? { autoPlay: optionsOrAutoPlay }
+        : optionsOrAutoPlay;
     setUnsupportedError(null);
     setOpenLibraryMenuId(null);
     if (item.availability === "missing") {
@@ -993,8 +1099,9 @@ export function App(): React.ReactElement {
       return;
     }
     try {
-      ipcClient.selectMediaById(item.id, { autoPlay });
+      ipcClient.selectMediaById(item.id, opts);
       setMissingMediaTarget(null);
+      bumpExplicitSeek();
       setSnapshot(ipcClient.getPlaybackSnapshot());
       setLibraryVersion((v) => v + 1);
       setSection("now_playing");
@@ -1010,7 +1117,7 @@ export function App(): React.ReactElement {
     void (async () => {
       try {
         const res = await ipcClient.pickAndOpenNativeMediaFiles();
-        if (!res.supported) {
+        if (!res.supported || res.unavailable) {
           fileInputRef.current?.click();
           return;
         }
@@ -1019,17 +1126,27 @@ export function App(): React.ReactElement {
         }
         setUnsupportedError(null);
         setMissingMediaTarget(null);
+        bumpExplicitSeek();
         setSnapshot(ipcClient.getPlaybackSnapshot());
         setLibraryVersion((v) => v + 1);
         setSection("now_playing");
       } catch (err) {
-        const payload = err as AppErrorPayload & { firstFileName?: string };
-        if (payload.code === "AV-104") {
-          setUnsupportedError({
-            fileName: payload.firstFileName ?? "Unknown file",
-            payload,
-          });
-          setSection("now_playing");
+        if (err && typeof err === "object" && "code" in err) {
+          const payload = err as AppErrorPayload & { firstFileName?: string };
+          if (payload.code === "AV-104" || payload.code === "AV-103") {
+            if (ipcClient.getSettings().window_mode === "minimum") {
+              setSettings(ipcClient.setWindowMode("full"));
+            }
+            setUnsupportedError({
+              fileName: payload.firstFileName ?? "Unknown file",
+              payload,
+            });
+            setSection("now_playing");
+          } else {
+            showTransientUpdateToast(payload.message || "Unable to open selected media.");
+          }
+        } else {
+          console.error("Unexpected error opening native media picker:", err);
         }
       }
     })();
@@ -1111,8 +1228,13 @@ export function App(): React.ReactElement {
           bsize = headView.byteLength - pos;
         }
         if (bsize < hdrLen) break;
-        if (btype === "moov" && pos + bsize <= headView.byteLength) {
-          const found = parseMvhdInMoov(headView, pos, hdrLen, pos + bsize);
+        if (btype === "moov") {
+          const found = parseMvhdInMoov(
+            headView,
+            pos,
+            hdrLen,
+            Math.min(pos + bsize, headView.byteLength),
+          );
           if (found !== undefined) return found;
           break;
         }
@@ -1138,10 +1260,15 @@ export function App(): React.ReactElement {
           } else if (sz32 === 0) {
             bsize = tailView.byteLength - i;
           }
-          if (bsize < hdrLen + 8 || i + bsize > tailView.byteLength) {
+          if (bsize < hdrLen + 8) {
             continue;
           }
-          const found = parseMvhdInMoov(tailView, i, hdrLen, i + bsize);
+          const found = parseMvhdInMoov(
+            tailView,
+            i,
+            hdrLen,
+            Math.min(i + bsize, tailView.byteLength),
+          );
           if (found !== undefined) return found;
         }
       }
@@ -1188,13 +1315,22 @@ export function App(): React.ReactElement {
             }
           }
         }
-        const payload = err as AppErrorPayload & { firstFileName?: string };
-        if (payload.code === "AV-104" || payload.code === "AV-103") {
-          setUnsupportedError({
-            fileName: payload.firstFileName ?? descriptors[0]?.name ?? "Unknown file",
-            payload,
-          });
-          setSection("now_playing");
+        if (err && typeof err === "object" && "code" in err) {
+          const payload = err as AppErrorPayload & { firstFileName?: string };
+          if (payload.code === "AV-104" || payload.code === "AV-103") {
+            if (ipcClient.getSettings().window_mode === "minimum") {
+              setSettings(ipcClient.setWindowMode("full"));
+            }
+            setUnsupportedError({
+              fileName: payload.firstFileName ?? descriptors[0]?.name ?? "Unknown file",
+              payload,
+            });
+            setSection("now_playing");
+          } else {
+            showTransientUpdateToast(payload.message || "Unable to open selected media.");
+          }
+        } else {
+          console.error("Unexpected error opening selected files:", err);
         }
       }
     })();
@@ -1237,6 +1373,8 @@ export function App(): React.ReactElement {
         setRelinkError(null);
         setMissingMediaTarget(null);
         ipcClient.selectMediaById(relinked.id);
+        bumpExplicitSeek();
+        setMediaReloadNonce((n) => n + 1);
         setSnapshot(ipcClient.getPlaybackSnapshot());
         setLibraryVersion((v) => v + 1);
         setSection("now_playing");
@@ -1324,6 +1462,18 @@ export function App(): React.ReactElement {
 
   const handleCleanupAppData = () => {
     void (async () => {
+      if (deletedNoteToastTimerRef.current !== null) {
+        window.clearTimeout(deletedNoteToastTimerRef.current);
+        deletedNoteToastTimerRef.current = null;
+      }
+      if (deletedPlaylistToastTimerRef.current !== null) {
+        window.clearTimeout(deletedPlaylistToastTimerRef.current);
+        deletedPlaylistToastTimerRef.current = null;
+      }
+      if (updateToastTimerRef.current !== null) {
+        window.clearTimeout(updateToastTimerRef.current);
+        updateToastTimerRef.current = null;
+      }
       const summary = await ipcClient.cleanupApplicationDataNative();
       setSettings(ipcClient.getSettings());
       setSnapshot(ipcClient.getPlaybackSnapshot());
@@ -1331,6 +1481,22 @@ export function App(): React.ReactElement {
       setDiagnosticReport(null);
       setMissingMediaTarget(null);
       setUnsupportedError(null);
+      setDeletedNoteToast(null);
+      setDeletedPlaylistToast(null);
+      setUpdateToastMessage(null);
+      setIsNoteModalOpen(false);
+      setNoteModalMedia(null);
+      setEditingNote(null);
+      setPendingMismatchRelink(null);
+      setAddToPlaylistTarget(null);
+      setIsSaveQueueModalOpen(false);
+      setIsUpdateDialogOpen(false);
+      setSelectedPlaylistId(null);
+      setOpenNoteMenuId(null);
+      setOpenLibraryMenuId(null);
+      setIsMinHelpOpen(false);
+      setSourceFolderError(null);
+      setRelinkError(null);
       setLibraryVersion((v) => v + 1);
       setBackupStatusMessage(
         `Cleaned up local database & update cache (${summary.removed_paths.length} paths) — media files on disk untouched`,
@@ -1397,6 +1563,16 @@ export function App(): React.ReactElement {
     const res = ipcClient.removeSourceFolder(folder.id);
     setSettings(ipcClient.getSettings());
     setSnapshot(ipcClient.getPlaybackSnapshot());
+    setDeletedNoteToast((curr) => {
+      if (curr && !ipcClient.getMediaById(curr.media_id)) {
+        if (deletedNoteToastTimerRef.current !== null) {
+          window.clearTimeout(deletedNoteToastTimerRef.current);
+          deletedNoteToastTimerRef.current = null;
+        }
+        return null;
+      }
+      return curr;
+    });
     setLibraryVersion((v) => v + 1);
     if (res.removed) {
       const notedNote =
@@ -1412,9 +1588,15 @@ export function App(): React.ReactElement {
   const handleJumpToNote = (noteId: string) => {
     try {
       const prevMediaId = snapshot.media_id;
+      const hadError = snapshot.error !== null;
       const nextSnap = ipcClient.activateNote(noteId);
+      setUnsupportedError(null);
+      if (hadError) {
+        setMediaReloadNonce((n) => n + 1);
+      }
       bumpExplicitSeek();
       setSnapshot(nextSnap);
+      setLibraryVersion((v) => v + 1);
       setSection("now_playing");
       const el = mediaElementRef.current;
       if (el && prevMediaId === nextSnap.media_id) {
@@ -1489,6 +1671,9 @@ export function App(): React.ReactElement {
   };
 
   const handleMediaEndedSync = (mediaId: string, mediaGen: number) => {
+    if (isPointerScrubbingRef.current) {
+      return;
+    }
     const beforeSnap = ipcClient.getPlaybackSnapshot();
     if (beforeSnap.media_id !== mediaId || beforeSnap.generation !== mediaGen) {
       return;
@@ -1543,9 +1728,11 @@ export function App(): React.ReactElement {
     ) {
       const upgraded = ipcClient.upgradeMediaKindToAudio(mediaId);
       if (upgraded) {
-        if (!el.paused) {
-          el.pause();
-        }
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+        bumpExplicitSeek();
+        setSnapshot(ipcClient.getPlaybackSnapshot());
         setLibraryVersion((v) => v + 1);
         return;
       }
@@ -1582,6 +1769,9 @@ export function App(): React.ReactElement {
     mediaId: string,
     mediaGen: number,
   ) => {
+    if (isPointerScrubbingRef.current) {
+      return;
+    }
     const nextSnap = ipcClient.syncMediaElementPosition(
       el.currentTime * 1000,
       Number.isFinite(el.duration) ? el.duration * 1000 : undefined,
@@ -1608,7 +1798,7 @@ export function App(): React.ReactElement {
     <>
       {activeMedia?.media_kind === "audio" && activeMedia.stream_url && (
         <audio
-          key={activeMedia.id}
+          key={`${activeMedia.id}:${mediaReloadNonce}`}
           ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
           src={activeMedia.stream_url}
           autoPlay={snapshot.state === "playing"}
@@ -1651,7 +1841,7 @@ export function App(): React.ReactElement {
           onToggleHelp={() => setIsMinHelpOpen((prev) => !prev)}
           onCloseHelp={() => setIsMinHelpOpen(false)}
           onUpdateSettings={setSettings}
-          onUpdateSnapshot={setSnapshot}
+          onTogglePlayPause={handleTogglePlayPause}
           onScrubPointerDown={handleScrubPointerDown}
           onScrubChange={handleScrubChange}
           onScrubCommit={handleScrubCommit}
@@ -1912,7 +2102,7 @@ export function App(): React.ReactElement {
                   >
                     {activeMedia?.stream_url && (
                       <video
-                        key={activeMedia.id}
+                        key={`${activeMedia.id}:${mediaReloadNonce}`}
                         ref={mediaElementRef as React.RefObject<HTMLVideoElement>}
                         src={activeMedia.stream_url}
                         autoPlay={snapshot.state === "playing"}
@@ -2221,11 +2411,7 @@ export function App(): React.ReactElement {
                         className="play-circle-btn"
                         disabled={!activeMedia}
                         aria-label={snapshot.state === "playing" ? "Pause" : "Play"}
-                        onClick={() =>
-                          setSnapshot(
-                            ipcClient.playbackCommand({ action: "toggle_play_pause" }),
-                          )
-                        }
+                        onClick={handleTogglePlayPause}
                       >
                         {snapshot.state === "playing" ? (
                           <IconPause size={18} />
@@ -2365,6 +2551,18 @@ export function App(): React.ReactElement {
               onClearMissingTarget={() => setMissingMediaTarget(null)}
               timestampPrecision={timestampPrecision}
               onModalOpenChange={setIsLibraryModalOpen}
+              onMediaRemoved={(removedMediaId) => {
+                setDeletedNoteToast((curr) => {
+                  if (curr && curr.media_id === removedMediaId) {
+                    if (deletedNoteToastTimerRef.current !== null) {
+                      window.clearTimeout(deletedNoteToastTimerRef.current);
+                      deletedNoteToastTimerRef.current = null;
+                    }
+                    return null;
+                  }
+                  return curr;
+                });
+              }}
             />
           )}
 
@@ -2411,14 +2609,14 @@ export function App(): React.ReactElement {
                   {editingNote ? "Edit note" : "Add note at current moment"}
                 </h2>
                 <p style={{ margin: "2px 0 0 0", fontSize: 12, color: "var(--text-tertiary)" }}>
-                  {activeMedia?.display_name} · Playback continues while you type
+                  {noteModalMedia?.display_name ?? activeMedia?.display_name} · Playback continues while you type
                 </p>
               </div>
               <button
                 type="button"
                 className="btn-secondary"
                 aria-label="Close note composer"
-                onClick={() => setIsNoteModalOpen(false)}
+                onClick={closeNoteModal}
               >
                 <IconClose size={14} />
               </button>
@@ -2443,7 +2641,9 @@ export function App(): React.ReactElement {
               onKeyDown={(e) => {
                 if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
                   e.preventDefault();
-                  handleSaveNote();
+                  if (!isSavingNote) {
+                    handleSaveNote();
+                  }
                 }
               }}
             />
@@ -2473,12 +2673,17 @@ export function App(): React.ReactElement {
                 <button
                   type="button"
                   className="btn-secondary"
-                  onClick={() => setIsNoteModalOpen(false)}
+                  onClick={closeNoteModal}
                 >
                   Cancel
                 </button>
-                <button type="button" className="btn-primary" onClick={handleSaveNote}>
-                  Save note
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={isSavingNote}
+                  onClick={handleSaveNote}
+                >
+                  {isSavingNote ? "Saving…" : "Save note"}
                 </button>
               </div>
             </div>

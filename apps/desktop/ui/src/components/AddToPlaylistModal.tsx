@@ -57,8 +57,9 @@ export function AddToPlaylistModal({
   };
 
   return (
-    <dialog
+    <div
       className="modal-backdrop"
+      role="dialog"
       aria-modal="true"
       aria-label="Add media to playlist"
       data-testid="add-to-playlist-modal"
@@ -180,6 +181,6 @@ export function AddToPlaylistModal({
           </button>
         </div>
       </div>
-    </dialog>
+    </div>
   );
 }

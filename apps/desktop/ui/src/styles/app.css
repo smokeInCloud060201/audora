@@ -1212,7 +1212,7 @@
   --min-expand-icon: #a5afab;
   --min-time-current: #f4f6f5;
   --min-time-total: #8f9b97;
-  --min-track-bg: #38413f;
+  --min-track-bg: #5a6764;
   --min-accent: #79d7bf;
   --min-play-fg: #092019;
   display: flex;
@@ -1236,7 +1236,7 @@
   --min-expand-icon: #2d3c37;
   --min-time-current: #101816;
   --min-time-total: #52615c;
-  --min-track-bg: #d1dcd8;
+  --min-track-bg: #848e8b;
   --min-accent: #127864;
   --min-play-fg: #ffffff;
 }
@@ -1352,6 +1352,12 @@
 .minimum-icon-btn[aria-expanded="true"] {
   background-color: rgba(121, 215, 191, 0.12);
   color: var(--min-title-color);
+}
+
+[data-theme="light"] .minimum-icon-btn:hover,
+[data-theme="light"] .minimum-icon-btn[aria-expanded="true"] {
+  background-color: rgba(18, 120, 100, 0.12);
+  color: var(--accent-text);
 }
 
 .minimum-transport-body {

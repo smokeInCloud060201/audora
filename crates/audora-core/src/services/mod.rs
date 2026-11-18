@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::{
     current_iso8601_utc, validate_local_media_path_str, validate_note_body, validate_playback_rate,
-    validate_playlist_fields, AppSettings, AppUpdateStatusDto, Availability, BackendEvent,
-    CleanupSummaryDto, CreateNoteInput, CreatePlaylistInput, DiagnosticReport, LibraryFilter,
-    LibrarySearchResult, MediaId, MediaItem, MediaRepository, Note, NotesRepository,
+    validate_playlist_fields, validate_volume, AppSettings, AppUpdateStatusDto, Availability,
+    BackendEvent, CleanupSummaryDto, CreateNoteInput, CreatePlaylistInput, DiagnosticReport,
+    LibraryFilter, LibrarySearchResult, MediaId, MediaItem, MediaRepository, Note, NotesRepository,
     PlaybackBackend, PlaybackCommand, PlaybackSnapshot, PlaybackState, Playlist,
     PlaylistRepository, ReleaseManifestDto, RelinkMediaRecord, RepeatMode, SettingsRepository,
     TimestampPrecision, UpdateNoteInput, UpdatePlaylistInput, WindowMode, MAX_SEARCH_QUERY_CHARS,
@@ -133,6 +133,19 @@ impl AudoraAppService {
         validate_local_media_path_str(raw_path)
     }
 
+    fn reset_snapshot_on_open_failure(&self, target_gen: u64, err: &AppError) {
+        let _ = self.playback_backend.stop();
+        if let Ok(mut snap) = self.snapshot.lock() {
+            if snap.generation == target_gen {
+                snap.state = PlaybackState::Failed;
+                snap.media_id = None;
+                snap.duration_ms = None;
+                snap.position_ms = 0;
+                snap.error = Some(err.to_payload());
+            }
+        }
+    }
+
     /// Opens a local media file, probes its stream metadata without modifying the source file,
     /// records/updates its library entry, increments the load generation, and loads it for playback.
     pub fn open_media(&self, raw_path: &str) -> AppResult<MediaItem> {
@@ -190,12 +203,7 @@ impl AudoraAppService {
         let probed = match self.playback_backend.load(path, next_gen) {
             Ok(meta) => meta,
             Err(err) => {
-                let mut snap = self
-                    .snapshot
-                    .lock()
-                    .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
-                snap.state = PlaybackState::Failed;
-                snap.error = Some(err.to_payload());
+                self.reset_snapshot_on_open_failure(next_gen, &err);
                 tracing::warn!(
                     path = %redact_path(path),
                     code = err.code().as_str(),
@@ -205,48 +213,59 @@ impl AudoraAppService {
             }
         };
 
-        let existing = self
-            .media_repo
-            .get_by_path(&normalized_path)?
-            .or(self.media_repo.get_by_path(trimmed)?);
-        let now = now_timestamp_string();
-        let media_id = existing
-            .as_ref()
-            .map_or_else(|| generate_id("med"), |m| m.id.clone());
-        let prior_pos = existing.as_ref().map_or(0, |m| m.last_position_ms);
-        let prior_completed = existing.as_ref().is_some_and(|m| m.completed);
+        let post_load = (|| -> AppResult<(MediaItem, u64)> {
+            let existing = self
+                .media_repo
+                .get_by_path(&normalized_path)?
+                .or(self.media_repo.get_by_path(trimmed)?);
+            let now = now_timestamp_string();
+            let media_id = existing
+                .as_ref()
+                .map_or_else(|| generate_id("med"), |m| m.id.clone());
+            let prior_pos = existing.as_ref().map_or(0, |m| m.last_position_ms);
+            let prior_completed = existing.as_ref().is_some_and(|m| m.completed);
 
-        let prior_folder = existing.as_ref().and_then(|m| m.source_folder_id.clone());
-        let item_to_save = MediaItem {
-            id: media_id,
-            path: normalized_path,
-            display_name: file_name,
-            media_kind: probed.media_kind,
-            duration_ms: probed.duration_ms,
-            duration_probed: probed.duration_ms.is_some(),
-            last_position_ms: prior_pos,
-            completed: prior_completed,
-            file_size_bytes: Some(metadata.len()),
-            fingerprint: None,
-            availability: Availability::Available,
-            added_at: existing.map_or_else(|| now.clone(), |m| m.added_at),
-            last_opened_at: Some(now.clone()),
-            last_seen_at: now,
-            note_count: 0,
-            source_folder_id: prior_folder,
+            let prior_folder = existing.as_ref().and_then(|m| m.source_folder_id.clone());
+            let item_to_save = MediaItem {
+                id: media_id,
+                path: normalized_path,
+                display_name: file_name,
+                media_kind: probed.media_kind,
+                duration_ms: probed.duration_ms,
+                duration_probed: probed.duration_ms.is_some(),
+                last_position_ms: prior_pos,
+                completed: prior_completed,
+                file_size_bytes: Some(metadata.len()),
+                fingerprint: None,
+                availability: Availability::Available,
+                added_at: existing.map_or_else(|| now.clone(), |m| m.added_at),
+                last_opened_at: Some(now.clone()),
+                last_seen_at: now,
+                note_count: 0,
+                source_folder_id: prior_folder,
+            };
+
+            let saved = self.media_repo.upsert_media(&item_to_save)?;
+
+            // Determine starting position (`Resume where I left off` unless previously completed).
+            let resume_pos = if settings.resume_where_left_off && !saved.completed {
+                saved.last_position_ms
+            } else {
+                0
+            };
+            let clamped_pos = self.playback_backend.seek(next_gen, resume_pos)?;
+            self.playback_backend
+                .set_rate(next_gen, settings.default_playback_speed)?;
+            Ok((saved, clamped_pos))
+        })();
+
+        let (saved, clamped_pos) = match post_load {
+            Ok(res) => res,
+            Err(err) => {
+                self.reset_snapshot_on_open_failure(next_gen, &err);
+                return Err(err);
+            }
         };
-
-        let saved = self.media_repo.upsert_media(&item_to_save)?;
-
-        // Determine starting position (`Resume where I left off` unless previously completed).
-        let resume_pos = if settings.resume_where_left_off && !saved.completed {
-            saved.last_position_ms
-        } else {
-            0
-        };
-        let clamped_pos = self.playback_backend.seek(next_gen, resume_pos)?;
-        self.playback_backend
-            .set_rate(next_gen, settings.default_playback_speed)?;
 
         {
             let mut snap = self
@@ -275,13 +294,14 @@ impl AudoraAppService {
             return Err(AppError::validation("At least one media path is required"));
         }
 
+        let has_non_empty = raw_paths.iter().any(|r| !r.trim().is_empty());
         let mut expanded_paths: Vec<(String, bool)> = Vec::new();
         for raw in raw_paths {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
+            if has_non_empty && raw.trim().is_empty() {
                 continue;
             }
-            let p = Path::new(trimmed);
+            let clean = Self::validate_local_media_path(raw)?;
+            let p = Path::new(clean);
             if p.is_dir() {
                 let mut dir_files: Vec<String> = fs::read_dir(p)
                     .map_err(|_| {
@@ -299,7 +319,7 @@ impl AudoraAppService {
                 dir_files.sort();
                 expanded_paths.extend(dir_files.into_iter().map(|f| (f, true)));
             } else {
-                expanded_paths.push((trimmed.to_owned(), false));
+                expanded_paths.push((clean.to_owned(), false));
             }
         }
 
@@ -731,6 +751,7 @@ impl AudoraAppService {
                 snap.rate = rate;
             }
             PlaybackCommand::SetVolume { volume } => {
+                validate_volume(volume)?;
                 self.playback_backend.set_volume(volume, snap.muted)?;
                 snap.volume = volume;
             }
@@ -1207,6 +1228,18 @@ impl AudoraAppService {
         let total_note_count: usize = all_media.iter().map(|m| m.note_count).sum();
         let playlist_count = self.playlist_repo.list_playlists()?.len();
         let snap = self.get_playback_snapshot()?;
+        let mut playback_state = snap.state;
+        if snap.media_id.is_none() && playback_state == PlaybackState::Idle {
+            if let Some(ref db) = self.db {
+                if let Ok(Some(session)) = db.load_playback_session() {
+                    if let Some(active_id) = session.active_media_id {
+                        if all_media.iter().any(|m| m.id == active_id) {
+                            playback_state = PlaybackState::Paused;
+                        }
+                    }
+                }
+            }
+        }
 
         let schema_version = self.settings_repo.schema_version().unwrap_or(4);
 
@@ -1219,7 +1252,7 @@ impl AudoraAppService {
             missing_media_count,
             total_note_count,
             playlist_count,
-            playback_state: snap.state,
+            playback_state,
             last_error_code: snap.error.map(|e| e.code.as_str().to_owned()),
             generated_at: now_timestamp_string(),
         })

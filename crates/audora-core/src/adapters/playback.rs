@@ -13,8 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::domain::{
-    MediaKind, PlaybackBackend, PlaybackState, ProbedMediaMetadata, MAX_PLAYBACK_RATE,
-    MAX_SAFE_DURATION_MS, MIN_PLAYBACK_RATE,
+    clamp_f64_to_safe_duration_ms, MediaKind, PlaybackBackend, PlaybackState, ProbedMediaMetadata,
+    MAX_PLAYBACK_RATE, MAX_SAFE_DURATION_MS, MIN_PLAYBACK_RATE,
 };
 use crate::error::{redact_path, AppError, AppResult};
 
@@ -369,6 +369,11 @@ fn run_command_with_timeout(
     cmd: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -472,6 +477,8 @@ impl PlaybackBackend for GStreamerBackend {
                 cmd.args([
                     "-v",
                     "quiet",
+                    "-protocol_whitelist",
+                    "file",
                     "-show_entries",
                     "format=duration",
                     "-of",
@@ -484,9 +491,10 @@ impl PlaybackBackend for GStreamerBackend {
                         if let Ok(secs) = String::from_utf8_lossy(&out.stdout).trim().parse::<f64>()
                         {
                             if secs.is_finite() && secs > 0.0 {
-                                let ms = (secs * 1_000.0).round();
-                                if ms >= 1.0 && ms <= (MAX_SAFE_DURATION_MS as f64) {
-                                    ext_meta.duration_ms = Some(ms as u64);
+                                if let Some(ms) = clamp_f64_to_safe_duration_ms(secs * 1_000.0)
+                                    .filter(|&v| v >= 1)
+                                {
+                                    ext_meta.duration_ms = Some(ms);
                                 }
                             }
                         }
@@ -632,6 +640,9 @@ fn probe_by_extension_rules(path: &Path) -> AppResult<ProbedMediaMetadata> {
 
 /// Parses a GStreamer duration string (`H:MM:SS.nnnnnnnnn`) into integer milliseconds.
 fn parse_gst_duration_ms(raw: &str) -> Option<u64> {
+    if !raw.is_ascii() {
+        return None;
+    }
     let parts: Vec<&str> = raw.split(':').collect();
     if parts.len() != 3 {
         return None;
@@ -645,7 +656,7 @@ fn parse_gst_duration_ms(raw: &str) -> Option<u64> {
         0 => 0,
         1 => nanos_str.parse::<u64>().ok()?.saturating_mul(100),
         2 => nanos_str.parse::<u64>().ok()?.saturating_mul(10),
-        _ => nanos_str[..3].parse().ok()?,
+        _ => nanos_str.get(..3)?.parse().ok()?,
     };
     Some(
         hours
@@ -788,8 +799,9 @@ fn probe_isobmff_mvhd_ms(file: &mut File, file_len: u64) -> Option<u64> {
             let moov_end = pos.saturating_add(bsz);
             let mut cpos = pos.saturating_add(hlen);
             let mut mvhd_ts = 0_u32;
+            let mut mvhd_ms: Option<u64> = None;
             let mut mehd_ticks = 0_u64;
-            let mut max_mdhd_ms = 0_u64;
+            let mut max_mdhd_ms: Option<u64> = None;
 
             for _ in 0..256 {
                 if cpos >= moov_end {
@@ -808,7 +820,7 @@ fn probe_isobmff_mvhd_ms(file: &mut File, file_len: u64) -> Option<u64> {
                             let ms = (u128::from(dur) * 1_000) / u128::from(ts);
                             if let Ok(v) = u64::try_from(ms) {
                                 if v > 0 {
-                                    return Some(v);
+                                    mvhd_ms = Some(mvhd_ms.map_or(v, |prev| prev.max(v)));
                                 }
                             }
                         }
@@ -879,7 +891,11 @@ fn probe_isobmff_mvhd_ms(file: &mut File, file_len: u64) -> Option<u64> {
                                         if ts > 0 && dur > 0 {
                                             let ms = (u128::from(dur) * 1_000) / u128::from(ts);
                                             if let Ok(v) = u64::try_from(ms) {
-                                                max_mdhd_ms = max_mdhd_ms.max(v);
+                                                if v > 0 {
+                                                    max_mdhd_ms = Some(
+                                                        max_mdhd_ms.map_or(v, |prev| prev.max(v)),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -893,16 +909,14 @@ fn probe_isobmff_mvhd_ms(file: &mut File, file_len: u64) -> Option<u64> {
                 cpos = cpos.saturating_add(csz);
             }
 
-            if mvhd_ts > 0 && mehd_ticks > 0 {
+            let mehd_ms = if mvhd_ts > 0 && mehd_ticks > 0 {
                 let ms = (u128::from(mehd_ticks) * 1_000) / u128::from(mvhd_ts);
-                if let Ok(v) = u64::try_from(ms) {
-                    if v > 0 {
-                        return Some(v);
-                    }
-                }
-            }
-            if max_mdhd_ms > 0 {
-                return Some(max_mdhd_ms);
+                u64::try_from(ms).ok().filter(|&v| v > 0)
+            } else {
+                None
+            };
+            if let Some(best) = mvhd_ms.into_iter().chain(mehd_ms).chain(max_mdhd_ms).max() {
+                return Some(best);
             }
         } else if &btype == b"sidx" {
             let plen = bsz.saturating_sub(hlen);
@@ -1111,9 +1125,12 @@ fn probe_ebml_ms(file: &mut File, file_len: u64) -> Option<u64> {
                     }
                     if let Some(ticks) = duration_ticks {
                         if ticks.is_finite() && ticks > 0.0 {
-                            let ms = (ticks * (ts_scale as f64)) / 1_000_000.0;
-                            if ms.is_finite() && ms >= 1.0 && ms <= (MAX_SAFE_DURATION_MS as f64) {
-                                return Some(ms.round() as u64);
+                            if let Some(ms) = clamp_f64_to_safe_duration_ms(
+                                (ticks * (ts_scale as f64)) / 1_000_000.0,
+                            )
+                            .filter(|&v| v >= 1)
+                            {
+                                return Some(ms);
                             }
                         }
                     }
@@ -1221,6 +1238,9 @@ fn probe_mp3_ms(file: &mut File, file_len: u64) -> Option<u64> {
         return None;
     }
     let scan_len = file_len.saturating_sub(audio_offset).min(65_536) as usize;
+    if scan_len < 4 {
+        return None;
+    }
     let mut buf = vec![0_u8; scan_len];
     if !read_at(file, audio_offset, &mut buf) {
         return None;
@@ -1235,9 +1255,9 @@ fn probe_mp3_ms(file: &mut File, file_len: u64) -> Option<u64> {
     }
     let effective_end = file_len.saturating_sub(tail_tag);
 
-    for idx in 0..buf.len().saturating_sub(4) {
+    for idx in 0..=buf.len() - 4 {
         let hdr = [buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]];
-        let Some((version_id, layer_id, kbps, sample_rate, samples_per_frame, frame_size)) =
+        let Some((version_id, layer_id, _kbps, sample_rate, samples_per_frame, frame_size)) =
             decode_mpeg_header(hdr)
         else {
             continue;
@@ -1279,25 +1299,29 @@ fn probe_mp3_ms(file: &mut File, file_len: u64) -> Option<u64> {
             }
         }
 
-        let vbri_off = idx + 4 + 32;
-        if vbri_off + 18 <= buf.len() && &buf[vbri_off..vbri_off + 4] == b"VBRI" {
-            let frames = u32::from_be_bytes([
-                buf[vbri_off + 14],
-                buf[vbri_off + 15],
-                buf[vbri_off + 16],
-                buf[vbri_off + 17],
-            ]);
-            if frames > 0 {
-                let ms = (u128::from(frames) * u128::from(samples_per_frame) * 1_000)
-                    / u128::from(sample_rate);
-                return u64::try_from(ms).ok().filter(|&v| v > 0);
+        for vbri_off in [idx + 4 + crc_len + 32, idx + 4 + 32] {
+            if vbri_off + 18 <= buf.len() && &buf[vbri_off..vbri_off + 4] == b"VBRI" {
+                let frames = u32::from_be_bytes([
+                    buf[vbri_off + 14],
+                    buf[vbri_off + 15],
+                    buf[vbri_off + 16],
+                    buf[vbri_off + 17],
+                ]);
+                if frames > 0 {
+                    let ms = (u128::from(frames) * u128::from(samples_per_frame) * 1_000)
+                        / u128::from(sample_rate);
+                    return u64::try_from(ms).ok().filter(|&v| v > 0);
+                }
             }
         }
 
-        let next_file_pos = audio_offset
-            .saturating_add(idx as u64)
-            .saturating_add(frame_size as u64);
-        if next_file_pos + 4 <= effective_end {
+        let frame0_pos = audio_offset.saturating_add(idx as u64);
+        let next_file_pos = frame0_pos.saturating_add(frame_size as u64);
+        if next_file_pos + 4 > effective_end {
+            if idx != 0 || next_file_pos != effective_end {
+                continue;
+            }
+        } else {
             let mut next_hdr = [0_u8; 4];
             let got_next = if idx + frame_size + 4 <= buf.len() {
                 next_hdr.copy_from_slice(&buf[idx + frame_size..idx + frame_size + 4]);
@@ -1316,9 +1340,48 @@ fn probe_mp3_ms(file: &mut File, file_len: u64) -> Option<u64> {
             }
         }
 
-        let audio_bytes = effective_end.saturating_sub(audio_offset + idx as u64);
-        let ms = (u128::from(audio_bytes) * 8) / u128::from(kbps);
-        return u64::try_from(ms).ok().filter(|&v| v > 0);
+        let mut cur_pos = frame0_pos;
+        let mut bytes_counted = 0_u64;
+        let mut samples_counted = 0_u64;
+        for _ in 0..128 {
+            if cur_pos.saturating_add(4) > effective_end {
+                break;
+            }
+            let mut fhdr = [0_u8; 4];
+            let buf_off = cur_pos
+                .checked_sub(audio_offset)
+                .and_then(|d| usize::try_from(d).ok());
+            let got_hdr = match buf_off {
+                Some(off) if off + 4 <= buf.len() => {
+                    fhdr.copy_from_slice(&buf[off..off + 4]);
+                    true
+                }
+                _ => read_at(file, cur_pos, &mut fhdr),
+            };
+            if !got_hdr {
+                break;
+            }
+            let Some((fv, fl, _, fsr, fsamples, fsize)) = decode_mpeg_header(fhdr) else {
+                break;
+            };
+            if fv != version_id || fl != layer_id || fsr != sample_rate {
+                break;
+            }
+            let fsize_u64 = fsize as u64;
+            if cur_pos.saturating_add(fsize_u64) > effective_end {
+                break;
+            }
+            bytes_counted = bytes_counted.saturating_add(fsize_u64);
+            samples_counted = samples_counted.saturating_add(fsamples);
+            cur_pos = cur_pos.saturating_add(fsize_u64);
+        }
+
+        let audio_bytes = effective_end.saturating_sub(frame0_pos);
+        if bytes_counted > 0 && samples_counted > 0 {
+            let ms = (u128::from(audio_bytes) * u128::from(samples_counted) * 1_000)
+                / (u128::from(bytes_counted) * u128::from(sample_rate));
+            return u64::try_from(ms).ok().filter(|&v| v > 0);
+        }
     }
 
     None
@@ -1329,12 +1392,25 @@ fn probe_aac_ms(file: &mut File, file_len: u64) -> Option<u64> {
         96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
         8_000, 7_350,
     ];
+    if file_len >= 8 {
+        let mut hdr = [0_u8; 8];
+        if read_at(file, 0, &mut hdr)
+            && matches!(
+                &hdr[4..8],
+                b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"styp"
+            )
+        {
+            if let Some(ms) = probe_isobmff_mvhd_ms(file, file_len) {
+                return Some(ms);
+            }
+        }
+    }
     let audio_offset = skip_id3v2_tags(file, file_len);
     if audio_offset + 7 <= file_len {
         let scan_len = file_len.saturating_sub(audio_offset).min(32_768) as usize;
         let mut buf = vec![0_u8; scan_len];
-        if read_at(file, audio_offset, &mut buf) {
-            for idx in 0..buf.len().saturating_sub(7) {
+        if read_at(file, audio_offset, &mut buf) && buf.len() >= 7 {
+            for idx in 0..=buf.len().saturating_sub(7) {
                 if buf[idx] != 0xFF || (buf[idx + 1] & 0xF6) != 0xF0 {
                     continue;
                 }
@@ -1376,7 +1452,7 @@ fn probe_aac_ms(file: &mut File, file_len: u64) -> Option<u64> {
 
                 let stream_start = audio_offset + idx as u64;
                 let single_frame_eof =
-                    frames_counted == 1 && stream_start + bytes_counted >= file_len;
+                    idx == 0 && frames_counted == 1 && stream_start + bytes_counted == file_len;
                 if (frames_counted >= 2 || single_frame_eof) && bytes_counted > 0 {
                     let stream_bytes = file_len.saturating_sub(stream_start);
                     let est_samples = (u128::from(stream_bytes) * u128::from(total_samples))
@@ -1470,7 +1546,8 @@ fn probe_ogg_ms(file: &mut File, file_len: u64) -> Option<u64> {
         if page_end > tail.len() {
             continue;
         }
-        if page_end + 4 <= tail.len() && &tail[page_end..page_end + 4] != b"OggS" {
+        let is_eos = (tail[i + 5] & 0x04) != 0;
+        if !is_eos && page_end + 4 <= tail.len() && &tail[page_end..page_end + 4] != b"OggS" {
             continue;
         }
         let granule_signed = i64::from_le_bytes([
@@ -1522,6 +1599,7 @@ fn probe_wav_ms(file: &mut File, file_len: u64) -> Option<u64> {
         }
         let cid = [ch[0], ch[1], ch[2], ch[3]];
         let csz = u64::from(u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]));
+        let mut step_sz = csz;
         if &cid == b"ds64" && csz >= 16 {
             let mut ds = [0_u8; 16];
             if read_at(file, pos.saturating_add(8), &mut ds) {
@@ -1544,11 +1622,12 @@ fn probe_wav_ms(file: &mut File, file_len: u64) -> Option<u64> {
             if byte_rate > 0 {
                 break;
             }
+            step_sz = raw_data_sz;
         }
         pos = pos
             .saturating_add(8)
-            .saturating_add(csz)
-            .saturating_add(csz & 1);
+            .saturating_add(step_sz)
+            .saturating_add(step_sz & 1);
     }
     if byte_rate > 0 && data_sz > 0 {
         u64::try_from((u128::from(data_sz) * 1_000) / u128::from(byte_rate))

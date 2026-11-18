@@ -1783,7 +1783,10 @@ Properties:
 
     #[test]
     fn path_and_timestamp_validators_reject_webdav_remote_schemes_and_invalid_iso8601() {
-        use crate::domain::{normalize_persisted_timestamp, validate_local_media_path_str};
+        use crate::domain::{
+            clamp_f64_to_safe_duration_ms, format_unix_ms_iso8601, normalize_persisted_timestamp,
+            validate_local_media_path_str, MAX_SAFE_DURATION_MS,
+        };
 
         for forbidden in [
             "smb://nas/share/song.mp3",
@@ -1792,11 +1795,27 @@ Properties:
             "nfs://server/export/a.wav",
             "afp://mac/share/a.mov",
             "file:///tmp/a.mp4",
+            "file:/tmp/a.mp4",
+            "FILE:/C:/media/a.mp4",
+            "rtmp://live.example/app/stream",
+            "rtmps://live.example/app/stream",
+            "udp://239.0.0.1:5000",
+            "tcp://127.0.0.1:9000",
+            "srt://relay.example:9000",
+            "rist://relay.example:9000",
+            "mmsh://stream.example/live",
             r"\\evil.example@SSL\DavWWWRoot\clip.mp4",
             r"\\evil.example@80\share\clip.mp4",
             r"\\evil.example:445\share\clip.mp4",
             r"\\evil.example\DavWWWRoot\clip.mp4",
             r"\\?\UNC\evil.example@443\share\clip.mp4",
+            r"/\evil.example@80/share/clip.mp4",
+            r"\/evil.example:445\share\clip.mp4",
+            r"//evil.example/share/DavWWWRoot/clip.mp4",
+            r"//NAS/Media@80/clip.mp4",
+            r"//NAS/Media:445/clip.mp4",
+            "//",
+            r"\\",
         ] {
             assert!(
                 validate_local_media_path_str(forbidden).is_err(),
@@ -1804,10 +1823,26 @@ Properties:
             );
         }
 
-        // Standard SMB UNC share, local verbatim drive with `@` in directory, and trailing space stay valid!
+        // Standard SMB UNC share, local Windows drives, verbatim drive with `@`, POSIX `@` dirs, and trailing space stay valid!
         assert_eq!(
             validate_local_media_path_str(r"\\NAS\Media\clip.mp4").unwrap(),
             r"\\NAS\Media\clip.mp4"
+        );
+        assert_eq!(
+            validate_local_media_path_str(r"//NAS/Media/clip.mp4").unwrap(),
+            r"//NAS/Media/clip.mp4"
+        );
+        assert_eq!(
+            validate_local_media_path_str(r"C:\Users\clip.mp4").unwrap(),
+            r"C:\Users\clip.mp4"
+        );
+        assert_eq!(
+            validate_local_media_path_str("c:/Users/clip.mp4").unwrap(),
+            "c:/Users/clip.mp4"
+        );
+        assert_eq!(
+            validate_local_media_path_str("/tmp/user@host/clip.mp4").unwrap(),
+            "/tmp/user@host/clip.mp4"
         );
         assert_eq!(
             validate_local_media_path_str(r"\\?\C:\Users\dev@corp\clip.mp4").unwrap(),
@@ -1821,11 +1856,29 @@ Properties:
         let fallback = "2026-11-18T00:00:00.000Z";
         assert_eq!(
             normalize_persisted_timestamp("2026-05-10T14:30:00Z", fallback),
-            "2026-05-10T14:30:00Z"
+            "2026-05-10T14:30:00.000Z"
+        );
+        assert_eq!(
+            normalize_persisted_timestamp("2026-05-10T14:30:00.2Z", fallback),
+            "2026-05-10T14:30:00.200Z"
         );
         assert_eq!(
             normalize_persisted_timestamp("2026-05-10T14:30:00.250Z", fallback),
             "2026-05-10T14:30:00.250Z"
+        );
+        assert_eq!(
+            normalize_persisted_timestamp("2026-05-10T14:30:00.123456Z", fallback),
+            "2026-05-10T14:30:00.123Z"
+        );
+        assert_eq!(
+            format_unix_ms_iso8601(u128::MAX),
+            "9999-12-31T23:59:59.999Z"
+        );
+        assert_eq!(clamp_f64_to_safe_duration_ms(-1.0), None);
+        assert_eq!(clamp_f64_to_safe_duration_ms(f64::NAN), None);
+        assert_eq!(
+            clamp_f64_to_safe_duration_ms(1e30),
+            Some(MAX_SAFE_DURATION_MS)
         );
         for invalid_ts in [
             "2026-99-99",
@@ -2022,5 +2075,437 @@ Properties:
         let _ = crate::services::cleanup_all_app_artifacts(&win_data).expect("cleanup win layout");
         assert!(!win_data.exists());
         assert!(!win_parent.exists());
+    }
+
+    #[test]
+    fn round2_prober_handles_isobmff_wav_rf64_flac_ogg_mp3_vbr_aac_and_gst_non_ascii() {
+        use crate::adapters::probe_container_duration_ms;
+
+        fn make_box(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let total = u32::try_from(8 + payload.len()).expect("box size");
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(tag);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        fn make_mvhd(timescale: u32, duration: u32) -> Vec<u8> {
+            let mut p = vec![0_u8; 24];
+            p[12..16].copy_from_slice(&timescale.to_be_bytes());
+            p[16..20].copy_from_slice(&duration.to_be_bytes());
+            make_box(b"mvhd", &p)
+        }
+
+        fn make_mehd(duration: u32) -> Vec<u8> {
+            let mut p = vec![0_u8; 8];
+            p[4..8].copy_from_slice(&duration.to_be_bytes());
+            make_box(b"mehd", &p)
+        }
+
+        fn make_mdhd(timescale: u32, duration: u32) -> Vec<u8> {
+            let mut p = vec![0_u8; 24];
+            p[12..16].copy_from_slice(&timescale.to_be_bytes());
+            p[16..20].copy_from_slice(&duration.to_be_bytes());
+            make_box(b"mdhd", &p)
+        }
+
+        fn make_sidx(ref_id: u32, timescale: u32, sub_dur: u32) -> Vec<u8> {
+            let mut p = vec![0_u8; 36];
+            p[4..8].copy_from_slice(&ref_id.to_be_bytes());
+            p[8..12].copy_from_slice(&timescale.to_be_bytes());
+            p[22..24].copy_from_slice(&1_u16.to_be_bytes()); // reference_count = 1
+            p[28..32].copy_from_slice(&sub_dur.to_be_bytes());
+            make_box(b"sidx", &p)
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+
+        // 1a. ISO-BMFF `mvhd` duration
+        let mut mp4_mvhd = ftyp.clone();
+        mp4_mvhd.extend_from_slice(&make_box(b"moov", &make_mvhd(1_000, 12_345)));
+        let mp4_mvhd_path = create_dummy_media_file(&temp, "mvhd.mp4", &mp4_mvhd);
+        assert_eq!(probe_container_duration_ms(&mp4_mvhd_path), Some(12_345));
+
+        // 1b. Hybrid fMP4: `mvhd` (2s) + `mvex/mehd` (45s) -> honors larger `mehd`!
+        let mut hybrid_moov_body = make_mvhd(1_000, 2_000);
+        hybrid_moov_body.extend_from_slice(&make_box(b"mvex", &make_mehd(45_000)));
+        let mut mp4_hybrid = ftyp.clone();
+        mp4_hybrid.extend_from_slice(&make_box(b"moov", &hybrid_moov_body));
+        let mp4_hybrid_path = create_dummy_media_file(&temp, "hybrid.mp4", &mp4_hybrid);
+        assert_eq!(probe_container_duration_ms(&mp4_hybrid_path), Some(45_000));
+
+        // 1c. `mdhd` fallback when `mvhd` duration = 0
+        let mut mdhd_moov_body = make_mvhd(1_000, 0);
+        let mdia = make_box(b"mdia", &make_mdhd(48_000, 480_000));
+        mdhd_moov_body.extend_from_slice(&make_box(b"trak", &mdia));
+        let mut mp4_mdhd = ftyp.clone();
+        mp4_mdhd.extend_from_slice(&make_box(b"moov", &mdhd_moov_body));
+        let mp4_mdhd_path = create_dummy_media_file(&temp, "mdhd.m4a", &mp4_mdhd);
+        assert_eq!(probe_container_duration_ms(&mp4_mdhd_path), Some(10_000));
+
+        // 1d. `sidx` fallback across multiple segment index boxes
+        let mut mp4_sidx = ftyp.clone();
+        mp4_sidx.extend_from_slice(&make_box(b"moov", &make_mvhd(1_000, 0)));
+        mp4_sidx.extend_from_slice(&make_sidx(1, 1_000, 7_500));
+        mp4_sidx.extend_from_slice(&make_sidx(1, 1_000, 9_500));
+        let mp4_sidx_path = create_dummy_media_file(&temp, "sidx.mp4", &mp4_sidx);
+        assert_eq!(probe_container_duration_ms(&mp4_sidx_path), Some(17_000));
+
+        // 2a. Standard RIFF WAV
+        let mut riff = Vec::new();
+        riff.extend_from_slice(b"RIFF");
+        riff.extend_from_slice(&0_u32.to_le_bytes());
+        riff.extend_from_slice(b"WAVE");
+        riff.extend_from_slice(b"fmt ");
+        riff.extend_from_slice(&16_u32.to_le_bytes());
+        let mut fmt_body = [0_u8; 16];
+        fmt_body[8..12].copy_from_slice(&176_400_u32.to_le_bytes());
+        riff.extend_from_slice(&fmt_body);
+        riff.extend_from_slice(b"data");
+        riff.extend_from_slice(&176_400_u32.to_le_bytes());
+        riff.resize(riff.len() + 176_400, 0);
+        let riff_path = create_dummy_media_file(&temp, "std.wav", &riff);
+        assert_eq!(probe_container_duration_ms(&riff_path), Some(1_000));
+
+        // 2b. RF64 WAV where `data` (`0xFFFF_FFFF` sentinel size) appears BEFORE `fmt `
+        let mut rf64 = Vec::new();
+        rf64.extend_from_slice(b"RF64");
+        rf64.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+        rf64.extend_from_slice(b"WAVE");
+        rf64.extend_from_slice(b"ds64");
+        rf64.extend_from_slice(&16_u32.to_le_bytes());
+        rf64.extend_from_slice(&0_u64.to_le_bytes()); // riffSize
+        rf64.extend_from_slice(&88_200_u64.to_le_bytes()); // dataSize = 88_200
+        rf64.extend_from_slice(b"data");
+        rf64.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
+        rf64.resize(rf64.len() + 88_200, 0);
+        rf64.extend_from_slice(b"fmt ");
+        rf64.extend_from_slice(&16_u32.to_le_bytes());
+        let mut rf64_fmt = [0_u8; 16];
+        rf64_fmt[8..12].copy_from_slice(&44_100_u32.to_le_bytes());
+        rf64.extend_from_slice(&rf64_fmt);
+        let rf64_path = create_dummy_media_file(&temp, "rf64_data_first.wav", &rf64);
+        assert_eq!(probe_container_duration_ms(&rf64_path), Some(2_000));
+
+        // 3. FLAC STREAMINFO (44.1kHz, 441_000 samples -> 10_000 ms)
+        let mut flac = Vec::new();
+        flac.extend_from_slice(b"fLaC");
+        flac.extend_from_slice(&[0x80, 0x00, 0x00, 34]); // last metadata block, type 0, len 34
+        let mut si = [0_u8; 34];
+        // 44_100 = 0x0AC44 -> bits in si[10..13]: si[10] = 0x0A, si[11] = 0xC4, si[12] top nibble = 0x4
+        si[10] = 0x0A;
+        si[11] = 0xC4;
+        si[12] = 0x40;
+        // 441_000 samples = 0x00_0006_BAA8 in si[13..18]
+        si[15] = 0x06;
+        si[16] = 0xBA;
+        si[17] = 0xA8;
+        flac.extend_from_slice(&si);
+        let flac_path = create_dummy_media_file(&temp, "track.flac", &flac);
+        assert_eq!(probe_container_duration_ms(&flac_path), Some(10_000));
+
+        // 4. Ogg Vorbis + trailing padding bytes after EOS page (`0x04`)
+        let mut vorbis = Vec::new();
+        vorbis.extend_from_slice(b"OggS\x00\x02");
+        vorbis.extend_from_slice(&0_u64.to_le_bytes());
+        vorbis.extend_from_slice(&9_u32.to_le_bytes());
+        vorbis.extend_from_slice(&0_u32.to_le_bytes());
+        vorbis.extend_from_slice(&0_u32.to_le_bytes());
+        vorbis.push(1);
+        vorbis.push(30);
+        let mut vhead = [0_u8; 30];
+        vhead[0..7].copy_from_slice(b"\x01vorbis");
+        vhead[12..16].copy_from_slice(&44_100_u32.to_le_bytes());
+        vorbis.extend_from_slice(&vhead);
+        vorbis.extend_from_slice(b"OggS\x00\x04");
+        vorbis.extend_from_slice(&441_000_u64.to_le_bytes());
+        vorbis.extend_from_slice(&9_u32.to_le_bytes());
+        vorbis.extend_from_slice(&1_u32.to_le_bytes());
+        vorbis.extend_from_slice(&0_u32.to_le_bytes());
+        vorbis.push(0);
+        vorbis.extend_from_slice(&[0_u8; 64]); // trailing padding after EOS
+        let vorbis_path = create_dummy_media_file(&temp, "padded.ogg", &vorbis);
+        assert_eq!(probe_container_duration_ms(&vorbis_path), Some(10_000));
+
+        // 5a. MP3 VBR multi-frame without Xing/VBRI (2x 128kbps 417B + 2x 320kbps 1044B at 44.1kHz -> 4*1152/44100 = 104 ms)
+        let mut mp3_vbr = Vec::new();
+        for _ in 0..2 {
+            let mut f = vec![0_u8; 417];
+            f[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // 128 kbps
+            mp3_vbr.extend_from_slice(&f);
+        }
+        for _ in 0..2 {
+            let mut f = vec![0_u8; 1044];
+            f[0..4].copy_from_slice(&[0xFF, 0xFB, 0xE0, 0x00]); // 320 kbps
+            mp3_vbr.extend_from_slice(&f);
+        }
+        let mp3_vbr_path = create_dummy_media_file(&temp, "vbr_no_xing.mp3", &mp3_vbr);
+        assert_eq!(probe_container_duration_ms(&mp3_vbr_path), Some(104));
+
+        // 5b. MP3 VBRI with CRC enabled (`0xFF 0xFA`, crc_len = 2 -> VBRI at offset 4 + 2 + 32 = 38)
+        let mut mp3_vbri = vec![0_u8; 256];
+        mp3_vbri[0..4].copy_from_slice(&[0xFF, 0xFA, 0x90, 0x00]);
+        mp3_vbri[38..42].copy_from_slice(b"VBRI");
+        mp3_vbri[52..56].copy_from_slice(&500_u32.to_be_bytes());
+        let mp3_vbri_path = create_dummy_media_file(&temp, "vbri_crc.mp3", &mp3_vbri);
+        assert_eq!(probe_container_duration_ms(&mp3_vbri_path), Some(13_061));
+
+        // 5c. False MP3 sync near EOF (`idx > 0 && next_file_pos + 4 > effective_end`) must be rejected
+        let mut mp3_eof_junk = vec![0_u8; 64];
+        mp3_eof_junk[10..14].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]); // frame_size 417 > 64
+        let mp3_eof_junk_path = create_dummy_media_file(&temp, "eof_junk.mp3", &mp3_eof_junk);
+        assert_eq!(probe_container_duration_ms(&mp3_eof_junk_path), None);
+
+        // 5d. Single-frame MP3 at `idx == 0 && next_file_pos == effective_end` succeeds
+        let mut mp3_single = vec![0_u8; 417];
+        mp3_single[0..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        let mp3_single_path = create_dummy_media_file(&temp, "single_frame.mp3", &mp3_single);
+        assert_eq!(probe_container_duration_ms(&mp3_single_path), Some(26));
+
+        // 6a. Short ISO-BMFF `.aac` containing fake `0xFF 0xF1` ADTS bytes in `mdat` -> must read `mvhd` first!
+        let mut bmff_aac = ftyp;
+        bmff_aac.extend_from_slice(&make_box(b"moov", &make_mvhd(1_000, 5_000)));
+        bmff_aac.extend_from_slice(&make_box(
+            b"mdat",
+            &[0xFF, 0xF1, 0x4C, 0x80, 0x10, 0x00, 0xFC],
+        ));
+        let bmff_aac_path = create_dummy_media_file(&temp, "container.aac", &bmff_aac);
+        assert_eq!(probe_container_duration_ms(&bmff_aac_path), Some(5_000));
+
+        // 6b. Exact 7-byte single raw ADTS frame at offset 0 (48kHz -> 1024 / 48 = 21 ms)
+        let mut single_adts = vec![0_u8; 7];
+        single_adts[0] = 0xFF;
+        single_adts[1] = 0xF1;
+        single_adts[2] = 0x4C; // 48kHz
+        single_adts[3] = 0x80; // frame_len = 7 -> 7 << 5 = 0xE0
+        single_adts[4] = 0x00;
+        single_adts[5] = 0xE0;
+        single_adts[6] = 0xFC;
+        let single_adts_path = create_dummy_media_file(&temp, "single.aac", &single_adts);
+        assert_eq!(probe_container_duration_ms(&single_adts_path), Some(21));
+
+        // 6c. False ADTS sync at `idx > 0` overshooting EOF must be rejected (`None`)
+        let mut false_adts = vec![0_u8; 16];
+        false_adts[4..11].copy_from_slice(&[0xFF, 0xF1, 0x4C, 0x80, 0x10, 0x00, 0xFC]);
+        let false_adts_path = create_dummy_media_file(&temp, "false_adts.aac", &false_adts);
+        assert_eq!(probe_container_duration_ms(&false_adts_path), None);
+
+        // 7. `parse_gst_duration_ms` with non-ASCII `\u{FFFD}` must NOT panic
+        let gst_out = "  Duration: 0:00:01.2\u{FFFD}\n  audio #0: Opus\n";
+        let gst_meta =
+            GStreamerBackend::parse_discoverer_output(Path::new("/tmp/bad.opus"), gst_out)
+                .expect("non-ascii duration falls back to None safely");
+        assert_eq!(gst_meta.duration_ms, None);
+    }
+
+    #[test]
+    fn round2_reconcile_relink_resets_duration_and_v3_v4_preserves_duplicate_path_notes() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora_dup_v3.sqlite");
+
+        // 1. `reconcile_upsert_media_in_tx` resets duration/size/fingerprint on relink (`path_changed`)
+        //    and clears `duration_ms` when `!path_changed && authoritative_folder` resets probe flag.
+        let mem_db = Database::open_in_memory().expect("mem db");
+        let mut item = crate::domain::MediaItem {
+            id: "med_1".to_owned(),
+            path: "/tmp/old.mp4".to_owned(),
+            display_name: "old.mp4".to_owned(),
+            media_kind: MediaKind::Video,
+            duration_ms: Some(120_000),
+            duration_probed: true,
+            last_position_ms: 15_000,
+            completed: false,
+            file_size_bytes: Some(4096),
+            fingerprint: Some("fp_old".to_owned()),
+            availability: Availability::Available,
+            added_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            last_opened_at: None,
+            last_seen_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            note_count: 0,
+            source_folder_id: None,
+        };
+        mem_db
+            .rpc_upsert_media_batch(&[item.clone()])
+            .expect("seed");
+
+        item.path = "/tmp/new.mp4".to_owned();
+        item.display_name = "new.mp4".to_owned();
+        item.duration_ms = None;
+        item.duration_probed = false;
+        item.file_size_bytes = Some(1024);
+        item.fingerprint = None;
+        mem_db
+            .rpc_upsert_media_batch(&[item.clone()])
+            .expect("relink path");
+        let after_relink = mem_db.export_relational_state().unwrap().unwrap();
+        assert_eq!(after_relink.media[0].duration_ms, None);
+        assert!(!after_relink.media[0].duration_probed);
+        assert_eq!(after_relink.media[0].file_size_bytes, Some(1024));
+        assert_eq!(after_relink.media[0].fingerprint, None);
+
+        item.duration_ms = Some(60_000);
+        item.duration_probed = true;
+        mem_db
+            .rpc_upsert_media_batch(&[item.clone()])
+            .expect("set probed");
+        item.duration_ms = None;
+        item.duration_probed = false;
+        mem_db.rpc_upsert_media_batch(&[item]).expect("reset probe");
+        let after_reset = mem_db.export_relational_state().unwrap().unwrap();
+        assert_eq!(after_reset.media[0].duration_ms, None);
+        assert!(!after_reset.media[0].duration_probed);
+
+        // 2. `v3 -> v4` migration with duplicate paths inside the v3 blob preserves notes/playlists/session!
+        let v3_migrations = &crate::persistence::db::BUILTIN_MIGRATIONS[..3];
+        let v3_db = Database::open_with_migrations(&db_path, v3_migrations).expect("open v3");
+        v3_db
+            .with_conn(|conn| {
+                let blob = r#"{
+                    "media": [
+                        { "id": "med_dup_1", "path": "/tmp/dup.mp3", "media_kind": "audio", "availability": "available" },
+                        { "id": "med_dup_2", "path": "/tmp/dup.mp3", "media_kind": "audio", "availability": "available" }
+                    ],
+                    "notes": [
+                        { "id": "note_from_1", "media_id": "med_dup_1", "position_ms": 1000, "body": "From dup 1" },
+                        { "id": "note_from_2", "media_id": "med_dup_2", "position_ms": 2000, "body": "From dup 2" }
+                    ],
+                    "playlists": [
+                        { "id": "pl_dup", "name": "Dup List", "item_ids": ["med_dup_1", "med_dup_2"] }
+                    ],
+                    "playback_session": {
+                        "active_media_id": "med_dup_1",
+                        "queue": ["med_dup_1", "med_dup_2"],
+                        "volume": 0.9,
+                        "rate": 1.0
+                    }
+                }"#;
+                conn.execute(
+                    "INSERT INTO app_ui_state (key, payload_json, updated_at) VALUES ('v2', ?1, '1');",
+                    [blob],
+                )?;
+                Ok(())
+            })
+            .expect("seed v3 dup");
+        drop(v3_db);
+
+        let (dispatcher, v4_db) =
+            build_production_dispatcher_with_db(&db_path).expect("upgrade to v4");
+        let migrated = v4_db.export_relational_state().unwrap().unwrap();
+        assert_eq!(migrated.media.len(), 1);
+        assert_eq!(migrated.media[0].id, "med_dup_2");
+        assert_eq!(migrated.notes.len(), 2);
+        assert!(migrated.notes.iter().all(|n| n.media_id == "med_dup_2"));
+        assert_eq!(migrated.playlists[0].item_ids, vec!["med_dup_2"]);
+        let sess = migrated.playback_session.expect("session");
+        assert_eq!(sess.active_media_id.as_deref(), Some("med_dup_2"));
+        assert_eq!(sess.queue, vec!["med_dup_2"]);
+
+        // `generate_diagnostic_report` falls back to persisted `playback_session` when in-memory `snapshot.media_id` is None!
+        let diag = dispatcher.generate_diagnostic_report().expect("diag");
+        assert_eq!(diag.playback_state, PlaybackState::Paused);
+
+        // `import_relational_state_json` handles duplicate paths and duplicate IDs cleanly
+        let import_json = serde_json::json!({
+            "media": [
+                { "id": "m_a", "path": "/tmp/one.mp4", "media_kind": "video", "availability": "available" },
+                { "id": "m_b", "path": "/tmp/one.mp4", "media_kind": "video", "availability": "available" },
+                { "id": "m_a", "path": "/tmp/two.mp4", "media_kind": "video", "availability": "available" },
+                { "id": "m_c", "path": "/tmp/two.mp4", "media_kind": "video", "availability": "available" }
+            ],
+            "notes": [
+                { "id": "n_b", "media_id": "m_b", "position_ms": 1000, "body": "Remapped from m_b to m_a" }
+            ],
+            "playlists": [
+                { "id": "pl_1", "name": "Imported", "item_ids": ["m_b", "m_a", "m_c"] }
+            ],
+            "playback_session": {
+                "active_media_id": "m_b",
+                "queue": ["m_b", "m_c"]
+            }
+        });
+        v4_db
+            .import_relational_state_json(&import_json.to_string())
+            .expect("import with dups");
+        let imported = v4_db.export_relational_state().unwrap().unwrap();
+        assert_eq!(imported.media.len(), 2);
+        assert_eq!(imported.notes.len(), 1);
+        assert_eq!(imported.notes[0].media_id, "m_a");
+        assert_eq!(imported.playlists[0].item_ids, vec!["m_a", "m_c"]);
+        let imp_sess = imported.playback_session.expect("imp session");
+        assert_eq!(imp_sess.active_media_id.as_deref(), Some("m_a"));
+        assert_eq!(imp_sess.queue, vec!["m_a", "m_c"]);
+
+        // `SetVolume` rejects NaN & `open_media` resets snapshot cleanly on backend load failure
+        assert_eq!(
+            dispatcher
+                .playback_command(PlaybackCommand::SetVolume { volume: f64::NAN })
+                .expect_err("NaN volume")
+                .code,
+            ErrorCode::ValidationFailed
+        );
+        let good_file = create_dummy_media_file(&temp, "ok.mp4", b"ok");
+        let bad_file = create_dummy_media_file(&temp, "bad.prores", b"bad");
+        dispatcher
+            .open_media(good_file.to_str().unwrap())
+            .expect("open good");
+        assert!(dispatcher.open_media(bad_file.to_str().unwrap()).is_err());
+        let failed_snap = dispatcher.get_playback_snapshot().expect("snap");
+        assert_eq!(failed_snap.state, PlaybackState::Failed);
+        assert_eq!(failed_snap.media_id, None);
+        assert_eq!(failed_snap.duration_ms, None);
+        assert_eq!(failed_snap.position_ms, 0);
+
+        // `open_media_batch` pre-validates remote URLs and preserves trailing spaces in paths
+        assert_eq!(
+            dispatcher
+                .open_media_batch(&["rtmp://evil.example/live".to_owned()])
+                .expect_err("reject rtmp in batch")
+                .code,
+            ErrorCode::ValidationFailed
+        );
+        let spaced_dir = temp.path().join("Folder Space ");
+        fs::create_dir_all(&spaced_dir).expect("spaced dir");
+        create_dummy_media_file(&temp, "Folder Space /clip.mp4", b"clip-bytes");
+        let spaced_opened = dispatcher
+            .open_media_batch(&[spaced_dir.to_str().unwrap().to_owned()])
+            .expect("open folder with trailing space");
+        assert_eq!(spaced_opened.len(), 1);
+
+        // `SqliteMediaRepository::upsert_media` reloads via validated path & `relink_path` enforces AV-201 inside tx
+        let repo = SqliteMediaRepository::new(v4_db.clone());
+        let mut ws_item = imported.media[0].clone();
+        let ws_path = format!("  {}\n", ws_item.path);
+        ws_item.path = ws_path;
+        let reloaded_ws = repo.upsert_media(&ws_item).expect("reload cleaned path");
+        assert_eq!(reloaded_ws.path, imported.media[0].path);
+        let relink_conflict = repo
+            .relink_path(&crate::domain::RelinkMediaRecord {
+                id: &imported.media[1].id,
+                new_path: &imported.media[0].path,
+                display_name: "conflict.mp4",
+                media_kind: MediaKind::Video,
+                duration_ms: Some(1_000),
+                duration_probed: true,
+                file_size_bytes: Some(100),
+                updated_at: "2026-05-01T00:00:00.000Z",
+            })
+            .expect_err("relink_path must enforce AV-201");
+        assert_eq!(relink_conflict.code(), ErrorCode::RelinkConflict);
+        drop(v4_db);
+        drop(dispatcher);
+
+        // Corrupt WAL recovery unlinks stale `-wal.corrupt.bak` when a new corruption event has no `-wal`
+        let wal_bak_db = temp.path().join("wal_stale.sqlite");
+        let stale_wal_bak = temp.path().join("wal_stale.sqlite-wal.corrupt.bak");
+        fs::write(&stale_wal_bak, b"STALE_OLD_WAL").unwrap();
+        fs::write(&wal_bak_db, b"NOT_SQLITE").unwrap();
+        let recovered_no_wal = Database::open_or_recover(&wal_bak_db).expect("recover without wal");
+        assert!(recovered_no_wal.verify_integrity().unwrap());
+        assert!(
+            !stale_wal_bak.exists(),
+            "stale -wal.corrupt.bak must be unlinked when no -wal exists"
+        );
     }
 }

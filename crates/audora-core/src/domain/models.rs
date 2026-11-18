@@ -11,6 +11,22 @@ use crate::error::{AppError, AppResult};
 /// Maximum safe millisecond timestamp stored in SQLite (`i64::MAX`).
 pub const MAX_SAFE_DURATION_MS: u64 = i64::MAX as u64;
 
+/// Maximum Unix millisecond timestamp representable as a 4-digit-year UTC ISO-8601 string
+/// (`9999-12-31T23:59:59.999Z`), preserving lexicographical sort order in SQLite.
+const MAX_ISO8601_UNIX_MS: u128 = 253_402_300_799_999;
+
+/// Clamps a non-negative finite `f64` millisecond value to `[0, MAX_SAFE_DURATION_MS]`.
+#[must_use]
+pub fn clamp_f64_to_safe_duration_ms(v: f64) -> Option<u64> {
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    if v >= (MAX_SAFE_DURATION_MS as f64) {
+        return Some(MAX_SAFE_DURATION_MS);
+    }
+    Some((v.round() as u64).min(MAX_SAFE_DURATION_MS))
+}
+
 fn deserialize_u64_lenient<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -28,12 +44,7 @@ where
                     .unwrap_or(0)
                     .min(MAX_SAFE_DURATION_MS))
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f > 0.0 {
-                    let clamped = f.round().min(MAX_SAFE_DURATION_MS as f64);
-                    Ok(clamped as u64)
-                } else {
-                    Ok(0)
-                }
+                Ok(clamp_f64_to_safe_duration_ms(f).unwrap_or(0))
             } else {
                 Ok(0)
             }
@@ -62,12 +73,7 @@ where
                     Ok(Some((i as u64).min(MAX_SAFE_DURATION_MS)))
                 }
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f >= 0.0 {
-                    let clamped = f.round().min(MAX_SAFE_DURATION_MS as f64);
-                    Ok(Some(clamped as u64))
-                } else {
-                    Ok(None)
-                }
+                Ok(clamp_f64_to_safe_duration_ms(f))
             } else {
                 Ok(None)
             }
@@ -79,8 +85,9 @@ where
 /// Formats a Unix millisecond timestamp as an ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SS.sssZ`).
 #[must_use]
 pub fn format_unix_ms_iso8601(unix_ms: u128) -> String {
-    let total_secs = (unix_ms / 1_000) as i64;
-    let millis = (unix_ms % 1_000) as u32;
+    let clamped_ms = unix_ms.min(MAX_ISO8601_UNIX_MS);
+    let total_secs = (clamped_ms / 1_000) as i64;
+    let millis = (clamped_ms % 1_000) as u32;
     let days = total_secs.div_euclid(86_400);
     let secs_of_day = total_secs.rem_euclid(86_400) as u32;
     let hour = secs_of_day / 3_600;
@@ -112,34 +119,36 @@ pub fn current_iso8601_utc() -> String {
     format_unix_ms_iso8601(millis)
 }
 
-fn is_valid_utc_iso8601(s: &str) -> bool {
+fn normalize_utc_iso8601(s: &str) -> Option<String> {
     if !s.is_ascii() || !(20..=30).contains(&s.len()) {
-        return false;
+        return None;
     }
     let b = s.as_bytes();
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-        return false;
+        return None;
     }
-    let Ok(year) = s[0..4].parse::<u32>() else {
-        return false;
-    };
-    let Ok(month) = s[5..7].parse::<u32>() else {
-        return false;
-    };
-    let Ok(day) = s[8..10].parse::<u32>() else {
-        return false;
-    };
-    let Ok(hour) = s[11..13].parse::<u32>() else {
-        return false;
-    };
-    let Ok(minute) = s[14..16].parse::<u32>() else {
-        return false;
-    };
-    let Ok(second) = s[17..19].parse::<u32>() else {
-        return false;
-    };
+    let digit_slices = [
+        &s[0..4],
+        &s[5..7],
+        &s[8..10],
+        &s[11..13],
+        &s[14..16],
+        &s[17..19],
+    ];
+    if !digit_slices
+        .iter()
+        .all(|part| part.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let year = digit_slices[0].parse::<u32>().ok()?;
+    let month = digit_slices[1].parse::<u32>().ok()?;
+    let day = digit_slices[2].parse::<u32>().ok()?;
+    let hour = digit_slices[3].parse::<u32>().ok()?;
+    let minute = digit_slices[4].parse::<u32>().ok()?;
+    let second = digit_slices[5].parse::<u32>().ok()?;
     if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 60 {
-        return false;
+        return None;
     }
     let is_leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let max_day = match month {
@@ -152,19 +161,29 @@ fn is_valid_utc_iso8601(s: &str) -> bool {
                 28
             }
         }
-        _ => return false,
+        _ => return None,
     };
     if day > max_day {
-        return false;
+        return None;
     }
     let rest = &s[19..];
-    if rest == "Z" {
-        return true;
-    }
-    if let Some(frac) = rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z')) {
-        return !frac.is_empty() && frac.len() <= 9 && frac.bytes().all(|c| c.is_ascii_digit());
-    }
-    false
+    let millis_str = if rest == "Z" {
+        "000".to_owned()
+    } else if let Some(frac) = rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z')) {
+        if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        match frac.len() {
+            1 => format!("{frac}00"),
+            2 => format!("{frac}0"),
+            _ => frac.get(..3)?.to_owned(),
+        }
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis_str}Z"
+    ))
 }
 
 /// Normalizes persisted timestamp strings (`""`, `"Just now"`, `"Yesterday"`, or raw epoch seconds)
@@ -192,24 +211,50 @@ pub fn normalize_persisted_timestamp(raw: &str, fallback_iso: &str) -> String {
             return format_unix_ms_iso8601(ms);
         }
     }
-    if is_valid_utc_iso8601(trimmed) {
-        return trimmed.to_owned();
+    if let Some(normalized) = normalize_utc_iso8601(trimmed) {
+        return normalized;
     }
     fallback_iso.to_owned()
 }
 
+fn has_forbidden_uri_scheme(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"file:/"))
+    {
+        return true;
+    }
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let mut extra_len = 0_usize;
+    for &b in rest {
+        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
+            extra_len += 1;
+        } else {
+            return extra_len >= 1 && rest[extra_len..].starts_with(b"://");
+        }
+    }
+    false
+}
+
 fn has_forbidden_unc_webdav_segment(unc_tail: &str) -> bool {
-    let mut segments = unc_tail.split(['\\', '/']).filter(|s| !s.is_empty());
+    let mut segments = unc_tail
+        .trim_start_matches(['\\', '/'])
+        .split(['\\', '/'])
+        .filter(|s| !s.is_empty());
     let Some(server) = segments.next() else {
         return true;
     };
-    let server_lower = server.to_ascii_lowercase();
-    if server.contains('@') || server.contains(':') || server_lower.contains("davwwwroot") {
+    if server.contains('@') || server.contains(':') || server.eq_ignore_ascii_case("davwwwroot") {
         return true;
     }
     if let Some(share) = segments.next() {
-        let share_lower = share.to_ascii_lowercase();
-        if share.contains('@') || share.contains(':') || share_lower.contains("davwwwroot") {
+        if share.contains('@') || share.contains(':') || share.eq_ignore_ascii_case("davwwwroot") {
             return true;
         }
     }
@@ -227,50 +272,46 @@ pub fn validate_local_media_path_str(raw_path: &str) -> AppResult<&str> {
             "Media file path contains invalid control characters",
         ));
     }
-    let lower = trimmed.to_ascii_lowercase();
-    for forbidden_scheme in [
-        "http://", "https://", "rtsp://", "rtsps://", "ftp://", "sftp://", "ws://", "wss://",
-        "mms://", "smb://", "dav://", "davs://", "nfs://", "afp://", "file://",
-    ] {
-        if lower.starts_with(forbidden_scheme) {
-            return Err(AppError::validation(
-                "Audora only opens local files on your device; remote network URLs are not permitted.",
-            ));
-        }
+    if has_forbidden_uri_scheme(trimmed) {
+        return Err(AppError::validation(
+            "Audora only opens local files on your device; remote network URLs are not permitted.",
+        ));
     }
-    if lower.starts_with(r"\\?\unc\") || lower.starts_with(r"\\.\unc\") {
-        if has_forbidden_unc_webdav_segment(&trimmed[8..]) {
-            return Err(AppError::validation(
-                "Remote WebDAV or port-qualified UNC network paths are not permitted.",
-            ));
+
+    let is_slash = |b: u8| b == b'/' || b == b'\\';
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 4
+        && is_slash(bytes[0])
+        && is_slash(bytes[1])
+        && matches!(bytes[2], b'?' | b'.')
+        && is_slash(bytes[3])
+    {
+        let rest = trimmed[4..].trim_start_matches(['/', '\\']);
+        let rest_bytes = rest.as_bytes();
+        let is_unc_device = rest_bytes
+            .get(..4)
+            .is_some_and(|p| p[..3].eq_ignore_ascii_case(b"unc") && is_slash(p[3]));
+        if is_unc_device {
+            if has_forbidden_unc_webdav_segment(&rest[4..]) {
+                return Err(AppError::validation(
+                    "Remote WebDAV or port-qualified UNC network paths are not permitted.",
+                ));
+            }
+        } else {
+            let is_drive_letter = rest_bytes.len() >= 2
+                && rest_bytes[0].is_ascii_alphabetic()
+                && rest_bytes[1] == b':';
+            if !is_drive_letter && has_forbidden_unc_webdav_segment(rest) {
+                return Err(AppError::validation(
+                    "Remote WebDAV or port-qualified UNC network paths are not permitted.",
+                ));
+            }
         }
-    } else if trimmed.starts_with(r"\\?\") || trimmed.starts_with(r"\\.\") {
-        let rest = &trimmed[4..];
-        let is_drive_letter = rest.len() >= 2
-            && rest.as_bytes()[0].is_ascii_alphabetic()
-            && rest.as_bytes()[1] == b':';
-        if !is_drive_letter && has_forbidden_unc_webdav_segment(rest) {
-            return Err(AppError::validation(
-                "Remote WebDAV or port-qualified UNC network paths are not permitted.",
-            ));
-        }
-    } else if trimmed.starts_with(r"\\") {
-        let tail = trimmed.trim_start_matches('\\');
+    } else if bytes.len() >= 2 && is_slash(bytes[0]) && is_slash(bytes[1]) {
+        let tail = trimmed.trim_start_matches(['/', '\\']);
         if has_forbidden_unc_webdav_segment(tail) {
             return Err(AppError::validation(
                 "Remote WebDAV or port-qualified UNC network paths are not permitted.",
-            ));
-        }
-    } else if let Some(tail) = trimmed.strip_prefix("//") {
-        let mut segs = tail.split(['/', '\\']).filter(|s| !s.is_empty());
-        let first_two_webdav = [segs.next(), segs.next()].into_iter().flatten().any(|seg| {
-            seg.contains('@')
-                || seg.contains(':')
-                || seg.to_ascii_lowercase().contains("davwwwroot")
-        });
-        if first_two_webdav {
-            return Err(AppError::validation(
-                "Remote WebDAV or port-qualified network paths are not permitted.",
             ));
         }
     }

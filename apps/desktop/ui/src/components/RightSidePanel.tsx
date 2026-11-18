@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ipcClient } from "../api/ipc";
 import type {
   MediaItem,
@@ -8,6 +8,7 @@ import type {
   TimestampPrecision,
 } from "../types/domain";
 import { formatDurationMs, formatHumanDate } from "../utils/format";
+import { focusFirstMenuItem, handlePopupMenuKeyDown } from "../utils/menuKeyboard";
 import {
   IconArrowRight,
   IconClose,
@@ -33,7 +34,10 @@ interface RightSidePanelProps {
   onOpenEditNoteModal: (note: Note) => void;
   onDeleteNote: (noteId: string) => void;
   onJumpToNote: (noteId: string) => void;
-  onSelectLibraryItem: (item: MediaItem, autoPlay?: boolean) => void;
+  onSelectLibraryItem: (
+    item: MediaItem,
+    options?: boolean | { autoPlay?: boolean; preserveShuffleOrder?: boolean },
+  ) => void;
   onOpenSaveQueueModal: () => void;
   onCycleRepeatMode: () => void;
   onCollapse: () => void;
@@ -61,6 +65,14 @@ export const RightSidePanel = React.memo(function RightSidePanel({
   timestampPrecision,
 }: RightSidePanelProps): React.ReactElement {
   const [noteMenuPlacement, setNoteMenuPlacement] = useState<"down" | "up">("down");
+  const noteMenuTriggerRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const activeNoteMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!openNoteMenuId) return;
+    focusFirstMenuItem(activeNoteMenuRef.current);
+  }, [openNoteMenuId]);
+
   const mediaById = useMemo(() => {
     const map = new Map<string, MediaItem>();
     for (const m of allMedia) {
@@ -217,6 +229,13 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                         style={{ position: "relative", display: "flex", gap: 6 }}
                       >
                         <button
+                          ref={(el) => {
+                            if (el) {
+                              noteMenuTriggerRefs.current.set(note.id, el);
+                            } else {
+                              noteMenuTriggerRefs.current.delete(note.id);
+                            }
+                          }}
                           type="button"
                           className="jump-link-btn"
                           aria-label={`More actions for note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
@@ -238,17 +257,28 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                         </button>
                         {openNoteMenuId === note.id && (
                           <div
+                            ref={activeNoteMenuRef}
                             role="menu"
                             aria-label={`Actions for note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
                             className={`note-row-menu ${
                               noteMenuPlacement === "up" ? "open-up" : "open-down"
                             }`}
+                            onKeyDown={(e) =>
+                              handlePopupMenuKeyDown(
+                                e,
+                                () => onSetOpenNoteMenuId(null),
+                                noteMenuTriggerRefs.current.get(note.id),
+                              )
+                            }
                           >
                             <button
                               type="button"
                               role="menuitem"
                               className="btn-secondary"
-                              onClick={() => onOpenEditNoteModal(note)}
+                              onClick={() => {
+                                noteMenuTriggerRefs.current.get(note.id)?.focus();
+                                onOpenEditNoteModal(note);
+                              }}
                             >
                               Edit note
                             </button>
@@ -379,7 +409,12 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                   >
                     <button
                       type="button"
-                      onClick={() => onSelectLibraryItem(qItem, true)}
+                      onClick={() =>
+                        onSelectLibraryItem(qItem, {
+                          autoPlay: true,
+                          preserveShuffleOrder: true,
+                        })
+                      }
                       style={{
                         border: "none",
                         background: "transparent",

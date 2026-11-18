@@ -10,10 +10,10 @@ use rusqlite::{
 };
 
 use crate::domain::{
-    current_iso8601_utc, normalize_persisted_timestamp, validate_local_media_path_str,
-    validate_note_body, validate_playback_rate, validate_playlist_fields, validate_volume,
-    AppSettings, Availability, MediaItem, MediaKind, Note, PersistedPlaybackSession, Playlist,
-    RelationalAppStateDto,
+    clamp_f64_to_safe_duration_ms, current_iso8601_utc, normalize_persisted_timestamp,
+    validate_local_media_path_str, validate_note_body, validate_playback_rate,
+    validate_playlist_fields, validate_volume, AppSettings, Availability, MediaItem, MediaKind,
+    Note, PersistedPlaybackSession, Playlist, RelationalAppStateDto,
 };
 use crate::error::{redact_path, AppError, AppResult};
 
@@ -161,23 +161,30 @@ impl Database {
         }
 
         let corrupt_bak = Self::backup_path_for(&db_path, "corrupt.bak");
+        let corrupt_tmp = Self::backup_path_for(&db_path, "corrupt.bak.tmp");
         if db_path.exists() {
             let file_len = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
             if file_len > 0 {
-                fs::copy(&db_path, &corrupt_bak).map_err(|io_err| {
-                    tracing::error!(
-                        path = %redact_path(&db_path),
-                        "Failed to preserve corrupt SQLite file before recovery: {io_err}"
-                    );
-                    AppError::persistence(
-                        "Database file appears damaged and could not be backed up safely.",
-                    )
-                })?;
+                let _ = fs::remove_file(&corrupt_tmp);
+                fs::copy(&db_path, &corrupt_tmp)
+                    .and_then(|_| {
+                        set_private_file_permissions(&corrupt_tmp);
+                        fs::rename(&corrupt_tmp, &corrupt_bak)
+                    })
+                    .map_err(|io_err| {
+                        let _ = fs::remove_file(&corrupt_tmp);
+                        tracing::error!(
+                            path = %redact_path(&db_path),
+                            "Failed to preserve corrupt SQLite file before recovery: {io_err}"
+                        );
+                        AppError::persistence(
+                            "Database file appears damaged and could not be backed up safely.",
+                        )
+                    })?;
                 set_private_file_permissions(&corrupt_bak);
             }
             let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
             let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
-            Self::preserve_corrupt_wal_if_present(&db_path);
             let _ = fs::remove_file(&wal_path);
             let _ = fs::remove_file(&shm_path);
 
@@ -209,15 +216,23 @@ impl Database {
 
     fn preserve_corrupt_wal_if_present(db_path: &Path) {
         let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-        if wal_path.exists() {
-            let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-            if wal_len > 0 {
-                let wal_corrupt_bak =
-                    PathBuf::from(format!("{}-wal.corrupt.bak", db_path.display()));
-                if !wal_corrupt_bak.exists() && fs::copy(&wal_path, &wal_corrupt_bak).is_ok() {
+        let wal_corrupt_bak = PathBuf::from(format!("{}-wal.corrupt.bak", db_path.display()));
+        let wal_tmp = PathBuf::from(format!("{}-wal.corrupt.bak.tmp", db_path.display()));
+        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        if wal_path.exists() && wal_len > 0 {
+            let _ = fs::remove_file(&wal_tmp);
+            if fs::copy(&wal_path, &wal_tmp).is_ok() {
+                set_private_file_permissions(&wal_tmp);
+                if fs::rename(&wal_tmp, &wal_corrupt_bak).is_ok() {
                     set_private_file_permissions(&wal_corrupt_bak);
+                } else {
+                    let _ = fs::remove_file(&wal_tmp);
                 }
+            } else {
+                let _ = fs::remove_file(&wal_tmp);
             }
+        } else {
+            let _ = fs::remove_file(&wal_corrupt_bak);
         }
     }
 
@@ -296,6 +311,64 @@ impl Database {
         })
     }
 
+    fn stage_backup_from_conn(
+        conn: &Connection,
+        db_path: &Path,
+        suffix: &str,
+        err_msg: &str,
+    ) -> Result<PathBuf, (AppError, bool)> {
+        let backup_path = Self::backup_path_for(db_path, suffix);
+        let tmp_backup = Self::backup_path_for(db_path, &format!("{suffix}.tmp"));
+        let checkpoint_res = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+            let busy: i64 = row.get(0)?;
+            Ok(busy == 0)
+        });
+        let checkpoint_complete = match checkpoint_res {
+            Ok(done) => done,
+            Err(e) if Self::is_sqlite_corruption_error(&e) => {
+                return Err((AppError::from(e), true));
+            }
+            Err(_) => false,
+        };
+        let _ = fs::remove_file(&tmp_backup);
+        let vacuum_ok = match tmp_backup.to_str() {
+            Some(s) => match conn.execute("VACUUM INTO ?1;", [s]) {
+                Ok(_) => true,
+                Err(e) if Self::is_sqlite_corruption_error(&e) => {
+                    let _ = fs::remove_file(&tmp_backup);
+                    return Err((AppError::from(e), true));
+                }
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !vacuum_ok {
+            let _ = fs::remove_file(&tmp_backup);
+            if !checkpoint_complete {
+                return Err((AppError::persistence(err_msg), false));
+            }
+            fs::copy(db_path, &tmp_backup).map_err(|io_err| {
+                let _ = fs::remove_file(&tmp_backup);
+                tracing::error!(
+                    path = %redact_path(&backup_path),
+                    "Failed to stage database backup copy: {io_err}"
+                );
+                (AppError::persistence(err_msg), false)
+            })?;
+        }
+        set_private_file_permissions(&tmp_backup);
+        fs::rename(&tmp_backup, &backup_path).map_err(|io_err| {
+            let _ = fs::remove_file(&tmp_backup);
+            tracing::error!(
+                path = %redact_path(&backup_path),
+                "Failed to finalize database backup: {io_err}"
+            );
+            (AppError::persistence(err_msg), false)
+        })?;
+        set_private_file_permissions(&backup_path);
+        Ok(backup_path)
+    }
+
     /// Creates an on-demand manual backup snapshot (`<db_path>.manual.bak`) atomically while holding the DB lock.
     pub fn create_manual_backup(&self) -> AppResult<Option<PathBuf>> {
         let Some(ref db_path) = self.db_path else {
@@ -304,46 +377,14 @@ impl Database {
         if !db_path.exists() {
             return Ok(None);
         }
-        let backup_path = Self::backup_path_for(db_path, "manual.bak");
-        let tmp_backup = Self::backup_path_for(db_path, "manual.bak.tmp");
-        self.with_conn(|conn| {
-            let checkpoint_complete = conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
-                    let busy: i64 = row.get(0)?;
-                    Ok(busy == 0)
-                })
-                .unwrap_or(false);
-            let _ = fs::remove_file(&tmp_backup);
-            let vacuum_ok = tmp_backup
-                .to_str()
-                .is_some_and(|s| conn.execute("VACUUM INTO ?1;", [s]).is_ok());
-            if !vacuum_ok {
-                let _ = fs::remove_file(&tmp_backup);
-                if !checkpoint_complete {
-                    return Err(AppError::persistence(
-                        "Failed to checkpoint WAL before manual database backup.",
-                    ));
-                }
-                fs::copy(db_path, &tmp_backup).map_err(|io_err| {
-                    let _ = fs::remove_file(&tmp_backup);
-                    tracing::error!(
-                        path = %redact_path(&backup_path),
-                        "Failed to stage manual database backup copy: {io_err}"
-                    );
-                    AppError::persistence("Failed to create manual database backup.")
-                })?;
-            }
-            set_private_file_permissions(&tmp_backup);
-            fs::rename(&tmp_backup, &backup_path).map_err(|io_err| {
-                let _ = fs::remove_file(&tmp_backup);
-                tracing::error!(
-                    path = %redact_path(&backup_path),
-                    "Failed to finalize manual database backup: {io_err}"
-                );
-                AppError::persistence("Failed to create manual database backup.")
-            })?;
-            set_private_file_permissions(&backup_path);
-            Ok(())
+        let backup_path = self.with_conn(|conn| {
+            Self::stage_backup_from_conn(
+                conn,
+                db_path,
+                "manual.bak",
+                "Failed to create manual database backup.",
+            )
+            .map_err(|(err, _)| err)
         })?;
         Ok(Some(backup_path))
     }
@@ -428,23 +469,23 @@ impl Database {
         // Checkpoint WAL first so any committed frames are included in the pre-migration backup (`H-1`).
         let mut last_backup_path = None;
         if has_pending && current_version >= 1 && db_path.exists() {
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-            let backup_path =
-                Self::backup_path_for(&db_path, &format!("pre-v{current_version}.bak"));
-            fs::copy(&db_path, &backup_path).map_err(|io_err| {
-                tracing::error!(
-                    path = %redact_path(&backup_path),
-                    "Failed to create pre-migration backup: {io_err}"
-                );
-                (
-                    AppError::persistence(
-                        "Failed to create pre-migration backup before upgrading schema.",
-                    ),
-                    false,
-                )
-            })?;
-            set_private_file_permissions(&backup_path);
-            last_backup_path = Some(backup_path);
+            let suffix = format!("pre-v{current_version}.bak");
+            match Self::stage_backup_from_conn(
+                &conn,
+                &db_path,
+                &suffix,
+                "Failed to create pre-migration backup before upgrading schema.",
+            ) {
+                Ok(backup_path) => {
+                    last_backup_path = Some(backup_path);
+                }
+                Err((err, is_corrupt)) => {
+                    if is_corrupt {
+                        Self::preserve_corrupt_wal_if_present(&db_path);
+                    }
+                    return Err((err, is_corrupt));
+                }
+            }
         }
 
         let mut db = Self {
@@ -452,8 +493,18 @@ impl Database {
             db_path: Some(db_path),
             last_backup_path,
         };
-        db.apply_migrations(migrations)?;
-        db.enable_foreign_keys()?;
+        if let Err((err, is_corrupt)) = db.apply_migrations(migrations) {
+            if is_corrupt {
+                Self::preserve_corrupt_wal_if_present(db_path_ref);
+            }
+            return Err((err, is_corrupt));
+        }
+        if let Err((err, is_corrupt)) = db.enable_foreign_keys() {
+            if is_corrupt {
+                Self::preserve_corrupt_wal_if_present(db_path_ref);
+            }
+            return Err((err, is_corrupt));
+        }
         if db.schema_version().unwrap_or(0) >= 4 {
             if let Err(err) = db.migrate_legacy_ui_state_blob() {
                 tracing::warn!(
@@ -583,10 +634,13 @@ impl Database {
             for elem in arr {
                 match serde_json::from_value::<MediaItem>(elem.clone()) {
                     Ok(mut m) => {
-                        if m.id.trim().is_empty() || validate_local_media_path_str(&m.path).is_err()
-                        {
+                        if m.id.trim().is_empty() {
                             continue;
                         }
+                        let Ok(clean) = validate_local_media_path_str(&m.path) else {
+                            continue;
+                        };
+                        m.path = clean.to_owned();
                         if m.display_name.trim().is_empty() {
                             m.display_name = Path::new(&m.path)
                                 .file_name()
@@ -686,6 +740,57 @@ impl Database {
         (settings, media, notes, playlists, playback_session)
     }
 
+    fn record_id_remap(
+        id_remap: &mut std::collections::HashMap<String, String>,
+        replaced_id: String,
+        surviving_id: &str,
+    ) {
+        if replaced_id == surviving_id {
+            return;
+        }
+        id_remap.remove(surviving_id);
+        for target in id_remap.values_mut() {
+            if target == &replaced_id {
+                *target = surviving_id.to_owned();
+            }
+        }
+        id_remap.insert(replaced_id, surviving_id.to_owned());
+    }
+
+    fn resolve_remapped_id<'a>(
+        mut id: &'a str,
+        id_remap: &'a std::collections::HashMap<String, String>,
+    ) -> &'a str {
+        let mut steps = 0_usize;
+        while let Some(next) = id_remap.get(id) {
+            if next == id || steps >= id_remap.len() {
+                break;
+            }
+            id = next.as_str();
+            steps += 1;
+        }
+        id
+    }
+
+    fn remap_playback_session(
+        session: &PersistedPlaybackSession,
+        id_remap: &std::collections::HashMap<String, String>,
+    ) -> PersistedPlaybackSession {
+        let mut remapped = session.clone();
+        remapped.active_media_id = remapped
+            .active_media_id
+            .as_deref()
+            .map(|id| Self::resolve_remapped_id(id, id_remap).to_owned());
+        let mut seen_q = std::collections::HashSet::with_capacity(remapped.queue.len());
+        remapped.queue = remapped
+            .queue
+            .iter()
+            .map(|id| Self::resolve_remapped_id(id, id_remap).to_owned())
+            .filter(|id| seen_q.insert(id.clone()))
+            .collect();
+        remapped
+    }
+
     fn migrate_legacy_ui_state_blob(&self) -> AppResult<bool> {
         let legacy_raw: Option<String> = self.with_conn(|conn| {
             let val = conn
@@ -722,22 +827,24 @@ impl Database {
             Self::parse_lenient_state_object(obj);
         let settings_json = serde_json::to_string(&settings)
             .map_err(|e| AppError::internal(format!("Settings serialize failed: {e}")))?;
-        let session_json = playback_session
-            .as_ref()
-            .and_then(|s| serde_json::to_string(s).ok());
 
         // Non-destructively merge legacy `v2` blob onto any existing relational rows (e.g. CLI opens)
         // and purge `app_ui_state` inside the exact same `IMMEDIATE` transaction (`C-1`).
         self.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut id_remap: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for m in &media {
-                Self::reconcile_upsert_media_in_tx(&tx, m, false)?;
+                if let Some(replaced_id) = Self::reconcile_upsert_media_in_tx(&tx, m, false)? {
+                    Self::record_id_remap(&mut id_remap, replaced_id, &m.id);
+                }
             }
             for n in &notes {
+                let target_media_id = Self::resolve_remapped_id(&n.media_id, &id_remap);
                 let exists: Option<i64> = tx
                     .query_row(
                         "SELECT 1 FROM media WHERE id = ?1",
-                        params![n.media_id],
+                        params![target_media_id],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -753,7 +860,7 @@ impl Database {
                            updated_at = excluded.updated_at;",
                         params![
                             n.id,
-                            n.media_id,
+                            target_media_id,
                             i64::try_from(n.position_ms).unwrap_or(i64::MAX),
                             i64::from(n.is_quick_marker),
                             n.body,
@@ -779,8 +886,9 @@ impl Database {
                 )?;
                 let mut seen_pl_items = std::collections::HashSet::new();
                 let mut pos = 0_i64;
-                for mid in &pl.item_ids {
-                    if !seen_pl_items.insert(mid.clone()) {
+                for raw_mid in &pl.item_ids {
+                    let mid = Self::resolve_remapped_id(raw_mid, &id_remap);
+                    if !seen_pl_items.insert(mid.to_owned()) {
                         continue;
                     }
                     let exists: Option<i64> = tx
@@ -808,6 +916,10 @@ impl Database {
                     params![settings_json],
                 )?;
             }
+            let session_json = playback_session
+                .as_ref()
+                .map(|s| Self::remap_playback_session(s, &id_remap))
+                .and_then(|s| serde_json::to_string(&s).ok());
             if let Some(ref s_json) = session_json {
                 tx.execute(
                     "INSERT INTO settings (key, value_json, updated_at)
@@ -1009,6 +1121,22 @@ impl Database {
         })
     }
 
+    /// Reads the persisted `playback_session_v1` entry from `settings`, if present and valid.
+    pub fn load_playback_session(&self) -> AppResult<Option<PersistedPlaybackSession>> {
+        self.with_conn(|conn| {
+            let raw_session: Option<String> = conn
+                .query_row(
+                    "SELECT value_json FROM settings WHERE key = 'playback_session_v1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(raw_session
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<PersistedPlaybackSession>(s).ok()))
+        })
+    }
+
     /// Transactionally imports a JSON state document into normalized relational tables.
     pub fn import_relational_state_json(&self, payload_json: &str) -> AppResult<()> {
         let raw_val: serde_json::Value = serde_json::from_str(payload_json)
@@ -1022,9 +1150,6 @@ impl Database {
 
         let settings_json = serde_json::to_string(&settings)
             .map_err(|e| AppError::internal(format!("Settings serialize failed: {e}")))?;
-        let session_json = playback_session
-            .as_ref()
-            .and_then(|s| serde_json::to_string(s).ok());
 
         self.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1035,11 +1160,22 @@ impl Database {
             tx.execute("DELETE FROM app_ui_state;", [])?;
 
             let mut valid_media_ids = std::collections::HashSet::with_capacity(media.len());
-            let mut seen_paths = std::collections::HashSet::with_capacity(media.len());
+            let mut path_to_id: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(media.len());
+            let mut id_remap: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for m in &media {
-                if !seen_paths.insert(m.path.clone()) || !valid_media_ids.insert(m.id.clone()) {
+                if let Some(existing_id) = path_to_id.get(&m.path) {
+                    if m.id != *existing_id {
+                        Self::record_id_remap(&mut id_remap, m.id.clone(), existing_id);
+                    }
                     continue;
                 }
+                if !valid_media_ids.insert(m.id.clone()) {
+                    continue;
+                }
+                id_remap.remove(&m.id);
+                path_to_id.insert(m.path.clone(), m.id.clone());
                 tx.execute(
                     "INSERT INTO media (
                         id, path, display_name, media_kind, duration_ms, duration_probed,
@@ -1068,7 +1204,8 @@ impl Database {
             }
 
             for n in &notes {
-                if !valid_media_ids.contains(&n.media_id) {
+                let media_id = Self::resolve_remapped_id(&n.media_id, &id_remap);
+                if !valid_media_ids.contains(media_id) {
                     continue;
                 }
                 tx.execute(
@@ -1077,7 +1214,7 @@ impl Database {
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         n.id,
-                        n.media_id,
+                        media_id,
                         i64::try_from(n.position_ms).unwrap_or(i64::MAX),
                         i64::from(n.is_quick_marker),
                         n.body,
@@ -1095,8 +1232,9 @@ impl Database {
                 )?;
                 let mut seen_pl_items = std::collections::HashSet::new();
                 let mut pos = 0_i64;
-                for mid in &pl.item_ids {
-                    if valid_media_ids.contains(mid) && seen_pl_items.insert(mid.clone()) {
+                for raw_mid in &pl.item_ids {
+                    let mid = Self::resolve_remapped_id(raw_mid, &id_remap);
+                    if valid_media_ids.contains(mid) && seen_pl_items.insert(mid.to_owned()) {
                         tx.execute(
                             "INSERT INTO playlist_items (playlist_id, media_id, position, added_at)
                              VALUES (?1, ?2, ?3, ?4)",
@@ -1116,6 +1254,10 @@ impl Database {
                 params![settings_json],
             )?;
 
+            let session_json = playback_session
+                .as_ref()
+                .map(|s| Self::remap_playback_session(s, &id_remap))
+                .and_then(|s| serde_json::to_string(&s).ok());
             if let Some(ref s_json) = session_json {
                 tx.execute(
                     "INSERT INTO settings (key, value_json, updated_at)
@@ -1142,7 +1284,7 @@ impl Database {
         tx: &rusqlite::Transaction<'_>,
         item: &MediaItem,
         authoritative_folder: bool,
-    ) -> AppResult<()> {
+    ) -> AppResult<Option<String>> {
         if item.id.trim().is_empty() {
             return Err(AppError::validation("Media item ID must not be empty"));
         }
@@ -1277,83 +1419,77 @@ impl Database {
                         params![item.id, other.id],
                     )?;
                     tx.execute("DELETE FROM media WHERE id = ?1", params![other.id])?;
-                    return Ok(());
+                    return Ok(Some(other.id));
                 }
             }
         }
 
         if existing_by_id.is_some() {
-            if authoritative_folder {
-                // `H-2`: Authoritative RPC updates allow clearing `source_folder_id` to `NULL`.
-                tx.execute(
-                    "UPDATE media
-                     SET path = ?2,
-                         display_name = ?3,
-                         media_kind = ?4,
-                         duration_ms = COALESCE(?5, duration_ms),
-                         duration_probed = CASE WHEN ?6 != 0 THEN 1 ELSE duration_probed END,
-                         last_position_ms = ?7,
-                         completed = ?8,
-                         file_size_bytes = COALESCE(?9, file_size_bytes),
-                         availability = ?10,
-                         last_opened_at = COALESCE(?11, last_opened_at),
-                         last_seen_at = ?12,
-                         source_folder_id = ?13,
-                         fingerprint = COALESCE(?14, fingerprint)
-                     WHERE id = ?1",
-                    params![
-                        item.id,
-                        clean_path,
-                        display_name,
-                        item.media_kind.as_str(),
-                        dur_param,
-                        i64::from(item.duration_probed),
-                        pos_param,
-                        i64::from(item.completed),
-                        size_param,
-                        item.availability.as_str(),
-                        last_opened_at,
-                        last_seen_at,
-                        item.source_folder_id,
-                        item.fingerprint,
-                    ],
-                )?;
+            let path_changed = existing_by_id.as_deref() != Some(clean_path.as_str());
+            let dur_expr = if path_changed {
+                "?5"
+            } else if authoritative_folder {
+                "CASE WHEN ?6 = 0 AND ?5 IS NULL THEN NULL ELSE COALESCE(?5, duration_ms) END"
             } else {
-                tx.execute(
-                    "UPDATE media
-                     SET path = ?2,
-                         display_name = ?3,
-                         media_kind = ?4,
-                         duration_ms = COALESCE(?5, duration_ms),
-                         duration_probed = CASE WHEN ?6 != 0 THEN 1 ELSE duration_probed END,
-                         last_position_ms = ?7,
-                         completed = ?8,
-                         file_size_bytes = COALESCE(?9, file_size_bytes),
-                         availability = ?10,
-                         last_opened_at = COALESCE(?11, last_opened_at),
-                         last_seen_at = ?12,
-                         source_folder_id = COALESCE(?13, source_folder_id),
-                         fingerprint = COALESCE(?14, fingerprint)
-                     WHERE id = ?1",
-                    params![
-                        item.id,
-                        clean_path,
-                        display_name,
-                        item.media_kind.as_str(),
-                        dur_param,
-                        i64::from(item.duration_probed),
-                        pos_param,
-                        i64::from(item.completed),
-                        size_param,
-                        item.availability.as_str(),
-                        last_opened_at,
-                        last_seen_at,
-                        item.source_folder_id,
-                        item.fingerprint,
-                    ],
-                )?;
-            }
-            return Ok(());
+                "COALESCE(?5, duration_ms)"
+            };
+            let probed_expr = if path_changed || authoritative_folder {
+                "?6"
+            } else {
+                "CASE WHEN ?6 != 0 THEN 1 ELSE duration_probed END"
+            };
+            let size_expr = if path_changed {
+                "?9"
+            } else {
+                "COALESCE(?9, file_size_bytes)"
+            };
+            let folder_expr = if authoritative_folder {
+                "?13"
+            } else {
+                "COALESCE(?13, source_folder_id)"
+            };
+            let fp_expr = if path_changed {
+                "?14"
+            } else {
+                "COALESCE(?14, fingerprint)"
+            };
+            let sql = format!(
+                "UPDATE media
+                 SET path = ?2,
+                     display_name = ?3,
+                     media_kind = ?4,
+                     duration_ms = {dur_expr},
+                     duration_probed = {probed_expr},
+                     last_position_ms = ?7,
+                     completed = ?8,
+                     file_size_bytes = {size_expr},
+                     availability = ?10,
+                     last_opened_at = COALESCE(?11, last_opened_at),
+                     last_seen_at = ?12,
+                     source_folder_id = {folder_expr},
+                     fingerprint = {fp_expr}
+                 WHERE id = ?1"
+            );
+            tx.execute(
+                &sql,
+                params![
+                    item.id,
+                    clean_path,
+                    display_name,
+                    item.media_kind.as_str(),
+                    dur_param,
+                    i64::from(item.duration_probed),
+                    pos_param,
+                    i64::from(item.completed),
+                    size_param,
+                    item.availability.as_str(),
+                    last_opened_at,
+                    last_seen_at,
+                    item.source_folder_id,
+                    item.fingerprint,
+                ],
+            )?;
+            return Ok(None);
         }
 
         tx.execute(
@@ -1380,7 +1516,7 @@ impl Database {
                 item.source_folder_id,
             ],
         )?;
-        Ok(())
+        Ok(None)
     }
 
     /// Upserts one or more media records transactionally without touching notes or playlists.
@@ -1730,12 +1866,7 @@ impl Database {
                             Some(v) => v
                                 .as_u64()
                                 .map(|u| u.min(crate::domain::MAX_SAFE_DURATION_MS))
-                                .or_else(|| {
-                                    v.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| {
-                                        f.round().min(crate::domain::MAX_SAFE_DURATION_MS as f64)
-                                            as u64
-                                    })
-                                })
+                                .or_else(|| v.as_f64().and_then(clamp_f64_to_safe_duration_ms))
                                 .ok_or_else(|| {
                                     AppError::validation(
                                         "Batch update_progress has invalid 'last_position_ms'",
@@ -1877,18 +2008,20 @@ impl Database {
         })
     }
 
-    /// Wipes all user records across relational tables and `app_ui_state`, then checkpoints WAL.
+    /// Wipes all user records across relational tables and `app_ui_state`, then vacuums and checkpoints WAL.
     pub fn reset_all_user_data(&self) -> AppResult<()> {
         self.with_conn(|conn| {
-            conn.execute_batch(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(
                 "DELETE FROM notes;
                  DELETE FROM playlist_items;
                  DELETE FROM playlists;
                  DELETE FROM media;
                  DELETE FROM settings;
-                 DELETE FROM app_ui_state;
-                 PRAGMA wal_checkpoint(TRUNCATE);",
+                 DELETE FROM app_ui_state;",
             )?;
+            tx.commit()?;
+            conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
             Ok(())
         })
     }

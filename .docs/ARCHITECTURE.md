@@ -51,13 +51,13 @@ The frontend is treated as untrusted ([ADR 0003](adr/0003-local-first-privacy-an
 
 SQLite lives in the per-user application data directory (`com.audora.desktop`), with foreign keys enabled, WAL journaling, versioned migrations (`0001_initial.sql` through `0004_relational_unification.sql`), automatic `.pre-v<N>.bak` snapshots before schema upgrades, manual `.manual.bak` snapshots, and `.corrupt.bak` quarantine on recovery. Media bytes and note contents are never written to logs.
 
-Core relational tables (`0004_relational_unification.sql`):
+Core relational tables (`0001`–`0004` migrations):
 
-- `media(id, path, file_name, title, media_kind, extension, duration_ms nullable, duration_probed, file_size_bytes, last_position_ms, completed, availability, fingerprint nullable, added_at, last_opened_at nullable, last_seen_at)`
-- `notes(id, media_id, timestamp_ms, is_quick_marker, text, created_at, updated_at)`
-- `playlists(id, name, description, created_at, updated_at)` and `playlist_items(playlist_id, position, media_id, added_at)`
-- `source_folders(path, added_at)`
-- `settings(key, value_json, updated_at)` and `session_state(singleton_id, queue_json, current_media_id, repeat_mode, shuffle_enabled, volume, muted, playback_rate, window_mode, updated_at)`
+- `media(id, path, display_name, media_kind, duration_ms nullable, last_position_ms, completed, file_size_bytes nullable, fingerprint nullable, availability, added_at, last_opened_at nullable, last_seen_at, source_folder_id nullable, duration_probed)`
+- `notes(id, media_id, position_ms, is_quick_marker, body, created_at, updated_at)`
+- `playlists(id, name, description, created_at, updated_at)` and `playlist_items(playlist_id, media_id, position, added_at)`
+- `settings(key, value_json, updated_at)` (stores user settings plus serialized `'playback_session_v1'`)
+- `app_ui_state(key, payload_json, updated_at)` (legacy v3 snapshot table migrated automatically into v4 relational tables)
 - `schema_migrations(version, applied_at)`
 
 ## Media identity and relocation

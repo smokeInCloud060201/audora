@@ -118,13 +118,55 @@ export const SettingsView = React.memo(function SettingsView({
         setCopiedDiagnosticJson(false);
       }, 2500);
     };
-    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-      void navigator.clipboard.writeText(formatted).then(markCopied).catch(() => {
+    const tryNativeClipboardFallback = async (): Promise<boolean> => {
+      if (
+        typeof window === "undefined" ||
+        typeof fetch !== "function" ||
+        (window.location.hostname !== "127.0.0.1" &&
+          window.location.hostname !== "localhost")
+      ) {
+        return false;
+      }
+      const win = window as Window & { __AUDORA_SESSION_TOKEN__?: unknown };
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (
+        typeof win.__AUDORA_SESSION_TOKEN__ === "string" &&
+        win.__AUDORA_SESSION_TOKEN__.length > 0
+      ) {
+        headers["X-Audora-Token"] = win.__AUDORA_SESSION_TOKEN__;
+      }
+      try {
+        const res = await fetch("/__audora_clipboard", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ text: formatted }),
+        });
+        return res.ok;
+      } catch {
+        return false;
+      }
+    };
+    void (async () => {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(formatted);
+          markCopied();
+          return;
+        } catch {
+          if (await tryNativeClipboardFallback()) {
+            markCopied();
+            return;
+          }
+          onSetBackupStatusMessage("Unable to access system clipboard.");
+          return;
+        }
+      }
+      if (await tryNativeClipboardFallback()) {
+        markCopied();
+      } else {
         onSetBackupStatusMessage("Unable to access system clipboard.");
-      });
-    } else {
-      markCopied();
-    }
+      }
+    })();
   };
   return (
     <div className="content-page">

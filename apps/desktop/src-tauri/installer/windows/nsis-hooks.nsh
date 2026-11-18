@@ -2,6 +2,11 @@
 ; Invokes `Audora.exe --uninstall-cleanup` (or `audora.exe`) and removes %APPDATA%\com.audora.desktop, %APPDATA%\com.audora.app, and %LOCALAPPDATA%\com.audora.desktop
 
 !macro NSIS_HOOK_PREUNINSTALL
+  nsExec::ExecToLog 'taskkill /F /IM Audora.exe'
+  Pop $0
+  nsExec::ExecToLog 'taskkill /F /IM audora.exe'
+  Pop $0
+  Sleep 300
   IfFileExists "$INSTDIR\Audora.exe" 0 _audora_try_lower
     nsExec::ExecToLog '"$INSTDIR\Audora.exe" --uninstall-cleanup'
     Goto _audora_cleanup_dirs

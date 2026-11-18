@@ -26,7 +26,7 @@ All Rust dependencies are audited in CI via [`deny.toml`](deny.toml) (`cargo-den
 
 | Package | Version | License | Usage |
 | :--- | :--- | :--- | :--- |
-| `react` & `react-dom` | `19.3.1` | `MIT` | User interface rendering (`apps/desktop/ui/`) |
+| `react`, `react-dom` & `scheduler` | `19.3.1` / `0.28.0` | `MIT` | User interface rendering (`apps/desktop/ui/`) |
 | `vite` & `vitest` (dev/build only) | `6.4.6` / `4.1.12` | `MIT` | Frontend bundling and unit testing |
 | `typescript` (dev/build only) | `5.9.3` | `Apache-2.0` | Static type checking |
 

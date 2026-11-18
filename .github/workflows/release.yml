@@ -264,8 +264,24 @@ jobs:
           Terminal=false
           Type=Application
           Categories=AudioVideo;Player;Video;Audio;
-          MimeType=video/mp4;video/webm;video/quicktime;video/x-matroska;audio/wav;audio/flac;audio/ogg;audio/mpeg;audio/mp4;audio/aac;
+          MimeType=video/mp4;video/x-m4v;video/webm;video/quicktime;video/x-matroska;audio/wav;audio/x-wav;audio/flac;audio/x-flac;audio/ogg;audio/opus;audio/x-opus+ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;
           DESKTOP
+            cat > "${DEB_ROOT}/DEBIAN/postinst" <<'POSTINST'
+          #!/bin/sh
+          set -e
+          case "$1" in
+            configure)
+              if command -v update-desktop-database >/dev/null 2>&1; then
+                update-desktop-database -q /usr/share/applications || true
+              fi
+              if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+                gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+              fi
+              ;;
+          esac
+          exit 0
+          POSTINST
+            chmod 0755 "${DEB_ROOT}/DEBIAN/postinst"
             cp apps/desktop/src-tauri/installer/linux/postrm "${DEB_ROOT}/DEBIAN/postrm"
             chmod 0755 "${DEB_ROOT}/DEBIAN/postrm"
             cat > "${DEB_ROOT}/DEBIAN/control" <<CONTROL
@@ -291,6 +307,7 @@ jobs:
               signtool.exe sign /f "${RUNNER_TEMP}/win_cert.pfx" /p "${WINDOWS_CERTIFICATE_PASSWORD:-}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/audora.exe
             fi
             cp target/release/audora.exe "${WIN_STAGE}/Audora.exe"
+            cp assets/icons/icon.ico "${WIN_STAGE}/Audora.ico"
             cp -R apps/desktop/ui/dist/* "${WIN_STAGE}/ui/"
             cp LICENSE THIRD_PARTY_NOTICES.md sbom.cdx.json "${WIN_STAGE}/"
             PORTABLE_ZIP="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-portable.zip"
@@ -301,6 +318,8 @@ jobs:
               SETUP_EXE="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-setup.exe"
               cat > dist-windows/audora-installer.nsi <<NSIS
           !include "MUI2.nsh"
+          !define MUI_ICON "../assets/icons/icon.ico"
+          !define MUI_UNICON "../assets/icons/icon.ico"
           !include "../apps/desktop/src-tauri/installer/windows/nsis-hooks.nsh"
           Name "Audora ${CLEAN_VERSION}"
           OutFile "../${SETUP_EXE}"
@@ -313,14 +332,18 @@ jobs:
           !insertmacro MUI_LANGUAGE "English"
 
           Section "Install"
+            nsExec::ExecToLog 'taskkill /F /IM Audora.exe'
+            nsExec::ExecToLog 'taskkill /F /IM audora.exe'
+            Sleep 400
             SetOutPath "\$INSTDIR"
             File /r "Audora\\*.*"
             WriteUninstaller "\$INSTDIR\\Uninstall.exe"
             CreateDirectory "\$SMPROGRAMS\\Audora"
-            CreateShortCut "\$SMPROGRAMS\\Audora\\Audora.lnk" "\$INSTDIR\\Audora.exe"
-            CreateShortCut "\$DESKTOP\\Audora.lnk" "\$INSTDIR\\Audora.exe"
+            CreateShortCut "\$SMPROGRAMS\\Audora\\Audora.lnk" "\$INSTDIR\\Audora.exe" "" "\$INSTDIR\\Audora.ico" 0
+            CreateShortCut "\$DESKTOP\\Audora.lnk" "\$INSTDIR\\Audora.exe" "" "\$INSTDIR\\Audora.ico" 0
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayName" "Audora"
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayVersion" "${CLEAN_VERSION}"
+            WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayIcon" '"\$INSTDIR\\Audora.ico"'
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "Publisher" "Audora Contributors"
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "UninstallString" '"\$INSTDIR\\Uninstall.exe"'
           SectionEnd
@@ -333,6 +356,7 @@ jobs:
             ; Remove only Audora's installed files & owned subdirectories — NEVER RMDir /r \$INSTDIR (`H-1`)
             RMDir /r "\$INSTDIR\\ui"
             Delete "\$INSTDIR\\Audora.exe"
+            Delete "\$INSTDIR\\Audora.ico"
             Delete "\$INSTDIR\\LICENSE"
             Delete "\$INSTDIR\\THIRD_PARTY_NOTICES.md"
             Delete "\$INSTDIR\\sbom.cdx.json"

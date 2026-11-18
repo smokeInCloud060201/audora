@@ -12,6 +12,12 @@ WEBKIT_DIR="${HOME}/Library/WebKit/com.audora.desktop"
 SAVED_STATE_DIR="${HOME}/Library/Saved Application State/com.audora.desktop.savedState"
 PREFS_PLIST="${HOME}/Library/Preferences/com.audora.desktop.plist"
 
+# Gracefully quit any running Audora instance before removing files
+osascript -e 'tell application id "com.audora.desktop" to quit' >/dev/null 2>&1 || true
+sleep 1
+pkill -x audora >/dev/null 2>&1 || true
+sleep 0.5
+
 if [[ -x "${APP_BUNDLE}/Contents/MacOS/audora" ]]; then
   "${APP_BUNDLE}/Contents/MacOS/audora" --uninstall-cleanup || true
 elif [[ -x "${USER_APP_BUNDLE}/Contents/MacOS/audora" ]]; then

@@ -613,4 +613,371 @@ describe("AudoraIpcClient queue auto-advance on playback completion", () => {
     };
     expect(JSON.parse(quitWin.__AUDORA_COLLECT_QUIT_BATCH__!())).toEqual([]);
   });
+
+  it("fences Event::Opened drops behind GET /__audora_state hydration, merges pre-hydration settings, and refuses to overwrite SQLite on 500", async () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 AppleWebKit/605.1.15" });
+    vi.stubGlobal("window", {
+      __AUDORA_SESSION_TOKEN__: "tok_hydration_race",
+      location: { hostname: "127.0.0.1" },
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          store.set(k, v);
+        },
+        removeItem: (k: string) => {
+          store.delete(k);
+        },
+      },
+    });
+
+    // Case 1: GET /__audora_state returns 500 -> must NOT POST /__audora_state or save_settings
+    const errCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        errCalls.push(`${method} ${url}`);
+        if (url === "/__audora_state" && method === "GET") {
+          return new Response(JSON.stringify({ ok: false }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    const errClient = new AudoraIpcClient(true);
+    await errClient.ensureHydratedFromNative();
+    errClient.updateSettings({ ...errClient.getSettings(), theme: "light" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(errCalls.some((c) => c === "POST /__audora_state")).toBe(false);
+    expect(errCalls.some((c) => c === "POST /__audora_rpc")).toBe(false);
+
+    // Case 2: Slow GET /__audora_state races against pre-hydration settings toggle AND Event::Opened drop
+    let resolveStateFetch!: (res: Response) => void;
+    const rpcBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        if (url === "/__audora_state" && method === "GET") {
+          return new Promise<Response>((resolve) => {
+            resolveStateFetch = resolve;
+          });
+        }
+        if (url === "/__audora_rpc" && init?.body) {
+          rpcBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    const client = new AudoraIpcClient(true);
+    const hydrationPromise = client.ensureHydratedFromNative();
+
+    // User toggles side panel `]` BEFORE hydration completes -> must NOT clobber SQLite source_folders!
+    client.updateSettings({ ...client.getSettings(), show_side_panel: false });
+    expect(rpcBodies.some((b) => b.op === "save_settings")).toBe(false);
+
+    // macOS Event::Opened arrives while hydration is still pending
+    const dropPromise = client.ingestNativeDroppedPaths(
+      [
+        {
+          kind: "file",
+          path: "/tmp/Opened_Via_OS.mp3",
+          name: "Opened_Via_OS.mp3",
+          size: 4096,
+          duration_ms: 42_000,
+        },
+      ],
+      { autoPlay: true },
+    );
+
+    // Now SQLite returns persisted library + source_folders + theme="light"
+    resolveStateFetch(
+      new Response(
+        JSON.stringify({
+          media: [
+            {
+              id: "med_hydrated_1",
+              path: "/tmp/Hydrated_Track.wav",
+              display_name: "Hydrated_Track.wav",
+              media_kind: "audio",
+              duration_ms: 60_000,
+              last_position_ms: 5_000,
+              completed: false,
+              file_size_bytes: 10_000,
+              fingerprint: null,
+              availability: "available",
+              added_at: "2026-01-01T00:00:00Z",
+              last_opened_at: "2026-01-01T00:00:00Z",
+              last_seen_at: "2026-01-01T00:00:00Z",
+              note_count: 0,
+              source_folder_id: "src_hydrated",
+            },
+          ],
+          notes: [],
+          playlists: [],
+          settings: {
+            theme: "light",
+            resume_where_left_off: true,
+            pause_on_headphones_disconnect: true,
+            default_playback_speed: 1.25,
+            timestamp_precision: "nearest_second",
+            window_mode: "full",
+            auto_check_updates: true,
+            installed_version: "1.1.2",
+            dismissed_update_version: null,
+            source_folders: [
+              {
+                id: "src_hydrated",
+                path: "/tmp/HydratedFolder",
+                label: "HydratedFolder",
+                enabled: true,
+                added_at: "2026-01-01T00:00:00Z",
+                last_scanned_at: "2026-01-01T00:00:00Z",
+                media_count: 1,
+              },
+            ],
+            show_playlists_bar: true,
+            show_side_panel: true,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const [_, dropRes] = await Promise.all([hydrationPromise, dropPromise]);
+    expect(dropRes.openedItems).toHaveLength(1);
+    // Hydrated library track + source folder preserved AND pre-hydration side-panel toggle merged!
+    expect(client.searchLibrary("", "all").media_items.map((m) => m.id)).toContain(
+      "med_hydrated_1",
+    );
+    expect(client.getSourceFolders()).toHaveLength(1);
+    expect(client.getSettings().theme).toBe("light");
+    expect(client.getSettings().show_side_panel).toBe(false);
+    // Event::Opened autoPlay starts playback on the opened track
+    expect(client.getPlaybackSnapshot().media_id).toBe(dropRes.openedItems[0]!.id);
+    expect(client.getPlaybackSnapshot().state).toBe("playing");
+  });
+
+  it("preserves volume/muted/rate/repeat/shuffle and monotonic generation across idle transitions, syncs shuffle queue & preserveShuffleOrder, and isolates open errors", () => {
+    const client = new AudoraIpcClient(false);
+    const [t1, t2, t3] = client.openLocalFiles([
+      { name: "Track1.mp3", path: "/tmp/Track1.mp3", size: 1000, durationMs: 30_000 },
+      { name: "Track2.mp3", path: "/tmp/Track2.mp3", size: 1000, durationMs: 30_000 },
+      { name: "Track3.mp3", path: "/tmp/Track3.mp3", size: 1000, durationMs: 30_000 },
+    ]);
+
+    client.playbackCommand({ action: "set_volume", volume: 0.35 });
+    client.playbackCommand({ action: "set_muted", muted: true });
+    client.playbackCommand({ action: "set_rate", rate: 1.5 });
+    client.playbackCommand({ action: "set_repeat", mode: "all" });
+
+    // Enabling shuffle syncs snapshot.queue to the shuffled order and stores unshuffledQueue
+    const shuffled = client.playbackCommand({ action: "set_shuffle", shuffle: true });
+    expect(shuffled.shuffle).toBe(true);
+    expect(shuffled.queue).toHaveLength(3);
+
+    // Selecting a track with preserveShuffleOrder keeps shuffled queue intact
+    const snapshotOrderBefore = [...shuffled.queue];
+    client.selectMediaById(t2!.id, { autoPlay: true, preserveShuffleOrder: true });
+    expect(client.getPlaybackSnapshot().queue).toEqual(snapshotOrderBefore);
+    expect(client.getPlaybackSnapshot().state).toBe("playing");
+
+    // Pre-open validation failure while playing does NOT corrupt active playback state
+    const genPlaying = client.getPlaybackSnapshot().generation;
+    expect(() => client.openMediaPath("/tmp/BadCodec.prores")).toThrow();
+    expect(client.getPlaybackSnapshot().state).toBe("playing");
+    expect(client.getPlaybackSnapshot().media_id).toBe(t2!.id);
+    expect(client.getPlaybackSnapshot().error).toBeNull();
+    expect(client.getPlaybackSnapshot().generation).toBe(genPlaying);
+
+    // Removing all tracks transitions to idle while preserving volume, muted, rate, repeat, shuffle & monotonic generation
+    client.removeMedia(t1!.id);
+    client.removeMedia(t3!.id);
+    const genBeforeLastRemove = client.getPlaybackSnapshot().generation;
+    client.removeMedia(t2!.id);
+    const idleSnap = client.getPlaybackSnapshot();
+    expect(idleSnap.state).toBe("idle");
+    expect(idleSnap.media_id).toBeNull();
+    expect(idleSnap.volume).toBe(0.35);
+    expect(idleSnap.muted).toBe(true);
+    expect(idleSnap.rate).toBe(1.5);
+    expect(idleSnap.repeat_mode).toBe("all");
+    expect(idleSnap.shuffle).toBe(true);
+    expect(idleSnap.generation).toBeGreaterThan(genBeforeLastRemove);
+
+    // Persisted idle snapshot with 0 available items also restores audio preferences instead of resetting to 100% unmuted
+    const store = new Map<string, string>();
+    store.set(
+      "audora.state.v2",
+      JSON.stringify({
+        media: [],
+        notes: [],
+        playlists: [],
+        settings: client.getSettings(),
+        playback_session: {
+          active_media_id: null,
+          queue: [],
+          volume: 0.25,
+          muted: true,
+          rate: 1.75,
+          repeat_mode: "one",
+          shuffle: true,
+        },
+      }),
+    );
+    vi.stubGlobal("window", {
+      location: { hostname: "example.local" },
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          store.set(k, v);
+        },
+        removeItem: (k: string) => {
+          store.delete(k);
+        },
+      },
+    });
+    const restoredClient = new AudoraIpcClient(true);
+    const restoredSnap = restoredClient.getPlaybackSnapshot();
+    expect(restoredSnap.state).toBe("idle");
+    expect(restoredSnap.volume).toBe(0.25);
+    expect(restoredSnap.muted).toBe(true);
+    expect(restoredSnap.rate).toBe(1.75);
+    expect(restoredSnap.repeat_mode).toBe("one");
+    expect(restoredSnap.shuffle).toBe(true);
+    expect(restoredSnap.generation).toBeGreaterThanOrEqual(1);
+  });
+
+  it("blocks playback on missing media with AV-101, increments generation on upgradeMediaKindToAudio, skips retry on 4xx RPC, and flushes inFlightRpcEntry on exit", async () => {
+    const client = new AudoraIpcClient(false);
+    const clip = client.openMediaPath("/tmp/AudioOnly.mp4", {
+      size: 2048,
+      durationMs: 20_000,
+    });
+    const genBeforeUpgrade = client.getPlaybackSnapshot().generation;
+    client.upgradeMediaKindToAudio(clip.id);
+    expect(client.getPlaybackSnapshot().generation).toBeGreaterThan(genBeforeUpgrade);
+
+    client.markMediaMissing(clip.id);
+    expect(() => client.playbackCommand({ action: "play" })).toThrowError(/moved, renamed/i);
+    expect(() => client.playbackCommand({ action: "toggle_play_pause" })).toThrowError(
+      /moved, renamed/i,
+    );
+    expect(client.getPlaybackSnapshot().state).toBe("paused");
+    expect(() =>
+      client.relinkMedia(clip.id, "/tmp/ZeroBytes.mp4", { fileSizeBytes: 0 }),
+    ).toThrowError(/0 bytes/i);
+
+    // 4xx RPC error skips retry; in-flight RPC is captured by __AUDORA_COLLECT_QUIT_BATCH__ and settles false
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 AppleWebKit/605.1.15" });
+    vi.stubGlobal("window", {
+      __AUDORA_SESSION_TOKEN__: "tok_rpc_test",
+      location: { hostname: "127.0.0.1" },
+      localStorage: {
+        getItem: () => null,
+        setItem: () => {},
+        removeItem: () => {},
+      },
+    });
+    let rpcMode: "ok" | "fail400" | "hang" = "ok";
+    let noteRpcCalls = 0;
+    let releaseInFlight: ((res: Response) => void) | null = null;
+    const setReleaseInFlight = (fn: (res: Response) => void) => {
+      releaseInFlight = fn;
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === "/__audora_state" && (init?.method ?? "GET") === "GET") {
+          return new Response("{}", {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url === "/__audora_rpc") {
+          const body = init?.body ? (JSON.parse(String(init.body)) as { op?: string }) : {};
+          if (body.op === "upsert_note") {
+            noteRpcCalls += 1;
+            if (rpcMode === "fail400") {
+              return new Response(JSON.stringify({ ok: false }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+            if (rpcMode === "hang") {
+              return new Promise<Response>((resolve) => {
+                setReleaseInFlight(resolve);
+              });
+            }
+          }
+          return new Response(JSON.stringify({ ok: true }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("{}", { status: 404 });
+      }),
+    );
+
+    const rpcClient = new AudoraIpcClient(true);
+    await rpcClient.ensureHydratedFromNative();
+    const m = rpcClient.openMediaPath("/tmp/Live.mp3", { size: 1000, durationMs: 10_000 });
+    await rpcClient.generateDiagnosticReportNative(); // flushes openMediaPath RPCs
+
+    // 4xx HTTP status skips retry (exactly 1 attempt)
+    rpcMode = "fail400";
+    noteRpcCalls = 0;
+    await expect(
+      rpcClient.saveNoteVerified({
+        mode: "create",
+        media_id: m.id,
+        position_ms: 1_000,
+        is_quick_marker: false,
+        body: "Test 400 note",
+      }),
+    ).rejects.toMatchObject({ code: "AV-401" });
+    expect(noteRpcCalls).toBe(1);
+
+    // inFlightRpcEntry stays visible to __AUDORA_COLLECT_QUIT_BATCH__ until settled and settles drained promises false
+    rpcMode = "hang";
+    const pendingNotePromise = rpcClient.saveNoteVerified({
+      mode: "create",
+      media_id: m.id,
+      position_ms: 2_000,
+      is_quick_marker: false,
+      body: "In-flight quit flush note",
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    const quitWin = globalThis.window as unknown as {
+      __AUDORA_COLLECT_QUIT_BATCH__?: () => string;
+    };
+    const exitBatch = JSON.parse(quitWin.__AUDORA_COLLECT_QUIT_BATCH__!()) as Array<{
+      op?: string;
+    }>;
+    expect(exitBatch.some((op) => op.op === "upsert_note")).toBe(true);
+    await expect(pendingNotePromise).rejects.toMatchObject({ code: "AV-401" });
+    if (releaseInFlight) {
+      (releaseInFlight as (res: Response) => void)(
+        new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+  });
 });

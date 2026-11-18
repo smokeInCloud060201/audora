@@ -1,4 +1,4 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 
 const FOCUSABLE_SELECTOR = [
   'a[href]:not([tabindex="-1"])',
@@ -18,9 +18,16 @@ export function useModalFocusTrap(
   containerRef: RefObject<HTMLElement | null>,
   initialFocusRef?: RefObject<HTMLElement | null>,
 ): void {
+  const restoreRafRef = useRef<number | null>(null);
+
   useEffect(() => {
     if (!isOpen || typeof document === "undefined") {
       return undefined;
+    }
+
+    if (restoreRafRef.current !== null) {
+      window.cancelAnimationFrame(restoreRafRef.current);
+      restoreRafRef.current = null;
     }
 
     const previouslyFocused =
@@ -80,11 +87,16 @@ export function useModalFocusTrap(
       window.cancelAnimationFrame(raf);
       document.removeEventListener("keydown", onKeyDown, true);
       if (previouslyFocused && document.contains(previouslyFocused)) {
-        try {
-          previouslyFocused.focus();
-        } catch {
-          // Ignore focus restore errors on unmounted triggers
-        }
+        restoreRafRef.current = window.requestAnimationFrame(() => {
+          restoreRafRef.current = null;
+          if (document.contains(previouslyFocused)) {
+            try {
+              previouslyFocused.focus();
+            } catch {
+              // Ignore focus restore errors on unmounted triggers
+            }
+          }
+        });
       }
     };
   }, [isOpen, containerRef, initialFocusRef]);

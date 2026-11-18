@@ -636,11 +636,12 @@ function audoraLocalDevBridge(): Plugin {
           const validHost = /^(127\.0\.0\.1|localhost)(:\d+)?$/i.test(host);
           const secFetchSite = String(req.headers["sec-fetch-site"] ?? "").toLowerCase();
           const origin = String(req.headers.origin ?? "").trim();
+          const expectedOrigin = `http://${host.toLowerCase()}`;
           const crossSite =
             !validHost ||
             (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") ||
             origin.toLowerCase() === "null" ||
-            (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin));
+            (origin && origin.toLowerCase() !== expectedOrigin);
           if (crossSite) {
             res.statusCode = 403;
             res.setHeader("Content-Type", "application/json; charset=utf-8");

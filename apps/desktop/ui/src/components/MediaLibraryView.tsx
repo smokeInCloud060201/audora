@@ -15,6 +15,7 @@ import {
   formatDurationMs,
   formatHumanDate,
 } from "../utils/format";
+import { focusFirstMenuItem, handlePopupMenuKeyDown } from "../utils/menuKeyboard";
 import { useModalFocusTrap } from "../utils/useModalFocusTrap";
 import {
   IconArrowRight,
@@ -55,6 +56,7 @@ interface MediaLibraryViewProps {
   onClearMissingTarget: () => void;
   timestampPrecision: TimestampPrecision;
   onModalOpenChange?: (open: boolean) => void;
+  onMediaRemoved?: (mediaId: string) => void;
 }
 
 export const MediaLibraryView = React.memo(function MediaLibraryView({
@@ -87,11 +89,19 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
   onClearMissingTarget,
   timestampPrecision,
   onModalOpenChange,
+  onMediaRemoved,
 }: MediaLibraryViewProps): React.ReactElement {
   const [pendingRemoveItem, setPendingRemoveItem] = useState<MediaItem | null>(null);
   const removeDialogRef = useRef<HTMLDivElement | null>(null);
   const cancelRemoveBtnRef = useRef<HTMLButtonElement | null>(null);
+  const menuTriggerRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const activeMenuRef = useRef<HTMLDivElement | null>(null);
   useModalFocusTrap(Boolean(pendingRemoveItem), removeDialogRef, cancelRemoveBtnRef);
+
+  useEffect(() => {
+    if (!openLibraryMenuId) return;
+    focusFirstMenuItem(activeMenuRef.current);
+  }, [openLibraryMenuId]);
 
   useEffect(() => {
     const isOpen = Boolean(pendingRemoveItem);
@@ -121,6 +131,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
     if (missingMediaTarget?.id === targetId) {
       onClearMissingTarget();
     }
+    onMediaRemoved?.(targetId);
     onUpdateSnapshot(ipcClient.getPlaybackSnapshot());
     onBumpLibraryVersion();
   };
@@ -549,6 +560,13 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                             }}
                           >
                             <button
+                              ref={(el) => {
+                                if (el) {
+                                  menuTriggerRefs.current.set(item.id, el);
+                                } else {
+                                  menuTriggerRefs.current.delete(item.id);
+                                }
+                              }}
                               type="button"
                               className="jump-link-btn"
                               aria-label={`Actions for ${item.display_name}`}
@@ -570,11 +588,19 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                             </button>
                             {isMenuOpen && (
                               <div
+                                ref={activeMenuRef}
                                 role="menu"
                                 aria-label={`Actions for ${item.display_name}`}
                                 className={`media-row-menu ${
                                   libraryMenuPlacement === "up" ? "open-up" : "open-down"
                                 }`}
+                                onKeyDown={(e) =>
+                                  handlePopupMenuKeyDown(
+                                    e,
+                                    () => onSetOpenLibraryMenuId(null),
+                                    menuTriggerRefs.current.get(item.id),
+                                  )
+                                }
                               >
                                 <button
                                   type="button"
@@ -591,6 +617,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                   onClick={() => {
                                     onUpdateSnapshot(ipcClient.addToQueue(item.id));
                                     onSetOpenLibraryMenuId(null);
+                                    menuTriggerRefs.current.get(item.id)?.focus();
                                   }}
                                 >
                                   Add to queue
@@ -600,6 +627,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                   role="menuitem"
                                   className="btn-secondary"
                                   onClick={() => {
+                                    menuTriggerRefs.current.get(item.id)?.focus();
                                     onAddToPlaylist(item);
                                     onSetOpenLibraryMenuId(null);
                                   }}
@@ -614,6 +642,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                     onClick={() => {
                                       ipcClient.markMediaMissing(item.id);
                                       onSetOpenLibraryMenuId(null);
+                                      menuTriggerRefs.current.get(item.id)?.focus();
                                       onUpdateSnapshot(ipcClient.getPlaybackSnapshot());
                                       onBumpLibraryVersion();
                                     }}
@@ -626,6 +655,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                   role="menuitem"
                                   className="btn-secondary"
                                   onClick={() => {
+                                    menuTriggerRefs.current.get(item.id)?.focus();
                                     onSetOpenLibraryMenuId(null);
                                     setPendingRemoveItem(item);
                                   }}

@@ -37,7 +37,8 @@
     ],
     "icon": [
       "../../../assets/icons/32x32.png",
-      "../../../assets/icons/icon.png"
+      "../../../assets/icons/icon.png",
+      "../../../assets/icons/icon.ico"
     ],
     "licenseFile": "../../../LICENSE",
     "copyright": "Copyright (c) 2026 Audora Contributors",
@@ -63,6 +64,7 @@
     },
     "linux": {
       "deb": {
+        "postRemoveScript": "./installer/linux/postrm",
         "files": {
           "/usr/share/audora/postrm": "./installer/linux/postrm"
         }

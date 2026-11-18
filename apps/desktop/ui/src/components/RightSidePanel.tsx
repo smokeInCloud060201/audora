@@ -33,7 +33,7 @@ interface RightSidePanelProps {
   onOpenEditNoteModal: (note: Note) => void;
   onDeleteNote: (noteId: string) => void;
   onJumpToNote: (noteId: string) => void;
-  onSelectLibraryItem: (item: MediaItem) => void;
+  onSelectLibraryItem: (item: MediaItem, autoPlay?: boolean) => void;
   onOpenSaveQueueModal: () => void;
   onCycleRepeatMode: () => void;
   onCollapse: () => void;
@@ -220,6 +220,7 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                           type="button"
                           className="jump-link-btn"
                           aria-label={`More actions for note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
+                          aria-haspopup="menu"
                           aria-expanded={openNoteMenuId === note.id}
                           onClick={(e) => {
                             const rect = e.currentTarget.getBoundingClientRect();
@@ -237,12 +238,15 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                         </button>
                         {openNoteMenuId === note.id && (
                           <div
+                            role="menu"
+                            aria-label={`Actions for note at ${formatDurationMs(note.position_ms, timestampPrecision)}`}
                             className={`note-row-menu ${
                               noteMenuPlacement === "up" ? "open-up" : "open-down"
                             }`}
                           >
                             <button
                               type="button"
+                              role="menuitem"
                               className="btn-secondary"
                               onClick={() => onOpenEditNoteModal(note)}
                             >
@@ -250,6 +254,7 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                             </button>
                             <button
                               type="button"
+                              role="menuitem"
                               className="btn-secondary"
                               onClick={() => onDeleteNote(note.id)}
                             >
@@ -374,7 +379,7 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                   >
                     <button
                       type="button"
-                      onClick={() => onSelectLibraryItem(qItem)}
+                      onClick={() => onSelectLibraryItem(qItem, true)}
                       style={{
                         border: "none",
                         background: "transparent",
@@ -411,6 +416,7 @@ export const RightSidePanel = React.memo(function RightSidePanel({
                         <span className="tabular-nums">
                           {formatDurationMs(qItem.duration_ms, timestampPrecision)}
                         </span>
+                        {qItem.availability === "missing" ? " · Missing" : ""}
                       </div>
                     </button>
                     <button

@@ -6,7 +6,9 @@ import {
 } from "../api/ipc";
 import {
   computeProgressPercent,
+  formatAriaProgress,
   formatAriaTimestamp,
+  formatDurationMs,
   formatHumanDate,
   formatTimestamp,
   shouldSuppressGlobalShortcut,
@@ -18,8 +20,22 @@ describe("formatTimestamp", () => {
     expect(formatTimestamp(864_000, "nearest_second")).toBe("14:24");
     expect(formatTimestamp(4_328_000, "nearest_second")).toBe("1:12:08");
     expect(formatTimestamp(3_425, "milliseconds")).toBe("00:03.425");
+    expect(formatTimestamp(null)).toBe("00:00");
     expect(formatTimestamp(Number.POSITIVE_INFINITY, "nearest_second")).toBe("00:00");
     expect(formatTimestamp(Number.NaN, "milliseconds")).toBe("00:00");
+  });
+
+  it("formats unknown total durations as --:-- in formatDurationMs and builds spoken progress in formatAriaProgress", () => {
+    expect(formatDurationMs(null)).toBe("--:--");
+    expect(formatDurationMs(undefined)).toBe("--:--");
+    expect(formatDurationMs(Number.NaN)).toBe("--:--");
+    expect(formatDurationMs(0)).toBe("00:00");
+    expect(formatDurationMs(222_000, "nearest_second")).toBe("03:42");
+
+    expect(formatAriaProgress(864_000, 2_892_000)).toBe(
+      "14 minutes 24 seconds of 48 minutes 12 seconds",
+    );
+    expect(formatAriaProgress(15_000, null)).toBe("15 seconds");
   });
 });
 
@@ -55,6 +71,9 @@ describe("shouldSuppressGlobalShortcut", () => {
     expect(shouldSuppressGlobalShortcut("INPUT", false, false)).toBe(true);
     expect(shouldSuppressGlobalShortcut("INPUT", false, false, "text")).toBe(true);
     expect(shouldSuppressGlobalShortcut("INPUT", false, false, "range")).toBe(false);
+    expect(shouldSuppressGlobalShortcut("INPUT", false, false, "checkbox")).toBe(false);
+    expect(shouldSuppressGlobalShortcut("INPUT", false, false, "radio")).toBe(false);
+    expect(shouldSuppressGlobalShortcut("INPUT", false, false, "button")).toBe(false);
     expect(shouldSuppressGlobalShortcut("INPUT", false, true, "range")).toBe(true);
     expect(shouldSuppressGlobalShortcut("DIV", false, true)).toBe(true);
     expect(shouldSuppressGlobalShortcut("BUTTON", false, false)).toBe(false);

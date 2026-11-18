@@ -373,17 +373,17 @@ fn run_command_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
-    let stdout_handle = child.stdout.take().map(|mut out| {
+    let stdout_handle = child.stdout.take().map(|out| {
         thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
+            let _ = out.take(1_048_576).read_to_end(&mut buf);
             buf
         })
     });
-    let stderr_handle = child.stderr.take().map(|mut err| {
+    let stderr_handle = child.stderr.take().map(|err| {
         thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = err.read_to_end(&mut buf);
+            let _ = err.take(1_048_576).read_to_end(&mut buf);
             buf
         })
     });
@@ -710,7 +710,6 @@ fn skip_id3v2_tags(file: &mut File, file_len: u64) -> u64 {
             .saturating_add(tag_sz)
             .saturating_add(footer);
         if next <= offset || next >= file_len {
-            offset = next;
             break;
         }
         offset = next;
@@ -1120,7 +1119,7 @@ fn probe_ebml_ms(file: &mut File, file_len: u64) -> Option<u64> {
                     }
                     return None;
                 }
-                if cid == 0x1F43_B675 || cunk {
+                if cunk {
                     break;
                 }
                 spos = cstart.saturating_add(csz);

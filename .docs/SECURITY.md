@@ -22,12 +22,13 @@ Protect against malicious or malformed media files, crafted metadata/subtitles, 
 - Opening a file is an explicit user action. No background recursive scan by default.
 - Keep decoder and plugin versions current; isolate playback in a subprocess only if threat/risk assessment justifies the complexity and the design is reviewed.
 
-### Tauri/webview boundary
+### Native shell, WebView, and loopback boundary
 
-- Define least-privilege Tauri capabilities per window. Disable broad filesystem, shell, and HTTP plugins unless a documented feature requires them.
-- Use a restrictive Content Security Policy; do not load remote scripts or remote UI content.
-- Validate every command payload in Rust, including bounds and identifier ownership. Never trust frontend validation alone.
-- Prevent navigation to untrusted origins; external links open through an explicit OS handoff.
+- Expose only narrow, explicitly validated IPC commands and loopback endpoints ([ADR 0004](adr/0004-native-webview-loopback-architecture.md)); never grant unrestricted filesystem, shell, or arbitrary network access to the WebView.
+- Authenticate every loopback HTTP request (`127.0.0.1:<port>`) with a per-launch 256-bit CSPRNG `X-Audora-Token` using constant-time comparison, validate the `Host` header to block DNS rebinding, cap request body sizes, and restrict `/__audora_media` byte-range streaming to canonical paths registered in `MediaAllowlist`.
+- Enforce a strict non-wildcard Content Security Policy (`default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'`); never load remote scripts or remote UI content.
+- Validate every RPC payload in Rust (`audora-core` + `audora-desktop`), including text length bounds, finite numeric ranges, timestamp validity, and local path safety (rejecting remote URLs and UNC/WebDAV network shares with `AV-301`). Never trust frontend validation alone.
+- Prevent navigation to untrusted origins; external documentation/release links open through an explicit `https://`-only OS handoff.
 - Keep IPC payloads small and avoid returning raw secrets, full filesystem inventories, or unnecessary media metadata.
 
 ### Data and logging

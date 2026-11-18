@@ -112,6 +112,61 @@ pub fn current_iso8601_utc() -> String {
     format_unix_ms_iso8601(millis)
 }
 
+fn is_valid_utc_iso8601(s: &str) -> bool {
+    if !s.is_ascii() || !(20..=30).contains(&s.len()) {
+        return false;
+    }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return false;
+    }
+    let Ok(year) = s[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = s[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = s[8..10].parse::<u32>() else {
+        return false;
+    };
+    let Ok(hour) = s[11..13].parse::<u32>() else {
+        return false;
+    };
+    let Ok(minute) = s[14..16].parse::<u32>() else {
+        return false;
+    };
+    let Ok(second) = s[17..19].parse::<u32>() else {
+        return false;
+    };
+    if !(1..=12).contains(&month) || day == 0 || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+    let is_leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    if day > max_day {
+        return false;
+    }
+    let rest = &s[19..];
+    if rest == "Z" {
+        return true;
+    }
+    if let Some(frac) = rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z')) {
+        return !frac.is_empty() && frac.len() <= 9 && frac.bytes().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
 /// Normalizes persisted timestamp strings (`""`, `"Just now"`, `"Yesterday"`, or raw epoch seconds)
 /// into sortable UTC ISO-8601 strings so SQLite `ORDER BY ... DESC` is always chronological (`H-3`).
 #[must_use]
@@ -137,21 +192,36 @@ pub fn normalize_persisted_timestamp(raw: &str, fallback_iso: &str) -> String {
             return format_unix_ms_iso8601(ms);
         }
     }
-    if trimmed.len() >= 10
-        && trimmed.as_bytes().get(4) == Some(&b'-')
-        && trimmed.as_bytes().get(7) == Some(&b'-')
-    {
+    if is_valid_utc_iso8601(trimmed) {
         return trimmed.to_owned();
     }
     fallback_iso.to_owned()
 }
 
+fn has_forbidden_unc_webdav_segment(unc_tail: &str) -> bool {
+    let mut segments = unc_tail.split(['\\', '/']).filter(|s| !s.is_empty());
+    let Some(server) = segments.next() else {
+        return true;
+    };
+    let server_lower = server.to_ascii_lowercase();
+    if server.contains('@') || server.contains(':') || server_lower.contains("davwwwroot") {
+        return true;
+    }
+    if let Some(share) = segments.next() {
+        let share_lower = share.to_ascii_lowercase();
+        if share.contains('@') || share.contains(':') || share_lower.contains("davwwwroot") {
+            return true;
+        }
+    }
+    segments.any(|seg| seg.eq_ignore_ascii_case("davwwwroot"))
+}
+
 /// Validates a local media or folder path against empty strings, control characters, and remote schemes (`H-6`).
 pub fn validate_local_media_path_str(raw_path: &str) -> AppResult<&str> {
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
+    if raw_path.trim().is_empty() {
         return Err(AppError::validation("Media file path must not be empty"));
     }
+    let trimmed = raw_path.trim_start().trim_end_matches(['\r', '\n']);
     if trimmed.chars().any(char::is_control) {
         return Err(AppError::validation(
             "Media file path contains invalid control characters",
@@ -160,11 +230,47 @@ pub fn validate_local_media_path_str(raw_path: &str) -> AppResult<&str> {
     let lower = trimmed.to_ascii_lowercase();
     for forbidden_scheme in [
         "http://", "https://", "rtsp://", "rtsps://", "ftp://", "sftp://", "ws://", "wss://",
-        "mms://",
+        "mms://", "smb://", "dav://", "davs://", "nfs://", "afp://", "file://",
     ] {
         if lower.starts_with(forbidden_scheme) {
             return Err(AppError::validation(
                 "Audora only opens local files on your device; remote network URLs are not permitted.",
+            ));
+        }
+    }
+    if lower.starts_with(r"\\?\unc\") || lower.starts_with(r"\\.\unc\") {
+        if has_forbidden_unc_webdav_segment(&trimmed[8..]) {
+            return Err(AppError::validation(
+                "Remote WebDAV or port-qualified UNC network paths are not permitted.",
+            ));
+        }
+    } else if trimmed.starts_with(r"\\?\") || trimmed.starts_with(r"\\.\") {
+        let rest = &trimmed[4..];
+        let is_drive_letter = rest.len() >= 2
+            && rest.as_bytes()[0].is_ascii_alphabetic()
+            && rest.as_bytes()[1] == b':';
+        if !is_drive_letter && has_forbidden_unc_webdav_segment(rest) {
+            return Err(AppError::validation(
+                "Remote WebDAV or port-qualified UNC network paths are not permitted.",
+            ));
+        }
+    } else if trimmed.starts_with(r"\\") {
+        let tail = trimmed.trim_start_matches('\\');
+        if has_forbidden_unc_webdav_segment(tail) {
+            return Err(AppError::validation(
+                "Remote WebDAV or port-qualified UNC network paths are not permitted.",
+            ));
+        }
+    } else if let Some(tail) = trimmed.strip_prefix("//") {
+        let mut segs = tail.split(['/', '\\']).filter(|s| !s.is_empty());
+        let first_two_webdav = [segs.next(), segs.next()].into_iter().flatten().any(|seg| {
+            seg.contains('@')
+                || seg.contains(':')
+                || seg.to_ascii_lowercase().contains("davwwwroot")
+        });
+        if first_two_webdav {
+            return Err(AppError::validation(
+                "Remote WebDAV or port-qualified network paths are not permitted.",
             ));
         }
     }

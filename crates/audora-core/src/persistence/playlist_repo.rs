@@ -129,17 +129,34 @@ impl PlaylistRepository for SqlitePlaylistRepository {
             })?;
 
             let mut playlists = Vec::new();
+            let mut index_by_id = std::collections::HashMap::new();
             for r in rows {
                 let (pid, name, description, created_at, updated_at) = r?;
-                let item_ids = load_playlist_items(conn, &pid)?;
+                index_by_id.insert(pid.clone(), playlists.len());
                 playlists.push(Playlist {
                     id: pid,
                     name,
                     description,
-                    item_ids,
+                    item_ids: Vec::new(),
                     created_at,
                     updated_at,
                 });
+            }
+            if !playlists.is_empty() {
+                let mut item_stmt = conn.prepare(
+                    "SELECT playlist_id, media_id
+                     FROM playlist_items
+                     ORDER BY playlist_id ASC, position ASC",
+                )?;
+                let item_rows = item_stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for ir in item_rows {
+                    let (pid, mid) = ir?;
+                    if let Some(&idx) = index_by_id.get(&pid) {
+                        playlists[idx].item_ids.push(mid);
+                    }
+                }
             }
             Ok(playlists)
         })
@@ -241,7 +258,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
             )?;
             let remaining = load_playlist_items(&tx, playlist_id)?;
             for (idx, mid) in remaining.iter().enumerate() {
-                let pos = i64::try_from(idx).unwrap_or(0);
+                let pos = i64::try_from(idx).unwrap_or(i64::MAX);
                 tx.execute(
                     "UPDATE playlist_items SET position = ?1 WHERE playlist_id = ?2 AND media_id = ?3",
                     params![pos, playlist_id, mid],
@@ -272,7 +289,7 @@ impl PlaylistRepository for SqlitePlaylistRepository {
                 let dest = target_index.min(current.len());
                 current.insert(dest, item);
                 for (idx, mid) in current.iter().enumerate() {
-                    let pos = i64::try_from(idx).unwrap_or(0);
+                    let pos = i64::try_from(idx).unwrap_or(i64::MAX);
                     tx.execute(
                         "UPDATE playlist_items SET position = ?1 WHERE playlist_id = ?2 AND media_id = ?3",
                         params![pos, playlist_id, mid],

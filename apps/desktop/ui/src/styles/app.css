@@ -1436,6 +1436,11 @@
   margin: 0;
 }
 
+.minimum-scrubber:focus-visible {
+  outline: 2px solid var(--min-accent);
+  outline-offset: 3px;
+}
+
 .minimum-scrubber::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
@@ -1610,6 +1615,12 @@
   cursor: pointer;
   z-index: 2;
   padding: 0;
+}
+
+.scrubber-note-marker::before {
+  content: "";
+  position: absolute;
+  inset: -9px;
 }
 
 .scrubber-note-marker:hover {
@@ -2027,16 +2038,5 @@
   .content-page {
     padding-top: 24px;
     padding-bottom: 20px;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
   }
 }

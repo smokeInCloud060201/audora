@@ -2,10 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Required for WebKit / Wry WebView JIT and helper processes under macOS Hardened Runtime -->
-  <key>com.apple.security.cs.allow-jit</key>
-  <true/>
-  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-  <true/>
+  <!-- macOS Hardened Runtime: WKWebView JIT executes inside Apple's signed WebContent XPC process; host binary needs no JIT/unsigned-memory exemptions -->
 </dict>
 </plist>

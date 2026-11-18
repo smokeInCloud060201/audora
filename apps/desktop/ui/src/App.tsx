@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ipcClient } from "./api/ipc";
+import { ipcClient, type NativeDroppedEntry } from "./api/ipc";
 import { AddToPlaylistModal } from "./components/AddToPlaylistModal";
 import { AudoraLogo } from "./components/AudoraLogo";
 import {
@@ -43,7 +43,7 @@ import type {
   TrustedSourceFolder,
 } from "./types/domain";
 import {
-  formatAriaTimestamp,
+  formatAriaProgress,
   formatDurationMs,
   shouldSuppressGlobalShortcut,
 } from "./utils/format";
@@ -90,6 +90,7 @@ export function App(): React.ReactElement {
     mediaId: string;
     newPath: string;
     probedDurationMs?: number;
+    fileSizeBytes?: number;
     payload: AppErrorPayload;
   } | null>(null);
 
@@ -122,6 +123,9 @@ export function App(): React.ReactElement {
   const [isPickingSourceFolder, setIsPickingSourceFolder] = useState<boolean>(false);
   const [sourceFolderError, setSourceFolderError] = useState<string | null>(null);
   const [rescanningFolderId, setRescanningFolderId] = useState<string | null>(null);
+  const [isPlaylistsModalOpen, setIsPlaylistsModalOpen] = useState<boolean>(false);
+  const [isLibraryModalOpen, setIsLibraryModalOpen] = useState<boolean>(false);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState<boolean>(false);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -132,16 +136,51 @@ export function App(): React.ReactElement {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaElementRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
 
+  const updateToastTimerRef = useRef<number | null>(null);
+  const deletedNoteToastTimerRef = useRef<number | null>(null);
+  const deletedPlaylistToastTimerRef = useRef<number | null>(null);
+
   const userNavigatedRef = useRef<boolean>(false);
   const seekGenerationRef = useRef<number>(0);
   const appliedSeekGenRef = useRef<number>(0);
   const isPointerScrubbingRef = useRef<boolean>(false);
+  const scrubPreviewMsRef = useRef<number | null>(null);
   const lastLiveSeekMsRef = useRef<number>(0);
+  const [isPointerScrubbing, setIsPointerScrubbing] = useState<boolean>(false);
   const [scrubPreviewMs, setScrubPreviewMs] = useState<number | null>(null);
 
   useModalFocusTrap(isNoteModalOpen, noteDialogRef, noteTextareaRef);
   useModalFocusTrap(Boolean(pendingMismatchRelink), mismatchDialogRef);
   useModalFocusTrap(isSaveQueueModalOpen, saveQueueDialogRef, saveQueueInputRef);
+
+  const showTransientUpdateToast = useCallback((message: string) => {
+    if (updateToastTimerRef.current !== null) {
+      window.clearTimeout(updateToastTimerRef.current);
+    }
+    setUpdateToastMessage(message);
+    updateToastTimerRef.current = window.setTimeout(() => {
+      updateToastTimerRef.current = null;
+      setUpdateToastMessage(null);
+    }, 5_000);
+  }, []);
+
+  useEffect(() => {
+    ipcClient.onPersistenceError = (err) => {
+      showTransientUpdateToast(`${err.title} (${err.code}): ${err.message}`);
+    };
+    return () => {
+      ipcClient.onPersistenceError = undefined;
+      if (updateToastTimerRef.current !== null) {
+        window.clearTimeout(updateToastTimerRef.current);
+      }
+      if (deletedNoteToastTimerRef.current !== null) {
+        window.clearTimeout(deletedNoteToastTimerRef.current);
+      }
+      if (deletedPlaylistToastTimerRef.current !== null) {
+        window.clearTimeout(deletedPlaylistToastTimerRef.current);
+      }
+    };
+  }, [showTransientUpdateToast]);
 
   const navigateSection = useCallback((target: PrimarySection) => {
     userNavigatedRef.current = true;
@@ -154,6 +193,7 @@ export function App(): React.ReactElement {
 
   const handleScrubPointerDown = useCallback(() => {
     isPointerScrubbingRef.current = true;
+    setIsPointerScrubbing(true);
   }, []);
 
   const handleScrubChange = useCallback(
@@ -163,6 +203,7 @@ export function App(): React.ReactElement {
         snapshot.duration_ms != null ? Math.min(nextPosMs, snapshot.duration_ms) : nextPosMs,
       );
       if (isPointerScrubbingRef.current) {
+        scrubPreviewMsRef.current = clamped;
         setScrubPreviewMs(clamped);
         const now = Date.now();
         if (now - lastLiveSeekMsRef.current >= 120) {
@@ -178,6 +219,7 @@ export function App(): React.ReactElement {
         }
         return;
       }
+      scrubPreviewMsRef.current = null;
       setScrubPreviewMs(null);
       bumpExplicitSeek();
       setSnapshot(ipcClient.playbackCommand({ action: "seek", position_ms: clamped }));
@@ -187,17 +229,54 @@ export function App(): React.ReactElement {
 
   const handleScrubCommit = useCallback(
     (finalPosMs: number) => {
-      if (!isPointerScrubbingRef.current && scrubPreviewMs === null) {
+      if (!isPointerScrubbingRef.current && scrubPreviewMsRef.current === null && scrubPreviewMs === null) {
         return;
       }
       isPointerScrubbingRef.current = false;
-      const targetPos = scrubPreviewMs ?? finalPosMs;
+      setIsPointerScrubbing(false);
+      const targetPos = scrubPreviewMsRef.current ?? scrubPreviewMs ?? finalPosMs;
+      scrubPreviewMsRef.current = null;
       setScrubPreviewMs(null);
       bumpExplicitSeek();
       setSnapshot(ipcClient.playbackCommand({ action: "seek", position_ms: targetPos }));
     },
     [scrubPreviewMs, bumpExplicitSeek],
   );
+
+  useEffect(() => {
+    if (!isPointerScrubbing || typeof window === "undefined") {
+      return undefined;
+    }
+    const releaseGlobalScrub = () => {
+      if (!isPointerScrubbingRef.current) return;
+      isPointerScrubbingRef.current = false;
+      setIsPointerScrubbing(false);
+      const pendingPos = scrubPreviewMsRef.current;
+      scrubPreviewMsRef.current = null;
+      setScrubPreviewMs(null);
+      if (pendingPos !== null && ipcClient.getPlaybackSnapshot().media_id) {
+        bumpExplicitSeek();
+        setSnapshot(ipcClient.playbackCommand({ action: "seek", position_ms: pendingPos }));
+      }
+    };
+    window.addEventListener("pointerup", releaseGlobalScrub);
+    window.addEventListener("pointercancel", releaseGlobalScrub);
+    window.addEventListener("blur", releaseGlobalScrub);
+    return () => {
+      window.removeEventListener("pointerup", releaseGlobalScrub);
+      window.removeEventListener("pointercancel", releaseGlobalScrub);
+      window.removeEventListener("blur", releaseGlobalScrub);
+    };
+  }, [isPointerScrubbing, bumpExplicitSeek]);
+
+  useEffect(() => {
+    if (!snapshot.media_id && (isPointerScrubbingRef.current || scrubPreviewMsRef.current !== null)) {
+      isPointerScrubbingRef.current = false;
+      scrubPreviewMsRef.current = null;
+      setIsPointerScrubbing(false);
+      setScrubPreviewMs(null);
+    }
+  }, [snapshot.media_id]);
 
   // Hydrate persisted native state IMMEDIATELY (`C-6`), then sync enabled folders & probe container durations in background
   useEffect(() => {
@@ -243,22 +322,38 @@ export function App(): React.ReactElement {
     };
   }, []);
 
-  // Subscribe to native `wry` OS drag-and-drop hooks (`H-9`)
+  // Subscribe to native `wry` OS drag-and-drop hooks (`H-9`, `C-1`)
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const win = window as Window & {
       __AUDORA_ON_DRAG_STATE__?: (dragging: boolean) => void;
-      __AUDORA_ON_NATIVE_DROP__?: (paths: string[]) => void;
+      __AUDORA_ON_NATIVE_DROP__?: (entries: Array<string | NativeDroppedEntry>) => void;
+    };
+    const extractFirstDropFileName = (
+      first: string | NativeDroppedEntry | undefined,
+    ): string => {
+      if (typeof first === "string") {
+        return first.split(/[\\/]/).pop() || "Unknown file";
+      }
+      if (first && typeof first === "object") {
+        if (typeof first.name === "string" && first.name.trim()) {
+          return first.name.trim();
+        }
+        if (typeof first.path === "string" && first.path.trim()) {
+          return first.path.split(/[\\/]/).pop() || "Unknown file";
+        }
+      }
+      return "Unknown file";
     };
     win.__AUDORA_ON_DRAG_STATE__ = (dragging: boolean) => {
       setIsDraggingFiles(Boolean(dragging));
     };
-    win.__AUDORA_ON_NATIVE_DROP__ = (paths: string[]) => {
+    win.__AUDORA_ON_NATIVE_DROP__ = (entries: Array<string | NativeDroppedEntry>) => {
       setIsDraggingFiles(false);
-      if (!Array.isArray(paths) || paths.length === 0) return;
+      if (!Array.isArray(entries) || entries.length === 0) return;
       void (async () => {
         try {
-          const res = await ipcClient.ingestNativeDroppedPaths(paths);
+          const res = await ipcClient.ingestNativeDroppedPaths(entries);
           if (res.openedItems.length > 0 || res.importedFolderCount > 0) {
             setUnsupportedError(null);
             setMissingMediaTarget(null);
@@ -269,11 +364,17 @@ export function App(): React.ReactElement {
             setSection("now_playing");
           }
         } catch (err) {
-          const payload = err as AppErrorPayload;
-          if (payload.code === "AV-104") {
-            const rawFirst = paths[0]?.split(/[\\/]/).pop() ?? "Unknown file";
-            setUnsupportedError({ fileName: rawFirst, payload });
-            setSection("now_playing");
+          if (err && typeof err === "object" && "code" in err) {
+            const payload = err as AppErrorPayload & { firstFileName?: string };
+            if (payload.code === "AV-104" || payload.code === "AV-103") {
+              const fileName = payload.firstFileName ?? extractFirstDropFileName(entries[0]);
+              setUnsupportedError({ fileName, payload });
+              setSection("now_playing");
+            } else {
+              showTransientUpdateToast(payload.message || "Unable to open dropped media.");
+            }
+          } else {
+            console.error("Unexpected error handling native OS file drop:", err);
           }
         }
       })();
@@ -282,7 +383,7 @@ export function App(): React.ReactElement {
       delete win.__AUDORA_ON_DRAG_STATE__;
       delete win.__AUDORA_ON_NATIVE_DROP__;
     };
-  }, [bumpExplicitSeek]);
+  }, [bumpExplicitSeek, showTransientUpdateToast]);
 
   // Apply Dark / Light / System theme tokens to `<html data-theme="...">`
   useEffect(() => {
@@ -514,15 +615,19 @@ export function App(): React.ReactElement {
       addToPlaylistTarget ||
       isSaveQueueModalOpen ||
       isUpdateDialogOpen ||
+      isPlaylistsModalOpen ||
+      isLibraryModalOpen ||
+      isSettingsModalOpen ||
       (typeof document !== "undefined" && document.querySelector('[role="dialog"]')),
   );
 
   const shortcutHandlerRef = useRef<(e: KeyboardEvent) => void>(() => {});
   shortcutHandlerRef.current = (e: KeyboardEvent) => {
+    if (e.defaultPrevented) return;
     const target = e.target as HTMLElement | null;
     const inputType = target instanceof HTMLInputElement ? target.type : null;
 
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
       if (isAnyModalOpen) return;
       e.preventDefault();
       if (settings.window_mode === "minimum") {
@@ -533,7 +638,7 @@ export function App(): React.ReactElement {
       return;
     }
 
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "o") {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "o") {
       if (isAnyModalOpen) return;
       e.preventDefault();
       triggerOpenMediaPicker();
@@ -590,17 +695,53 @@ export function App(): React.ReactElement {
       return;
     }
 
+    if (e.metaKey || e.ctrlKey || e.altKey) {
+      return;
+    }
+
     if (e.code === "Space") {
+      if (
+        target?.closest(
+          'button, a[href], summary, [role="button"], [role="switch"], [role="checkbox"], [role="tab"], [role="menuitem"], input[type="checkbox"], input[type="radio"], input[type="button"]',
+        )
+      ) {
+        return;
+      }
       e.preventDefault();
       setSnapshot(ipcClient.playbackCommand({ action: "toggle_play_pause" }));
-    } else if (e.key === "ArrowLeft") {
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      if (
+        target instanceof HTMLInputElement &&
+        target.type === "range" &&
+        target.dataset.seekScrubber !== "true"
+      ) {
+        return;
+      }
+      if (target?.closest('[role="tablist"], [role="menu"]')) {
+        return;
+      }
       e.preventDefault();
+      const stepMs = e.shiftKey ? 15_000 : 5_000;
+      const deltaMs = e.key === "ArrowLeft" ? -stepMs : stepMs;
       bumpExplicitSeek();
-      setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: -5000 }));
-    } else if (e.key === "ArrowRight") {
+      setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: deltaMs }));
+    } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      if (
+        (target instanceof HTMLInputElement && target.type === "range") ||
+        target?.closest(
+          '[role="menu"], [role="menuitem"], [role="listbox"], select, .panel-scroll-list, .content-page, .playlist-picker-list',
+        )
+      ) {
+        return;
+      }
       e.preventDefault();
-      bumpExplicitSeek();
-      setSnapshot(ipcClient.playbackCommand({ action: "skip_relative", delta_ms: 5000 }));
+      const deltaVol = e.key === "ArrowUp" ? 0.05 : -0.05;
+      const baseVol = snapshot.muted && deltaVol > 0 ? 0 : snapshot.volume;
+      const nextVol = Math.round(Math.max(0, Math.min(1, baseVol + deltaVol)) * 100) / 100;
+      if (snapshot.muted && nextVol > 0) {
+        ipcClient.playbackCommand({ action: "set_muted", muted: false });
+      }
+      setSnapshot(ipcClient.playbackCommand({ action: "set_volume", volume: nextVol }));
     } else if (e.key.toLowerCase() === "n" && e.shiftKey) {
       e.preventDefault();
       handleCreateQuickMarker();
@@ -641,14 +782,27 @@ export function App(): React.ReactElement {
     return () => window.removeEventListener("mousedown", onPointerDown);
   }, [openLibraryMenuId, openNoteMenuId]);
 
+  const getLivePlayheadMs = (): number => {
+    if (scrubPreviewMs !== null) {
+      return scrubPreviewMs;
+    }
+    const el = mediaElementRef.current;
+    if (el && el.readyState >= 1 && Number.isFinite(el.currentTime) && el.currentTime >= 0) {
+      const liveMs = Math.round(el.currentTime * 1000);
+      return snapshot.duration_ms != null ? Math.min(liveMs, snapshot.duration_ms) : liveMs;
+    }
+    return snapshot.position_ms;
+  };
+
   const openAddNoteModal = () => {
     if (!activeMedia) return;
+    const capturedMs = getLivePlayheadMs();
     if (settings.window_mode === "minimum") {
       setIsMinHelpOpen(false);
       setSettings(ipcClient.setWindowMode("full"));
     }
     setEditingNote(null);
-    setCapturedTimestampMs(snapshot.position_ms);
+    setCapturedTimestampMs(capturedMs);
     setNoteBodyDraft("");
     setIsQuickMarkerDraft(false);
     setNoteModalError(null);
@@ -669,56 +823,76 @@ export function App(): React.ReactElement {
 
   const handleCreateQuickMarker = () => {
     if (!activeMedia) return;
-    ipcClient.createNote({
-      media_id: activeMedia.id,
-      position_ms: snapshot.position_ms,
-      is_quick_marker: true,
-      body: "",
-    });
-    setSideTab("notes");
-    if (!showSidePanel) {
-      setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
-    }
-    setSnapshot(ipcClient.getPlaybackSnapshot());
-    setLibraryVersion((v) => v + 1);
+    const capturedMs = getLivePlayheadMs();
+    void (async () => {
+      try {
+        await ipcClient.saveNoteVerified({
+          mode: "create",
+          media_id: activeMedia.id,
+          position_ms: capturedMs,
+          is_quick_marker: true,
+          body: "",
+        });
+        setSideTab("notes");
+        if (!showSidePanel) {
+          setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
+        }
+        setSnapshot(ipcClient.getPlaybackSnapshot());
+        setLibraryVersion((v) => v + 1);
+        showTransientUpdateToast("Quick marker added");
+      } catch (err) {
+        const payload = err as AppErrorPayload;
+        showTransientUpdateToast(payload.message ?? "Unable to save quick marker.");
+      }
+    })();
   };
 
   const handleSaveNote = () => {
     if (!activeMedia) return;
-    try {
-      if (editingNote) {
-        ipcClient.updateNote({
-          id: editingNote.id,
-          body: noteBodyDraft,
-        });
-      } else {
-        ipcClient.createNote({
-          media_id: activeMedia.id,
-          position_ms: capturedTimestampMs,
-          is_quick_marker: isQuickMarkerDraft,
-          body: noteBodyDraft,
-        });
+    void (async () => {
+      try {
+        const saved = editingNote
+          ? await ipcClient.saveNoteVerified({
+              mode: "update",
+              id: editingNote.id,
+              body: noteBodyDraft,
+            })
+          : await ipcClient.saveNoteVerified({
+              mode: "create",
+              media_id: activeMedia.id,
+              position_ms: capturedTimestampMs,
+              is_quick_marker: isQuickMarkerDraft,
+              body: noteBodyDraft,
+            });
+        setNoteModalError(null);
+        setIsNoteModalOpen(false);
+        setSideTab("notes");
+        if (!showSidePanel) {
+          setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
+        }
+        setSnapshot(ipcClient.getPlaybackSnapshot());
+        setLibraryVersion((v) => v + 1);
+        showTransientUpdateToast(
+          saved.is_quick_marker ? "Quick marker added" : "Note added",
+        );
+      } catch (err) {
+        const payload = err as AppErrorPayload;
+        setNoteModalError(payload.message ?? "Unable to save note.");
       }
-      setIsNoteModalOpen(false);
-      setSideTab("notes");
-      if (!showSidePanel) {
-        setSettings(ipcClient.updateSettings({ ...settings, show_side_panel: true }));
-      }
-      setSnapshot(ipcClient.getPlaybackSnapshot());
-      setLibraryVersion((v) => v + 1);
-    } catch (err) {
-      const payload = err as AppErrorPayload;
-      setNoteModalError(payload.message ?? "Unable to save note.");
-    }
+    })();
   };
 
   const handleDeleteNote = (noteId: string) => {
     const deleted = ipcClient.deleteNote(noteId);
     setOpenNoteMenuId(null);
     if (deleted) {
+      if (deletedNoteToastTimerRef.current !== null) {
+        window.clearTimeout(deletedNoteToastTimerRef.current);
+      }
       setDeletedNoteToast(deleted);
       setLibraryVersion((v) => v + 1);
-      setTimeout(() => {
+      deletedNoteToastTimerRef.current = window.setTimeout(() => {
+        deletedNoteToastTimerRef.current = null;
         setDeletedNoteToast((current) => (current?.id === deleted.id ? null : current));
       }, 6000);
     }
@@ -726,21 +900,33 @@ export function App(): React.ReactElement {
 
   const handleUndoDelete = () => {
     if (!deletedNoteToast) return;
+    if (deletedNoteToastTimerRef.current !== null) {
+      window.clearTimeout(deletedNoteToastTimerRef.current);
+      deletedNoteToastTimerRef.current = null;
+    }
     ipcClient.restoreNote(deletedNoteToast);
     setDeletedNoteToast(null);
     setLibraryVersion((v) => v + 1);
   };
 
   const handlePlaylistDeleted = (deleted: Playlist) => {
+    if (deletedPlaylistToastTimerRef.current !== null) {
+      window.clearTimeout(deletedPlaylistToastTimerRef.current);
+    }
     setDeletedPlaylistToast(deleted);
     setLibraryVersion((v) => v + 1);
-    window.setTimeout(() => {
+    deletedPlaylistToastTimerRef.current = window.setTimeout(() => {
+      deletedPlaylistToastTimerRef.current = null;
       setDeletedPlaylistToast((curr) => (curr?.id === deleted.id ? null : curr));
     }, 6_000);
   };
 
   const handleUndoDeletePlaylist = () => {
     if (!deletedPlaylistToast) return;
+    if (deletedPlaylistToastTimerRef.current !== null) {
+      window.clearTimeout(deletedPlaylistToastTimerRef.current);
+      deletedPlaylistToastTimerRef.current = null;
+    }
     const restored = ipcClient.restorePlaylist(deletedPlaylistToast);
     setDeletedPlaylistToast(null);
     setSelectedPlaylistId(restored.id);
@@ -854,72 +1040,110 @@ export function App(): React.ReactElement {
     if (!["mp4", "m4a", "m4v", "mov"].includes(ext) || typeof file.slice !== "function") {
       return undefined;
     }
+    const readAscii4 = (view: DataView, off: number) =>
+      String.fromCharCode(
+        view.getUint8(off),
+        view.getUint8(off + 1),
+        view.getUint8(off + 2),
+        view.getUint8(off + 3),
+      );
+    const parseMvhdInMoov = (
+      view: DataView,
+      moovStart: number,
+      moovHdrLen: number,
+      moovEnd: number,
+    ): number | undefined => {
+      let cpos = moovStart + moovHdrLen;
+      let guard = 0;
+      while (cpos + 8 <= moovEnd && guard < 512) {
+        guard += 1;
+        const csz32 = view.getUint32(cpos, false);
+        const ctype = readAscii4(view, cpos + 4);
+        let csize = csz32;
+        let chdr = 8;
+        if (csz32 === 1) {
+          if (cpos + 16 > moovEnd) break;
+          csize = Number(view.getBigUint64(cpos + 8, false));
+          chdr = 16;
+        }
+        if (csize < chdr || cpos + csize > moovEnd) break;
+        if (ctype === "mvhd") {
+          const pOff = cpos + chdr;
+          const pLen = csize - chdr;
+          if (pLen >= 20) {
+            const ver = view.getUint8(pOff);
+            let ts = 0n;
+            let dur = 0n;
+            if (ver === 1 && pLen >= 32) {
+              ts = BigInt(view.getUint32(pOff + 20, false));
+              const raw = view.getBigUint64(pOff + 24, false);
+              dur = raw === 0xffffffffffffffffn ? 0n : raw;
+            } else if (ver === 0) {
+              ts = BigInt(view.getUint32(pOff + 12, false));
+              const raw = view.getUint32(pOff + 16, false);
+              dur = raw === 0xffffffff ? 0n : BigInt(raw);
+            }
+            if (ts > 0n && dur > 0n) {
+              const ms = Number((dur * 1000n) / ts);
+              if (Number.isFinite(ms) && ms > 0) return ms;
+            }
+          }
+        }
+        cpos += csize;
+      }
+      return undefined;
+    };
     try {
-      const sliceLen = Math.min(file.size, 131_072);
-      const buf = await file.slice(0, sliceLen).arrayBuffer();
-      const view = new DataView(buf);
-      const readAscii4 = (off: number) =>
-        String.fromCharCode(
-          view.getUint8(off),
-          view.getUint8(off + 1),
-          view.getUint8(off + 2),
-          view.getUint8(off + 3),
-        );
+      const headLen = Math.min(file.size, 131_072);
+      const headBuf = await file.slice(0, headLen).arrayBuffer();
+      const headView = new DataView(headBuf);
       let pos = 0;
-      while (pos + 8 <= view.byteLength) {
-        const sz32 = view.getUint32(pos, false);
-        const btype = readAscii4(pos + 4);
+      while (pos + 8 <= headView.byteLength) {
+        const sz32 = headView.getUint32(pos, false);
+        const btype = readAscii4(headView, pos + 4);
         let bsize = sz32;
         let hdrLen = 8;
         if (sz32 === 1) {
-          if (pos + 16 > view.byteLength) break;
-          bsize = Number(view.getBigUint64(pos + 8, false));
+          if (pos + 16 > headView.byteLength) break;
+          bsize = Number(headView.getBigUint64(pos + 8, false));
           hdrLen = 16;
         } else if (sz32 === 0) {
-          bsize = view.byteLength - pos;
+          bsize = headView.byteLength - pos;
         }
         if (bsize < hdrLen) break;
-        if (btype === "moov" && pos + bsize <= view.byteLength) {
-          const moovEnd = pos + bsize;
-          let cpos = pos + hdrLen;
-          while (cpos + 8 <= moovEnd) {
-            const csz32 = view.getUint32(cpos, false);
-            const ctype = readAscii4(cpos + 4);
-            let csize = csz32;
-            let chdr = 8;
-            if (csz32 === 1) {
-              if (cpos + 16 > moovEnd) break;
-              csize = Number(view.getBigUint64(cpos + 8, false));
-              chdr = 16;
-            }
-            if (csize < chdr || cpos + csize > moovEnd) break;
-            if (ctype === "mvhd") {
-              const pOff = cpos + chdr;
-              const pLen = csize - chdr;
-              if (pLen >= 20) {
-                const ver = view.getUint8(pOff);
-                let ts = 0n;
-                let dur = 0n;
-                if (ver === 1 && pLen >= 32) {
-                  ts = BigInt(view.getUint32(pOff + 20, false));
-                  const raw = view.getBigUint64(pOff + 24, false);
-                  dur = raw === 0xffffffffffffffffn ? 0n : raw;
-                } else if (ver === 0) {
-                  ts = BigInt(view.getUint32(pOff + 12, false));
-                  const raw = view.getUint32(pOff + 16, false);
-                  dur = raw === 0xffffffff ? 0n : BigInt(raw);
-                }
-                if (ts > 0n && dur > 0n) {
-                  const ms = Number((dur * 1000n) / ts);
-                  if (Number.isFinite(ms) && ms > 0) return ms;
-                }
-              }
-            }
-            cpos += csize;
-          }
+        if (btype === "moov" && pos + bsize <= headView.byteLength) {
+          const found = parseMvhdInMoov(headView, pos, hdrLen, pos + bsize);
+          if (found !== undefined) return found;
           break;
         }
         pos += bsize;
+      }
+
+      // Inspect tail 128 KiB slice for non-faststart MP4/MOV files where `moov` is written after `mdat`.
+      if (file.size > 16) {
+        const tailStart = Math.max(0, file.size - 131_072);
+        const tailBuf = await file.slice(tailStart, file.size).arrayBuffer();
+        const tailView = new DataView(tailBuf);
+        for (let i = 0; i + 16 <= tailView.byteLength; i += 1) {
+          if (tailView.getUint32(i + 4, false) !== 0x6d6f6f76) {
+            continue;
+          }
+          const sz32 = tailView.getUint32(i, false);
+          let bsize = sz32;
+          let hdrLen = 8;
+          if (sz32 === 1) {
+            if (i + 16 > tailView.byteLength) continue;
+            bsize = Number(tailView.getBigUint64(i + 8, false));
+            hdrLen = 16;
+          } else if (sz32 === 0) {
+            bsize = tailView.byteLength - i;
+          }
+          if (bsize < hdrLen + 8 || i + bsize > tailView.byteLength) {
+            continue;
+          }
+          const found = parseMvhdInMoov(tailView, i, hdrLen, i + bsize);
+          if (found !== undefined) return found;
+        }
       }
     } catch {
       // Fall back to media element metadata
@@ -964,10 +1188,10 @@ export function App(): React.ReactElement {
             }
           }
         }
-        const payload = err as AppErrorPayload;
-        if (payload.code === "AV-104") {
+        const payload = err as AppErrorPayload & { firstFileName?: string };
+        if (payload.code === "AV-104" || payload.code === "AV-103") {
           setUnsupportedError({
-            fileName: descriptors[0]?.name ?? "Unknown file",
+            fileName: payload.firstFileName ?? descriptors[0]?.name ?? "Unknown file",
             payload,
           });
           setSection("now_playing");
@@ -981,6 +1205,7 @@ export function App(): React.ReactElement {
     newPath: string,
     confirmMismatch = false,
     explicitProbedDurationMs?: number,
+    explicitFileSizeBytes?: number,
   ) => {
     void (async () => {
       let probedDurationMs = explicitProbedDurationMs;
@@ -1006,6 +1231,7 @@ export function App(): React.ReactElement {
         const relinked = ipcClient.relinkMedia(mediaId, newPath, {
           confirmMismatch,
           probedDurationMs,
+          fileSizeBytes: explicitFileSizeBytes,
         });
         setPendingMismatchRelink(null);
         setRelinkError(null);
@@ -1017,7 +1243,13 @@ export function App(): React.ReactElement {
       } catch (err) {
         const payload = err as AppErrorPayload;
         if (payload.code === "AV-202") {
-          setPendingMismatchRelink({ mediaId, newPath, probedDurationMs, payload });
+          setPendingMismatchRelink({
+            mediaId,
+            newPath,
+            probedDurationMs,
+            fileSizeBytes: explicitFileSizeBytes,
+            payload,
+          });
         } else {
           setRelinkError(payload);
         }
@@ -1036,7 +1268,13 @@ export function App(): React.ReactElement {
         return;
       }
       setRelinkPathDraft(picked.file.path);
-      handleAttemptRelink(mediaId, picked.file.path, false, picked.file.durationMs);
+      handleAttemptRelink(
+        mediaId,
+        picked.file.path,
+        false,
+        picked.file.durationMs,
+        picked.file.size,
+      );
     })();
   };
 
@@ -1050,13 +1288,6 @@ export function App(): React.ReactElement {
     const order: RepeatMode[] = ["off", "all", "one"];
     const nextMode = order[(order.indexOf(snapshot.repeat_mode) + 1) % order.length];
     setSnapshot(ipcClient.playbackCommand({ action: "set_repeat", mode: nextMode }));
-  };
-
-  const showTransientUpdateToast = (message: string) => {
-    setUpdateToastMessage(message);
-    window.setTimeout(() => {
-      setUpdateToastMessage((curr) => (curr === message ? null : curr));
-    }, 5_000);
   };
 
   const handleCheckForUpdates = async () => {
@@ -1295,14 +1526,31 @@ export function App(): React.ReactElement {
         // Ignore seek before ready state
       }
     }
-    setSnapshot(
-      ipcClient.syncMediaElementPosition(
-        latestSnap.position_ms,
-        probedDurationMs,
-        mediaId,
-        mediaGen,
-      ),
+    const syncedSnap = ipcClient.syncMediaElementPosition(
+      latestSnap.position_ms,
+      probedDurationMs,
+      mediaId,
+      mediaGen,
     );
+    setSnapshot(syncedSnap);
+
+    // Upgrade audio-only `.mp4`/`.mov`/`.webm` containers (`videoWidth === 0 && videoHeight === 0`)
+    // to `"audio"` so they render the Audio-Only Canvas instead of a blank video frame (`C-2`).
+    if (
+      el instanceof HTMLVideoElement &&
+      el.videoWidth === 0 &&
+      el.videoHeight === 0
+    ) {
+      const upgraded = ipcClient.upgradeMediaKindToAudio(mediaId);
+      if (upgraded) {
+        if (!el.paused) {
+          el.pause();
+        }
+        setLibraryVersion((v) => v + 1);
+        return;
+      }
+    }
+
     if (latestSnap.state === "playing" && el.paused) {
       void el.play().catch(() => {
         // Ignore autoplay restrictions in headless browsers
@@ -1415,6 +1663,7 @@ export function App(): React.ReactElement {
       {/* Keep `.audora-shell` & `<video>` mounted when in Minimum Mode to prevent dual streams or 00:00 resets (`C-7`) */}
       <div
         className="audora-shell"
+        inert={isAnyModalOpen || undefined}
         aria-hidden={isMinimumMode || undefined}
         style={isMinimumMode ? { display: "none" } : undefined}
         onDragOver={(e) => {
@@ -1448,7 +1697,18 @@ export function App(): React.ReactElement {
       )}
 
       {/* Hybrid 56px Header Bar (Frame 2:4 & Brand System 12:68) */}
-      <header className="audora-titlebar" data-tauri-drag-region>
+      <header
+        className="audora-titlebar"
+        data-tauri-drag-region
+        onMouseDown={(e) => {
+          if (e.button !== 0 || e.detail !== 1) return;
+          const target = e.target as HTMLElement | null;
+          if (target?.closest("button, input, a, select, textarea, [role='button']")) {
+            return;
+          }
+          ipcClient.dragNativeWindow();
+        }}
+      >
         <div className="titlebar-brand">
           <AudoraLogo variant="mark" size={28} isPlaying={snapshot.state === "playing"} />
           <span className="brand-title">Audora</span>
@@ -1592,6 +1852,7 @@ export function App(): React.ReactElement {
                 onPlaylistDeleted={handlePlaylistDeleted}
                 onCollapse={togglePlaylistsBar}
                 timestampPrecision={timestampPrecision}
+                onModalOpenChange={setIsPlaylistsModalOpen}
               />
             )}
 
@@ -1755,7 +2016,11 @@ export function App(): React.ReactElement {
                         }}
                       >
                         <IconAlertCircle size={14} />
-                        <span>Unsupported format ({unsupportedError.payload.code})</span>
+                        <span>
+                          {unsupportedError.payload.code === "AV-103"
+                            ? `Playback error (${unsupportedError.payload.code})`
+                            : `Unsupported format (${unsupportedError.payload.code})`}
+                        </span>
                       </span>
                       <h2 style={{ margin: "0 0 8px 0", fontSize: 22 }}>
                         {unsupportedError.payload.title}
@@ -1845,8 +2110,9 @@ export function App(): React.ReactElement {
                         })}
                       <input
                         type="range"
+                        data-seek-scrubber="true"
                         aria-label="Seek timeline"
-                        aria-valuetext={formatAriaTimestamp(displayPositionMs)}
+                        aria-valuetext={formatAriaProgress(displayPositionMs, snapshot.duration_ms)}
                         className="scrubber-slider"
                         disabled={!activeMedia}
                         min={0}
@@ -2098,13 +2364,17 @@ export function App(): React.ReactElement {
               onBrowseRelinkFile={handleBrowseRelinkFile}
               onClearMissingTarget={() => setMissingMediaTarget(null)}
               timestampPrecision={timestampPrecision}
+              onModalOpenChange={setIsLibraryModalOpen}
             />
           )}
 
           {section === "settings" && (
             <SettingsView
               settings={settings}
-              onUpdateSettings={setSettings}
+              onUpdateSettings={(next) => {
+                setSettings(next);
+                setSnapshot(ipcClient.getPlaybackSnapshot());
+              }}
               settingsTab={settingsTab}
               onSelectSettingsTab={setSettingsTab}
               playbackSpeeds={PLAYBACK_SPEEDS}
@@ -2123,9 +2393,12 @@ export function App(): React.ReactElement {
               onCleanupAppData={handleCleanupAppData}
               currentVersion={currentVersion}
               onSetUpdateStatus={setUpdateStatus}
+              onCheckForUpdates={() => void handleCheckForUpdates()}
+              onModalOpenChange={setIsSettingsModalOpen}
             />
           )}
         </main>
+      </div>
       </div>
 
       {/* Add / Edit Note Modal (Frame 4:88) */}
@@ -2245,6 +2518,7 @@ export function App(): React.ReactElement {
                     pendingMismatchRelink.newPath,
                     true,
                     pendingMismatchRelink.probedDurationMs,
+                    pendingMismatchRelink.fileSizeBytes,
                   )
                 }
               >
@@ -2332,7 +2606,6 @@ export function App(): React.ReactElement {
           </form>
         </div>
       )}
-      </div>
 
       {/* Software Update Dialog */}
       {isUpdateDialogOpen && updateStatus && (

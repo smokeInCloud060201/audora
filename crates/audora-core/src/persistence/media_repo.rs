@@ -130,27 +130,35 @@ impl MediaRepository for SqliteMediaRepository {
                     candidates.push(row?);
                 }
 
-                let mut note_stmt =
-                    conn.prepare("SELECT body FROM notes WHERE media_id = ?1")?;
-                let mut matched = Vec::new();
-                for item in candidates {
-                    if item.display_name.to_lowercase().contains(&needle) {
-                        matched.push(item);
-                        continue;
-                    }
-                    let note_rows = note_stmt.query_map(params![item.id], |r| r.get::<_, String>(0))?;
-                    let mut note_hit = false;
-                    for body_res in note_rows {
-                        if body_res?.to_lowercase().contains(&needle) {
-                            note_hit = true;
-                            break;
+                let mut matched_note_media_ids = std::collections::HashSet::new();
+                if candidates
+                    .iter()
+                    .any(|item| !item.display_name.to_lowercase().contains(&needle))
+                {
+                    let mut note_stmt = conn.prepare(
+                        "SELECT n.media_id, n.body
+                         FROM notes n
+                         INNER JOIN media m ON m.id = n.media_id
+                         WHERE (?1 IS NULL OR m.media_kind = ?1)",
+                    )?;
+                    let note_rows = note_stmt.query_map(params![kind_filter], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                    for note_res in note_rows {
+                        let (mid, body) = note_res?;
+                        if !matched_note_media_ids.contains(&mid)
+                            && body.to_lowercase().contains(&needle)
+                        {
+                            matched_note_media_ids.insert(mid);
                         }
                     }
-                    if note_hit {
-                        matched.push(item);
-                    }
                 }
-                return Ok(matched);
+
+                candidates.retain(|item| {
+                    item.display_name.to_lowercase().contains(&needle)
+                        || matched_note_media_ids.contains(&item.id)
+                });
+                return Ok(candidates);
             }
 
             let search_pattern = clean_query.map(|q| Self::escape_like_pattern(&q.to_lowercase()));
@@ -188,7 +196,7 @@ impl MediaRepository for SqliteMediaRepository {
                  WHERE id = ?1",
                 params![
                     id,
-                    i64::try_from(last_position_ms).unwrap_or(0),
+                    i64::try_from(last_position_ms).unwrap_or(i64::MAX),
                     i64::from(completed),
                     updated_at
                 ],
@@ -218,7 +226,9 @@ impl MediaRepository for SqliteMediaRepository {
     fn relink_path(&self, record: &RelinkMediaRecord<'_>) -> AppResult<MediaItem> {
         self.db.with_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let dur_param = record.duration_ms.and_then(|v| i64::try_from(v).ok());
+            let dur_param = record
+                .duration_ms
+                .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
             let updated = tx.execute(
                 "UPDATE media
                  SET path = ?2,
@@ -240,7 +250,9 @@ impl MediaRepository for SqliteMediaRepository {
                     record.display_name,
                     record.media_kind.as_str(),
                     dur_param,
-                    record.file_size_bytes.and_then(|v| i64::try_from(v).ok()),
+                    record
+                        .file_size_bytes
+                        .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                     record.updated_at,
                     i64::from(record.duration_probed),
                 ],

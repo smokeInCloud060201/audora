@@ -19,8 +19,9 @@ Welcome to **Audora**, a local-first desktop audio and video player built for ca
 | Action | Shortcut | Notes |
 | :--- | :--- | :--- |
 | **Open media file(s)** | `⌘O` (macOS) / `Ctrl+O` | Also supports dragging & dropping files onto the window |
-| **Play / Pause** | `Space` | Works in Full mode and Minimum mode |
-| **Seek backward / forward 5 seconds** | `←` / `→` | Or click/drag the timeline scrubber |
+| **Play / Pause** | `Space` | Works in Full mode and Minimum mode (when focus is not on another button or input) |
+| **Seek backward / forward** | `←` / `→` (`±5s`), `Shift+←` / `Shift+→` (`±15s`) | Or click/drag the timeline scrubber |
+| **Adjust volume** | `↑` / `↓` (`±5%`) | Or drag the transport volume slider |
 | **Add note at current timestamp** | `N` | Captures the exact timestamp immediately; playback continues while you type |
 | **Save note in composer** | `⌘Enter` / `Ctrl+Enter` | Or check **Save as quick marker** to save a timestamp without text |
 | **Drop instant quick marker** | `Shift + N` | Drops a marker at the current playhead without opening the modal |

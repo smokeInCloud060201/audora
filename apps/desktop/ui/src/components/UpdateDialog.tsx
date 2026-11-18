@@ -21,7 +21,7 @@ function formatPackageMeta(status: AppUpdateStatusDto): string {
   const sizeBytes = status.package_size_bytes ?? 0;
   const mb = sizeBytes > 0 ? Math.max(1, Math.round(sizeBytes / (1024 * 1024))) : null;
   const verificationLabel = status.verified
-    ? "Downloaded and verified"
+    ? "SHA-256 checksum published"
     : "Pending checksum verification";
   return mb !== null ? `${mb} MB · ${verificationLabel}` : verificationLabel;
 }
@@ -93,7 +93,7 @@ export function UpdateDialog({
       className="modal-backdrop"
       role="dialog"
       aria-modal="true"
-      aria-label="Update Available Dialog"
+      aria-label={titleText}
       data-testid="update-dialog"
     >
       <div
@@ -122,7 +122,12 @@ export function UpdateDialog({
         <p className="update-dialog-subtitle">{subtitleText}</p>
 
         {hasChangelogBlocks && (
-          <div className="update-changelog-box" aria-label="Release Notes">
+          <div
+            className="update-changelog-box"
+            role="region"
+            aria-label="Release Notes"
+            tabIndex={0}
+          >
             {changelogLines.map((line, index) => {
               if (/^#{1,3}\s+/.test(line)) {
                 const heading = line.replace(/^#{1,3}\s+/, "");

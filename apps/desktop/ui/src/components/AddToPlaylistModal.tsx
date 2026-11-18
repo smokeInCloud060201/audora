@@ -57,9 +57,8 @@ export function AddToPlaylistModal({
   };
 
   return (
-    <div
+    <dialog
       className="modal-backdrop"
-      role="dialog"
       aria-modal="true"
       aria-label="Add media to playlist"
       data-testid="add-to-playlist-modal"
@@ -129,7 +128,7 @@ export function AddToPlaylistModal({
           </div>
         )}
 
-        <div className="playlist-picker-list" aria-label="Existing playlists">
+        <div className="playlist-picker-list" role="group" aria-label="Existing playlists">
           {playlists.length === 0 ? (
             <div className="source-picker-empty" style={{ padding: "22px 12px" }}>
               No playlists yet. Enter a name above to create your first playlist.
@@ -181,6 +180,6 @@ export function AddToPlaylistModal({
           </button>
         </div>
       </div>
-    </div>
+    </dialog>
   );
 }

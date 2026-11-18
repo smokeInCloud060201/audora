@@ -145,14 +145,14 @@ Single-key shortcuts **MUST** be suppressed whenever focus is inside `<input>`, 
 
 | Shortcut | Action |
 |---|---|
-| `Space` | Toggle Play / Pause |
+| `Space` | Toggle Play / Pause (when focus is not on an interactive button, toggle, menu item, or text input) |
 | `N` | Capture current playhead and open `Add a note` dialog |
 | `Shift + N` | Immediately save a Quick Marker at current playhead and show `Note added` toast |
 | `⌘/Ctrl + Enter` | Submit `Add a note` / `Edit note` dialog |
 | `Escape` | Close open modal/popover, or return from Minimum mode to Full mode |
 | `←` / `→` | Seek backward / forward `5 seconds` (`Shift + ←/→` for `15 seconds`) |
-| `↑` / `↓` | Increase / decrease volume by `5%` (when player/transport focused) |
-| `M` | Toggle Mute |
+| `↑` / `↓` | Increase / decrease volume by `5%` |
+| `M` | Toggle Minimum mode / Full mode |
 | `⌘/Ctrl + K` | Focus Library `Search titles and notes…` input |
 | `⌘/Ctrl + O` | Open native file picker (`Open media`) |
 

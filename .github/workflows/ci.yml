@@ -31,8 +31,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-tools \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good
 
@@ -69,6 +68,10 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Audit production npm dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: pnpm audit --prod --audit-level=high
 
       - name: Frontend typecheck, unit tests, production bundle & release gate
         run: |

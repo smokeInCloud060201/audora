@@ -34,6 +34,9 @@ export function formatDurationMs(
   ms: number | null | undefined,
   precision: TimestampPrecision = "nearest_second",
 ): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) {
+    return "--:--";
+  }
   return formatTimestamp(ms, precision);
 }
 
@@ -59,6 +62,20 @@ export function formatAriaTimestamp(ms: number | null | undefined): string {
     parts.push(`${seconds} ${seconds === 1 ? "second" : "seconds"}`);
   }
   return parts.join(" ");
+}
+
+/**
+ * Formats playback progress (`position` + optional `duration`) for `aria-valuetext` (`UI_DESIGN.md:161`).
+ */
+export function formatAriaProgress(
+  posMs: number | null | undefined,
+  durMs: number | null | undefined,
+): string {
+  const spokenPos = formatAriaTimestamp(posMs);
+  if (durMs !== null && durMs !== undefined && Number.isFinite(durMs) && durMs > 0) {
+    return `${spokenPos} of ${formatAriaTimestamp(durMs)}`;
+  }
+  return spokenPos;
 }
 
 /**
@@ -143,7 +160,7 @@ export function shouldSuppressGlobalShortcut(
   const normalized = targetTagName.toUpperCase();
   if (normalized === "INPUT") {
     const t = (inputType ?? "").toLowerCase();
-    if (t === "range" || t === "checkbox" || t === "button") {
+    if (t === "range" || t === "checkbox" || t === "radio" || t === "button") {
       return false;
     }
     return true;

@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ipcClient } from "../api/ipc";
 import type {
   AppSettings,
@@ -8,8 +9,9 @@ import type {
   TimestampPrecision,
   TrustedSourceFolder,
 } from "../types/domain";
+import { useModalFocusTrap } from "../utils/useModalFocusTrap";
 import { AudoraLogo } from "./AudoraLogo";
-import { IconCheck, IconPlus, IconRepeat } from "./Icons";
+import { IconCheck, IconClose, IconPlus, IconRepeat } from "./Icons";
 
 export type SettingsTab =
   | "appearance"
@@ -41,6 +43,8 @@ interface SettingsViewProps {
   onCleanupAppData: () => void;
   currentVersion: string;
   onSetUpdateStatus: React.Dispatch<React.SetStateAction<AppUpdateStatusDto | null>>;
+  onCheckForUpdates: () => void;
+  onModalOpenChange?: (open: boolean) => void;
 }
 
 export const SettingsView = React.memo(function SettingsView({
@@ -64,7 +68,64 @@ export const SettingsView = React.memo(function SettingsView({
   onCleanupAppData,
   currentVersion,
   onSetUpdateStatus,
+  onCheckForUpdates,
+  onModalOpenChange,
 }: SettingsViewProps): React.ReactElement {
+  const [isCleanupConfirmOpen, setIsCleanupConfirmOpen] = useState(false);
+  const [copiedDiagnosticJson, setCopiedDiagnosticJson] = useState(false);
+  const copyResetTimerRef = useRef<number | null>(null);
+  const cleanupDialogRef = useRef<HTMLDivElement | null>(null);
+  const cancelCleanupBtnRef = useRef<HTMLButtonElement | null>(null);
+  useModalFocusTrap(isCleanupConfirmOpen, cleanupDialogRef, cancelCleanupBtnRef);
+
+  useEffect(() => {
+    onModalOpenChange?.(isCleanupConfirmOpen);
+    return () => {
+      onModalOpenChange?.(false);
+    };
+  }, [isCleanupConfirmOpen, onModalOpenChange]);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isCleanupConfirmOpen) return undefined;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setIsCleanupConfirmOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [isCleanupConfirmOpen]);
+
+  const handleCopyDiagnosticJson = () => {
+    if (!diagnosticReport) return;
+    const formatted = JSON.stringify(diagnosticReport, null, 2);
+    const markCopied = () => {
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+      }
+      setCopiedDiagnosticJson(true);
+      copyResetTimerRef.current = window.setTimeout(() => {
+        copyResetTimerRef.current = null;
+        setCopiedDiagnosticJson(false);
+      }, 2500);
+    };
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(formatted).then(markCopied).catch(() => {
+        onSetBackupStatusMessage("Unable to access system clipboard.");
+      });
+    } else {
+      markCopied();
+    }
+  };
   return (
     <div className="content-page">
       <div style={{ marginBottom: 24 }}>
@@ -524,6 +585,8 @@ export const SettingsView = React.memo(function SettingsView({
                 {[
                   ["Play / Pause", "Space"],
                   ["Seek backward / forward 5s", "← / →"],
+                  ["Seek backward / forward 15s", "Shift + ← / →"],
+                  ["Adjust volume ±5%", "↑ / ↓"],
                   ["Add note at current timestamp", "N"],
                   ["Drop quick marker", "Shift + N"],
                   ["Save note in composer", "⌘/Ctrl + Enter"],
@@ -628,7 +691,12 @@ export const SettingsView = React.memo(function SettingsView({
                 >
                   Preview redacted diagnostic report
                 </button>
-                <button type="button" className="btn-secondary" onClick={onCleanupAppData}>
+                <button
+                  type="button"
+                  className="btn-danger-subtle"
+                  style={{ height: 34, padding: "0 12px" }}
+                  onClick={() => setIsCleanupConfirmOpen(true)}
+                >
                   Clean up app data &amp; cache
                 </button>
               </div>
@@ -650,21 +718,43 @@ export const SettingsView = React.memo(function SettingsView({
               )}
 
               {diagnosticReport && (
-                <pre
-                  data-testid="diagnostic-report-preview"
-                  style={{
-                    margin: 0,
-                    padding: 12,
-                    borderRadius: 8,
-                    background: "var(--bg-inset)",
-                    border: "1px solid var(--border-control)",
-                    fontSize: 11,
-                    color: "var(--text-secondary)",
-                    overflowX: "auto",
-                  }}
-                >
-                  {JSON.stringify(diagnosticReport, null, 2)}
-                </pre>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 10,
+                    }}
+                  >
+                    <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
+                      Redacted diagnostic report
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      style={{ height: 28, padding: "0 10px", fontSize: 11.5 }}
+                      onClick={handleCopyDiagnosticJson}
+                    >
+                      {copiedDiagnosticJson ? "Copied!" : "Copy JSON"}
+                    </button>
+                  </div>
+                  <pre
+                    data-testid="diagnostic-report-preview"
+                    style={{
+                      margin: 0,
+                      padding: 12,
+                      borderRadius: 8,
+                      background: "var(--bg-inset)",
+                      border: "1px solid var(--border-control)",
+                      fontSize: 11,
+                      color: "var(--text-secondary)",
+                      overflowX: "auto",
+                    }}
+                  >
+                    {JSON.stringify(diagnosticReport, null, 2)}
+                  </pre>
+                </div>
               )}
             </section>
           )}
@@ -681,22 +771,39 @@ export const SettingsView = React.memo(function SettingsView({
                 gap: 16,
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                <AudoraLogo variant="icon" size={48} />
-                <div>
-                  <h2 style={{ margin: "0 0 4px 0", fontSize: 16 }}>
-                    Audora v{currentVersion}
-                  </h2>
-                  <p
-                    style={{
-                      margin: 0,
-                      fontSize: 13,
-                      color: "var(--text-secondary)",
-                    }}
-                  >
-                    Cross-platform local-first audio and video player with timestamped notes.
-                  </p>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 14,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <AudoraLogo variant="icon" size={48} />
+                  <div>
+                    <h2 style={{ margin: "0 0 4px 0", fontSize: 16 }}>
+                      Audora v{currentVersion}
+                    </h2>
+                    <p
+                      style={{
+                        margin: 0,
+                        fontSize: 13,
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      Cross-platform local-first audio and video player with timestamped notes.
+                    </p>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={onCheckForUpdates}
+                >
+                  Check for updates…
+                </button>
               </div>
 
               <div
@@ -765,6 +872,68 @@ export const SettingsView = React.memo(function SettingsView({
           )}
         </div>
       </div>
+
+      {isCleanupConfirmOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="modal-backdrop"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm clean up app data and cache"
+            data-testid="confirm-cleanup-appdata-modal"
+          >
+            <div ref={cleanupDialogRef} className="modal-dialog">
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <h2 style={{ margin: 0, fontSize: 17 }}>
+                  Clean up app data &amp; cache?
+                </h2>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ width: 30, height: 30, padding: 0 }}
+                  aria-label="Close confirmation dialog"
+                  onClick={() => setIsCleanupConfirmOpen(false)}
+                >
+                  <IconClose size={14} />
+                </button>
+              </div>
+              <p style={{ margin: 0, fontSize: 13, color: "var(--text-secondary)" }}>
+                This will permanently clear your Audora library records, playlists,
+                timestamped notes, update cache, and local SQLite backups. Your original
+                audio and video files on disk stay completely untouched.
+              </p>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button
+                  ref={cancelCleanupBtnRef}
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => setIsCleanupConfirmOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn-danger-subtle"
+                  style={{ height: 34, padding: "0 14px" }}
+                  onClick={() => {
+                    setIsCleanupConfirmOpen(false);
+                    onCleanupAppData();
+                  }}
+                >
+                  Clean up app data
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 });

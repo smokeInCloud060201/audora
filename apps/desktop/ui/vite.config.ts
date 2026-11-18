@@ -87,6 +87,7 @@ function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
   let pos = 0;
   let sidxSumMs = 0;
   let hasSidx = false;
+  let trackedSidxRefId: number | null = null;
   let guard = 0;
 
   while (pos < fileLen && guard < 4096) {
@@ -135,21 +136,27 @@ function probeIsoBmffDurationMs(fd: number, fileLen: number): number | null {
         const sidx = readExactAt(fd, pos + box.hdrLen, payloadLen);
         if (sidx) {
           const ver = sidx[0];
+          const refId = sidx.readUInt32BE(4);
           const timescale = BigInt(sidx.readUInt32BE(8));
           const entriesOffset = ver === 0 ? 20 : 28;
           if (timescale > 0n && sidx.length >= entriesOffset + 4) {
-            const count = sidx.readUInt16BE(entriesOffset + 2);
-            const tableStart = entriesOffset + 4;
-            if (sidx.length >= tableStart + count * 12) {
-              let sum = 0n;
-              for (let i = 0; i < count; i += 1) {
-                sum += BigInt(sidx.readUInt32BE(tableStart + i * 12 + 4));
-              }
-              if (sum > 0n) {
-                const ms = Number((sum * 1000n) / timescale);
-                if (Number.isFinite(ms) && ms > 0) {
-                  sidxSumMs += ms;
-                  hasSidx = true;
+            if (trackedSidxRefId === null) {
+              trackedSidxRefId = refId;
+            }
+            if (refId === trackedSidxRefId) {
+              const count = sidx.readUInt16BE(entriesOffset + 2);
+              const tableStart = entriesOffset + 4;
+              if (sidx.length >= tableStart + count * 12) {
+                let sum = 0n;
+                for (let i = 0; i < count; i += 1) {
+                  sum += BigInt(sidx.readUInt32BE(tableStart + i * 12 + 4));
+                }
+                if (sum > 0n) {
+                  const ms = Number((sum * 1000n) / timescale);
+                  if (Number.isFinite(ms) && ms > 0) {
+                    sidxSumMs += ms;
+                    hasSidx = true;
+                  }
                 }
               }
             }
@@ -530,6 +537,7 @@ function parseByteRange(spec: string, totalLen: number): [number, number] | null
 function audoraLocalDevBridge(): Plugin {
   const allowedDevFiles = new Set<string>();
   const allowedDevDirs = new Set<string>();
+  let dialogInFlight = false;
 
   const normalizeKey = (p: string): string =>
     process.platform === "win32" ? p.toLowerCase() : p;
@@ -564,6 +572,61 @@ function audoraLocalDevBridge(): Plugin {
   return {
     name: "audora-local-dev-bridge",
     configureServer(server) {
+      const allowlistPath = path.resolve(
+        server.config.root,
+        "node_modules",
+        ".vite",
+        "audora-dev-allowlist.json",
+      );
+
+      const loadPersistedAllowlist = () => {
+        try {
+          if (!fs.existsSync(allowlistPath)) return;
+          const raw = fs.readFileSync(allowlistPath, "utf8");
+          const parsed = JSON.parse(raw) as { files?: unknown; dirs?: unknown };
+          if (Array.isArray(parsed.files)) {
+            for (const entry of parsed.files) {
+              if (typeof entry === "string" && (path.isAbsolute(entry) || entry.startsWith("\\\\"))) {
+                allowedDevFiles.add(normalizeKey(entry));
+              }
+            }
+          }
+          if (Array.isArray(parsed.dirs)) {
+            for (const entry of parsed.dirs) {
+              if (typeof entry === "string" && (path.isAbsolute(entry) || entry.startsWith("\\\\"))) {
+                allowedDevDirs.add(normalizeKey(entry));
+              }
+            }
+          }
+        } catch {
+          // Ignore malformed or unreadable dev allowlist cache
+        }
+      };
+
+      const savePersistedAllowlist = () => {
+        try {
+          fs.mkdirSync(path.dirname(allowlistPath), { recursive: true });
+          const tmpPath = `${allowlistPath}.tmp`;
+          fs.writeFileSync(
+            tmpPath,
+            JSON.stringify(
+              {
+                files: Array.from(allowedDevFiles),
+                dirs: Array.from(allowedDevDirs),
+              },
+              null,
+              2,
+            ),
+            "utf8",
+          );
+          fs.renameSync(tmpPath, allowlistPath);
+        } catch {
+          // Ignore cache write errors in read-only environments
+        }
+      };
+
+      loadPersistedAllowlist();
+
       server.middlewares.use((req, res, next) => {
         if (!req.url) return next();
         const urlObj = new URL(req.url, "http://127.0.0.1");
@@ -605,62 +668,84 @@ function audoraLocalDevBridge(): Plugin {
           urlObj.pathname === "/__audora_pick_files" ||
           urlObj.pathname === "/__audora_pick_single_file"
         ) {
+          if (dialogInFlight) {
+            res.statusCode = 409;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(
+              JSON.stringify({
+                ok: false,
+                status: "busy",
+                message: "A file or folder picker dialog is already open.",
+              }),
+            );
+            return;
+          }
+          dialogInFlight = true;
           const isSingle = urlObj.pathname === "/__audora_pick_single_file";
           const sendPickedFiles = (rawStdout: string | null) => {
-            res.statusCode = 200;
-            res.setHeader("Content-Type", "application/json; charset=utf-8");
-            if (!rawStdout) {
-              res.end(
-                JSON.stringify(
-                  isSingle
-                    ? { ok: true, cancelled: true, file: null }
-                    : { ok: true, cancelled: true, files: [] },
-                ),
-              );
-              return;
-            }
-            const files: Array<{
-              path: string;
-              name: string;
-              size: number;
-              duration_ms: number | null;
-            }> = [];
-            for (const line of rawStdout.split(/\r?\n/)) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              try {
-                const stat = fs.statSync(trimmed);
-                if (stat.isFile()) {
-                  const canonical = fs.realpathSync(trimmed);
-                  allowedDevFiles.add(normalizeKey(canonical));
-                  files.push({
-                    path: canonical,
-                    name: path.basename(canonical),
-                    size: stat.size,
-                    duration_ms: probeMediaDurationMs(canonical),
-                  });
-                }
-              } catch {
-                // Skip invalid selection line
+            try {
+              res.statusCode = 200;
+              res.setHeader("Content-Type", "application/json; charset=utf-8");
+              if (!rawStdout) {
+                res.end(
+                  JSON.stringify(
+                    isSingle
+                      ? { ok: true, cancelled: true, file: null }
+                      : { ok: true, cancelled: true, files: [] },
+                  ),
+                );
+                return;
               }
-            }
-            if (isSingle) {
+              const files: Array<{
+                path: string;
+                name: string;
+                size: number;
+                duration_ms: number | null;
+              }> = [];
+              let addedAny = false;
+              for (const line of rawStdout.split(/\r?\n/)) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                try {
+                  const stat = fs.statSync(trimmed);
+                  if (stat.isFile()) {
+                    const canonical = fs.realpathSync(trimmed);
+                    allowedDevFiles.add(normalizeKey(canonical));
+                    addedAny = true;
+                    files.push({
+                      path: canonical,
+                      name: path.basename(canonical),
+                      size: stat.size,
+                      duration_ms: probeMediaDurationMs(canonical),
+                    });
+                  }
+                } catch {
+                  // Skip invalid selection line
+                }
+              }
+              if (addedAny) {
+                savePersistedAllowlist();
+              }
+              if (isSingle) {
+                res.end(
+                  JSON.stringify({
+                    ok: true,
+                    cancelled: files.length === 0,
+                    file: files[0] ?? null,
+                  }),
+                );
+                return;
+              }
               res.end(
                 JSON.stringify({
                   ok: true,
                   cancelled: files.length === 0,
-                  file: files[0] ?? null,
+                  files,
                 }),
               );
-              return;
+            } finally {
+              dialogInFlight = false;
             }
-            res.end(
-              JSON.stringify({
-                ok: true,
-                cancelled: files.length === 0,
-                files,
-              }),
-            );
           };
 
           if (process.platform === "darwin") {
@@ -707,16 +792,34 @@ function audoraLocalDevBridge(): Plugin {
         }
 
         if (urlObj.pathname === "/__audora_pick_folder") {
-          const sendPicked = (rawPicked: string | null) => {
-            const cleaned = rawPicked ? rawPicked.trim().replace(/[\\/]+$/, "") : "";
-            res.statusCode = 200;
+          if (dialogInFlight) {
+            res.statusCode = 409;
             res.setHeader("Content-Type", "application/json; charset=utf-8");
-            if (cleaned && fs.existsSync(cleaned) && fs.statSync(cleaned).isDirectory()) {
-              const canonical = fs.realpathSync(cleaned);
-              allowedDevDirs.add(normalizeKey(canonical));
-              res.end(JSON.stringify({ ok: true, cancelled: false, path: canonical }));
-            } else {
-              res.end(JSON.stringify({ ok: true, cancelled: true, path: null }));
+            res.end(
+              JSON.stringify({
+                ok: false,
+                status: "busy",
+                message: "A file or folder picker dialog is already open.",
+              }),
+            );
+            return;
+          }
+          dialogInFlight = true;
+          const sendPicked = (rawPicked: string | null) => {
+            try {
+              const cleaned = rawPicked ? rawPicked.trim().replace(/[\\/]+$/, "") : "";
+              res.statusCode = 200;
+              res.setHeader("Content-Type", "application/json; charset=utf-8");
+              if (cleaned && fs.existsSync(cleaned) && fs.statSync(cleaned).isDirectory()) {
+                const canonical = fs.realpathSync(cleaned);
+                allowedDevDirs.add(normalizeKey(canonical));
+                savePersistedAllowlist();
+                res.end(JSON.stringify({ ok: true, cancelled: false, path: canonical }));
+              } else {
+                res.end(JSON.stringify({ ok: true, cancelled: true, path: null }));
+              }
+            } finally {
+              dialogInFlight = false;
             }
           };
 
@@ -879,6 +982,40 @@ function audoraLocalDevBridge(): Plugin {
           const rs = fs.createReadStream(allowed);
           rs.on("error", () => res.destroy());
           rs.pipe(res);
+          return;
+        }
+
+        if (urlObj.pathname === "/__audora_revoke_folder" && req.method === "POST") {
+          const rawPath = urlObj.searchParams.get("path")?.trim() ?? "";
+          if (rawPath) {
+            try {
+              const canon = fs.existsSync(rawPath) ? fs.realpathSync(rawPath) : path.resolve(rawPath);
+              if (allowedDevDirs.delete(normalizeKey(canon))) {
+                savePersistedAllowlist();
+              }
+            } catch {
+              // Ignore
+            }
+          }
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+
+        if (urlObj.pathname === "/__audora_state" && req.method === "DELETE") {
+          allowedDevFiles.clear();
+          allowedDevDirs.clear();
+          try {
+            if (fs.existsSync(allowlistPath)) {
+              fs.unlinkSync(allowlistPath);
+            }
+          } catch {
+            // Ignore
+          }
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify({ ok: true, removed_paths: [allowlistPath], bytes_reclaimed: 0 }));
           return;
         }
 

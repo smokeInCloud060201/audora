@@ -1,6 +1,6 @@
 # ADR 0001: Desktop shell, persistence, and playback architecture
 
-- **Status:** Accepted (Validated in Phase 1)
+- **Status:** Superseded in part by [ADR 0004](0004-native-webview-loopback-architecture.md) (originally Accepted in Phase 1)
 - **Date:** 2026-11-12
 - **Deciders:** Project Maintainers
 

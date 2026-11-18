@@ -727,6 +727,24 @@ Properties:
                     "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_macos-aarch64.dmg",
                     "size": 18452992,
                     "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                },
+                {
+                    "name": "Audora_1.2.0_macos-x86_64.dmg",
+                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_macos-x86_64.dmg",
+                    "size": 18452992,
+                    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                },
+                {
+                    "name": "Audora_1.2.0_windows-x86_64-setup.exe",
+                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_windows-x86_64-setup.exe",
+                    "size": 18452992,
+                    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                },
+                {
+                    "name": "Audora_1.2.0_linux-x86_64.deb",
+                    "browser_download_url": "https://github.com/smokeInCloud060201/audora/releases/download/v1.2.0/Audora_1.2.0_linux-x86_64.deb",
+                    "size": 18452992,
+                    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 }
             ]
         }"#;
@@ -1043,13 +1061,31 @@ Properties:
                     "browser_download_url": "https://example.com/Audora_1.2.0_macos-aarch64.dmg",
                     "size": 20000000,
                     "digest": null
+                },
+                {
+                    "name": "Audora_1.2.0_macos-x86_64.dmg",
+                    "browser_download_url": "https://example.com/Audora_1.2.0_macos-x86_64.dmg",
+                    "size": 20000000,
+                    "digest": null
+                },
+                {
+                    "name": "Audora_1.2.0_windows-x86_64-setup.exe",
+                    "browser_download_url": "https://example.com/Audora_1.2.0_windows-x86_64-setup.exe",
+                    "size": 20000000,
+                    "digest": null
+                },
+                {
+                    "name": "Audora_1.2.0_linux-x86_64.deb",
+                    "browser_download_url": "https://example.com/Audora_1.2.0_linux-x86_64.deb",
+                    "size": 20000000,
+                    "digest": null
                 }
             ]
         }"#;
 
         let parsed = parse_github_release_json(unverified_json).expect("parse unverified");
         assert!(
-            parsed.download_url.ends_with(".dmg"),
+            !parsed.download_url.ends_with(".json"),
             "must skip .json sidecar and pick installer"
         );
         assert!(
@@ -1401,6 +1437,18 @@ Properties:
                     "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
                 },
                 {
+                    "name": "Audora_2.0.0_macos-x86_64.dmg",
+                    "browser_download_url": "https://example.com/Audora-intel.dmg",
+                    "size": 100,
+                    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                {
+                    "name": "Audora_2.0.0_macos-x86_64.app.tar.gz",
+                    "browser_download_url": "https://example.com/Audora-intel.app.tar.gz",
+                    "size": 90,
+                    "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                {
                     "name": "Audora_2.0.0_windows-x86_64-portable.zip",
                     "browser_download_url": "https://example.com/Audora-portable.zip",
                     "size": 110,
@@ -1571,5 +1619,408 @@ Properties:
             .expect("replay after ended");
         assert_eq!(replayed.state, PlaybackState::Playing);
         assert_eq!(replayed.position_ms, 0);
+    }
+
+    #[test]
+    fn rpc_execute_batch_is_atomic_and_rejects_malformed_payloads() {
+        let db = Database::open_in_memory().expect("open in-memory db");
+        let valid_batch = serde_json::json!([
+            {
+                "op": "upsert_media_batch",
+                "items": [{
+                    "id": "med_batch_1",
+                    "path": "/tmp/batch_track.mp3",
+                    "display_name": "batch_track.mp3",
+                    "media_kind": "audio",
+                    "duration_ms": 120000,
+                    "duration_probed": true,
+                    "last_position_ms": 0,
+                    "completed": false,
+                    "file_size_bytes": 4096,
+                    "availability": "available",
+                    "added_at": "2026-05-01T00:00:00Z",
+                    "last_seen_at": "2026-05-01T00:00:00Z"
+                }]
+            },
+            {
+                "op": "upsert_note",
+                "note": {
+                    "id": "note_batch_1",
+                    "media_id": "med_batch_1",
+                    "position_ms": 12500,
+                    "is_quick_marker": false,
+                    "body": "Atomic batch note",
+                    "created_at": "2026-05-01T00:00:00Z",
+                    "updated_at": "2026-05-01T00:00:00Z"
+                }
+            },
+            {
+                "op": "update_progress",
+                "media_id": "med_batch_1",
+                "last_position_ms": 54321,
+                "completed": false
+            },
+            {
+                "op": "revoke_source_folder",
+                "path": "/tmp/RevokedFolder"
+            }
+        ]);
+        db.rpc_execute_batch(valid_batch.as_array().unwrap())
+            .expect("valid atomic batch");
+
+        let state_before = db.export_relational_state().unwrap().unwrap();
+        assert_eq!(state_before.media[0].last_position_ms, 54_321);
+        assert_eq!(state_before.notes.len(), 1);
+
+        // Now execute a batch where op 0 mutates progress to 99_999 and op 1 is malformed -> MUST fail & roll back op 0!
+        let broken_batch = serde_json::json!([
+            {
+                "op": "update_progress",
+                "media_id": "med_batch_1",
+                "last_position_ms": 99999,
+                "completed": true
+            },
+            {
+                "op": "delete_note"
+            }
+        ]);
+        let err = db
+            .rpc_execute_batch(broken_batch.as_array().unwrap())
+            .expect_err("malformed op must fail batch");
+        assert_eq!(err.code(), ErrorCode::ValidationFailed);
+
+        let state_after = db.export_relational_state().unwrap().unwrap();
+        assert_eq!(
+            state_after.media[0].last_position_ms, 54_321,
+            "earlier op in failed batch must roll back cleanly"
+        );
+        assert!(!state_after.media[0].completed);
+
+        // Unknown op is also rejected with AV-301
+        let unknown_op = serde_json::json!([{ "op": "drop_everything" }]);
+        assert_eq!(
+            db.rpc_execute_batch(unknown_op.as_array().unwrap())
+                .expect_err("unknown op")
+                .code(),
+            ErrorCode::ValidationFailed
+        );
+    }
+
+    #[test]
+    fn reconcile_upsert_blocks_silent_relink_conflict_and_preserves_id_reconciliation_progress() {
+        let db = Database::open_in_memory().expect("db");
+        let item_a = crate::domain::MediaItem {
+            id: "med_a".to_owned(),
+            path: "/tmp/a.mp4".to_owned(),
+            display_name: "a.mp4".to_owned(),
+            media_kind: MediaKind::Video,
+            duration_ms: Some(100_000),
+            duration_probed: true,
+            last_position_ms: 40_000,
+            completed: true,
+            file_size_bytes: Some(2048),
+            fingerprint: Some("fp-original-a".to_owned()),
+            availability: Availability::Available,
+            added_at: "2026-01-01T10:00:00.000Z".to_owned(),
+            last_opened_at: Some("2026-02-01T10:00:00.000Z".to_owned()),
+            last_seen_at: "2026-02-01T10:00:00.000Z".to_owned(),
+            note_count: 0,
+            source_folder_id: None,
+        };
+        let item_b = crate::domain::MediaItem {
+            id: "med_b".to_owned(),
+            path: "/tmp/b.mp4".to_owned(),
+            display_name: "b.mp4".to_owned(),
+            ..item_a.clone()
+        };
+        db.rpc_upsert_media_batch(&[item_a.clone(), item_b])
+            .expect("insert a and b");
+
+        // 1. Moving existing `med_a` onto `/tmp/b.mp4` (owned by `med_b`) MUST fail with AV-201 RelinkConflict!
+        let mut conflicting_a = item_a.clone();
+        conflicting_a.path = "/tmp/b.mp4".to_owned();
+        let conflict_err = db
+            .rpc_upsert_media_batch(&[conflicting_a])
+            .expect_err("must reject silent overwrite of med_b");
+        assert_eq!(conflict_err.code(), ErrorCode::RelinkConflict);
+
+        // 2. Reconciling a brand-new ID `med_ui_a` onto `/tmp/a.mp4` preserves higher progress, completed, last_opened_at, and fingerprint!
+        let reconciled_ui = crate::domain::MediaItem {
+            id: "med_ui_a".to_owned(),
+            path: "/tmp/a.mp4".to_owned(),
+            display_name: "a.mp4".to_owned(),
+            media_kind: MediaKind::Video,
+            duration_ms: None,
+            duration_probed: false,
+            last_position_ms: 5_000,
+            completed: false,
+            file_size_bytes: None,
+            fingerprint: None,
+            availability: Availability::Available,
+            added_at: "2026-03-01T00:00:00.000Z".to_owned(),
+            last_opened_at: None,
+            last_seen_at: "2026-03-01T00:00:00.000Z".to_owned(),
+            note_count: 0,
+            source_folder_id: None,
+        };
+        db.rpc_upsert_media_batch(&[reconciled_ui])
+            .expect("reconcile id");
+        let state = db.export_relational_state().unwrap().unwrap();
+        assert_eq!(state.media.len(), 2);
+        let merged = state
+            .media
+            .iter()
+            .find(|m| m.id == "med_ui_a")
+            .expect("merged item");
+        assert_eq!(merged.last_position_ms, 40_000);
+        assert!(merged.completed);
+        assert_eq!(
+            merged.last_opened_at.as_deref(),
+            Some("2026-02-01T10:00:00.000Z")
+        );
+        assert_eq!(merged.fingerprint.as_deref(), Some("fp-original-a"));
+    }
+
+    #[test]
+    fn path_and_timestamp_validators_reject_webdav_remote_schemes_and_invalid_iso8601() {
+        use crate::domain::{normalize_persisted_timestamp, validate_local_media_path_str};
+
+        for forbidden in [
+            "smb://nas/share/song.mp3",
+            "dav://host/file.mp4",
+            "davs://host/file.mp4",
+            "nfs://server/export/a.wav",
+            "afp://mac/share/a.mov",
+            "file:///tmp/a.mp4",
+            r"\\evil.example@SSL\DavWWWRoot\clip.mp4",
+            r"\\evil.example@80\share\clip.mp4",
+            r"\\evil.example:445\share\clip.mp4",
+            r"\\evil.example\DavWWWRoot\clip.mp4",
+            r"\\?\UNC\evil.example@443\share\clip.mp4",
+        ] {
+            assert!(
+                validate_local_media_path_str(forbidden).is_err(),
+                "must reject {forbidden}"
+            );
+        }
+
+        // Standard SMB UNC share, local verbatim drive with `@` in directory, and trailing space stay valid!
+        assert_eq!(
+            validate_local_media_path_str(r"\\NAS\Media\clip.mp4").unwrap(),
+            r"\\NAS\Media\clip.mp4"
+        );
+        assert_eq!(
+            validate_local_media_path_str(r"\\?\C:\Users\dev@corp\clip.mp4").unwrap(),
+            r"\\?\C:\Users\dev@corp\clip.mp4"
+        );
+        assert_eq!(
+            validate_local_media_path_str("/tmp/Folder With Space ").unwrap(),
+            "/tmp/Folder With Space "
+        );
+
+        let fallback = "2026-11-18T00:00:00.000Z";
+        assert_eq!(
+            normalize_persisted_timestamp("2026-05-10T14:30:00Z", fallback),
+            "2026-05-10T14:30:00Z"
+        );
+        assert_eq!(
+            normalize_persisted_timestamp("2026-05-10T14:30:00.250Z", fallback),
+            "2026-05-10T14:30:00.250Z"
+        );
+        for invalid_ts in [
+            "2026-99-99",
+            "2026-05-10 not-utc",
+            "2026-05-10T14:30:00+07:00",
+            "2026-02-30T10:00:00Z",
+        ] {
+            assert_eq!(
+                normalize_persisted_timestamp(invalid_ts, fallback),
+                fallback,
+                "must reject non-UTC/invalid timestamp {invalid_ts}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_parser_blocks_cross_os_and_cross_arch_fallbacks() {
+        use crate::services::parse_github_release_json_for_target;
+
+        let macos_arm_only = r#"{
+            "tag_name": "v1.3.0",
+            "html_url": "https://github.com/smokeInCloud060201/audora/releases/tag/v1.3.0",
+            "assets": [
+                {
+                    "name": "Audora_1.3.0_macos-aarch64.app.tar.gz",
+                    "browser_download_url": "https://example.com/Audora_1.3.0_macos-aarch64.app.tar.gz",
+                    "size": 12345,
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            ]
+        }"#;
+
+        // Matches on macos + aarch64
+        let arm_mac =
+            parse_github_release_json_for_target(macos_arm_only, "macos", "aarch64").unwrap();
+        assert_eq!(arm_mac.package_size_bytes, 12345);
+        assert_eq!(arm_mac.sha256.len(), 64);
+
+        // Must NOT match on macos-x86_64, windows-x86_64, or linux-x86_64 (even though `.tar.gz` suffix overlaps!)
+        for (os, arch) in [
+            ("macos", "x86_64"),
+            ("windows", "x86_64"),
+            ("linux", "x86_64"),
+        ] {
+            let miss = parse_github_release_json_for_target(macos_arm_only, os, arch).unwrap();
+            assert_eq!(
+                miss.download_url,
+                "https://github.com/smokeInCloud060201/audora/releases/tag/v1.3.0"
+            );
+            assert_eq!(miss.package_size_bytes, 0);
+            assert!(miss.sha256.is_empty(), "must be unverified for {os}-{arch}");
+        }
+    }
+
+    #[test]
+    fn prober_skips_known_size_ebml_cluster_and_ignores_oversized_id3v2_tag() {
+        use crate::adapters::probe_container_duration_ms;
+
+        let temp = TempDir::new().expect("tempdir");
+
+        // 1. WebM where a known-size `Cluster` (`0x1F43_B675`) appears BEFORE `Info` (`0x1549_A966`)
+        let mut webm = Vec::new();
+        webm.extend_from_slice(&[0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01]);
+        let mut segment_payload = Vec::new();
+        // Known-size Cluster of 4 zero bytes
+        segment_payload.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75, 0x84, 0, 0, 0, 0]);
+        let mut info_payload = Vec::new();
+        info_payload.extend_from_slice(&[0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]);
+        info_payload.extend_from_slice(&[0x44, 0x89, 0x88]);
+        info_payload.extend_from_slice(&(7_500.0_f64).to_be_bytes());
+        segment_payload.extend_from_slice(&[
+            0x15,
+            0x49,
+            0xA9,
+            0x66,
+            0x80 | (info_payload.len() as u8),
+        ]);
+        segment_payload.extend_from_slice(&info_payload);
+        webm.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x80 | (segment_payload.len() as u8)]);
+        webm.extend_from_slice(&segment_payload);
+        let webm_path = create_dummy_media_file(&temp, "cluster_first.webm", &webm);
+        assert_eq!(probe_container_duration_ms(&webm_path), Some(7_500));
+
+        // 2. MP3 whose leading ID3v2 header claims a truncated/oversized length (`next >= file_len`)
+        //    must NOT advance `offset` past EOF and must still scan the Xing header inside the buffer!
+        let mut mp3 = vec![0_u8; 256];
+        mp3[0..3].copy_from_slice(b"ID3");
+        mp3[3] = 4;
+        mp3[4] = 0;
+        mp3[6..10].copy_from_slice(&[0x00, 0x10, 0x00, 0x00]); // claims >163KB (> 256B file_len)
+        mp3[16..20].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        mp3[16 + 36..16 + 40].copy_from_slice(b"Xing");
+        mp3[16 + 40..16 + 44].copy_from_slice(&1_u32.to_be_bytes());
+        mp3[16 + 44..16 + 48].copy_from_slice(&500_u32.to_be_bytes()); // 500 * 1152 / 44100 = 13_061 ms
+        let mp3_path = create_dummy_media_file(&temp, "truncated_id3.mp3", &mp3);
+        assert_eq!(probe_container_duration_ms(&mp3_path), Some(13_061));
+    }
+
+    #[test]
+    fn wal_corrupt_backup_allowlist_sources_clamping_bounds_and_windows_parent_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("audora.sqlite");
+        let wal_path = temp.path().join("audora.sqlite-wal");
+        {
+            let live_db = Database::open(&db_path).expect("open initial wal db");
+            live_db
+                .rpc_save_settings(&crate::domain::AppSettings::default())
+                .expect("write wal frame");
+            let saved_main = fs::read(&db_path).expect("read main db");
+            let saved_wal = fs::read(&wal_path).unwrap_or_else(|_| b"UNFLUSHED_WAL_DATA".to_vec());
+            drop(live_db);
+            let mut corrupted_main = saved_main;
+            for b in corrupted_main.iter_mut().take(64) {
+                *b = 0xFF;
+            }
+            fs::write(&db_path, corrupted_main).unwrap();
+            fs::write(&wal_path, saved_wal).unwrap();
+        }
+
+        let recovered = Database::open_or_recover(&db_path).expect("recover");
+        assert!(temp.path().join("audora.sqlite.corrupt.bak").is_file());
+        assert!(temp.path().join("audora.sqlite-wal.corrupt.bak").is_file());
+
+        // `parse_lenient_state_object` drops oversized notes (>10,000 chars) and oversized playlist names (>120 chars),
+        // and `query_allowlist_sources` returns only standalone media (`source_folder_id IS NULL`) + `source_folders`.
+        let huge_note = "x".repeat(crate::domain::MAX_NOTE_BODY_CHARS + 10);
+        let huge_pl_name = "p".repeat(crate::domain::MAX_PLAYLIST_NAME_CHARS + 5);
+        let import_payload = serde_json::json!({
+            "media": [
+                {
+                    "id": "m_standalone",
+                    "path": "/tmp/standalone.flac",
+                    "media_kind": "audio",
+                    "availability": "available"
+                },
+                {
+                    "id": "m_folder",
+                    "path": "/tmp/folder/track.flac",
+                    "media_kind": "audio",
+                    "availability": "available",
+                    "source_folder_id": "src_1"
+                }
+            ],
+            "notes": [
+                { "id": "n_huge", "media_id": "m_standalone", "position_ms": 0, "body": huge_note },
+                { "id": "n_ok", "media_id": "m_standalone", "position_ms": 1000, "body": "valid" }
+            ],
+            "playlists": [
+                { "id": "pl_huge", "name": huge_pl_name, "description": "" },
+                { "id": "pl_ok", "name": "Valid List", "description": "", "item_ids": ["m_standalone"] }
+            ],
+            "settings": {
+                "source_folders": [{
+                    "id": "src_1",
+                    "path": "/tmp/folder",
+                    "label": "folder",
+                    "enabled": true
+                }]
+            }
+        });
+        recovered
+            .import_relational_state_json(&import_payload.to_string())
+            .expect("import");
+
+        let (standalone_paths, folders) = recovered.query_allowlist_sources().expect("sources");
+        assert_eq!(standalone_paths, vec!["/tmp/standalone.flac".to_owned()]);
+        assert_eq!(folders.len(), 1);
+
+        let exported = recovered.export_relational_state().unwrap().unwrap();
+        assert_eq!(exported.notes.len(), 1);
+        assert_eq!(exported.notes[0].id, "n_ok");
+        assert_eq!(exported.playlists.len(), 1);
+        assert_eq!(exported.playlists[0].id, "pl_ok");
+
+        // `u64::MAX` clamps to `i64::MAX` (`MAX_SAFE_DURATION_MS`) instead of resetting to 0!
+        recovered
+            .rpc_update_progress("m_standalone", u64::MAX, false, None)
+            .expect("clamp progress");
+        let after_clamp = recovered.export_relational_state().unwrap().unwrap();
+        let m_st = after_clamp
+            .media
+            .iter()
+            .find(|m| m.id == "m_standalone")
+            .unwrap();
+        assert_eq!(m_st.last_position_ms, crate::domain::MAX_SAFE_DURATION_MS);
+
+        drop(recovered);
+
+        // Windows-style `<root>/com.audora.desktop/data` cleanup removes both `data` and empty `com.audora.desktop`!
+        let win_parent = temp.path().join("com.audora.desktop");
+        let win_data = win_parent.join("data");
+        fs::create_dir_all(win_data.join("webview")).unwrap();
+        fs::write(win_data.join("audora.sqlite"), b"stub").unwrap();
+        let _ = crate::services::cleanup_all_app_artifacts(&win_data).expect("cleanup win layout");
+        assert!(!win_data.exists());
+        assert!(!win_parent.exists());
     }
 }

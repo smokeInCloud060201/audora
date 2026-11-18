@@ -44,8 +44,6 @@ jobs:
             patchelf \
             rpm \
             dpkg-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good
 
@@ -153,6 +151,32 @@ jobs:
           <dict>
             <key>CFBundleDisplayName</key>
             <string>Audora</string>
+            <key>CFBundleDocumentTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleTypeExtensions</key>
+                <array>
+                  <string>mp4</string>
+                  <string>m4v</string>
+                  <string>mov</string>
+                  <string>webm</string>
+                  <string>mkv</string>
+                  <string>mp3</string>
+                  <string>wav</string>
+                  <string>flac</string>
+                  <string>ogg</string>
+                  <string>opus</string>
+                  <string>m4a</string>
+                  <string>aac</string>
+                </array>
+                <key>CFBundleTypeName</key>
+                <string>Media File</string>
+                <key>CFBundleTypeRole</key>
+                <string>Viewer</string>
+                <key>LSHandlerRank</key>
+                <string>Alternate</string>
+              </dict>
+            </array>
             <key>CFBundleExecutable</key>
             <string>audora</string>
             <key>CFBundleIconFile</key>
@@ -185,9 +209,13 @@ jobs:
               security unlock-keychain -p "audora-ci" "${RUNNER_TEMP}/build.keychain"
               security import "${RUNNER_TEMP}/build_cert.p12" -k "${RUNNER_TEMP}/build.keychain" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -T /usr/bin/codesign
               security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "audora-ci" "${RUNNER_TEMP}/build.keychain"
-              codesign --force --deep --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" --entitlements apps/desktop/src-tauri/Entitlements.plist "dist-macos/Audora.app"
+              codesign --force --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" "${APP_DIR}/Resources/uninstall-cleanup.sh"
+              codesign --force --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" --entitlements apps/desktop/src-tauri/Entitlements.plist "${APP_DIR}/MacOS/audora"
+              codesign --force --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" --entitlements apps/desktop/src-tauri/Entitlements.plist "dist-macos/Audora.app"
             else
-              codesign --force --deep --sign - --entitlements apps/desktop/src-tauri/Entitlements.plist "dist-macos/Audora.app"
+              codesign --force --sign - "${APP_DIR}/Resources/uninstall-cleanup.sh"
+              codesign --force --sign - --entitlements apps/desktop/src-tauri/Entitlements.plist "${APP_DIR}/MacOS/audora"
+              codesign --force --sign - --entitlements apps/desktop/src-tauri/Entitlements.plist "dist-macos/Audora.app"
             fi
             codesign --verify --deep --strict --verbose=2 "dist-macos/Audora.app"
 
@@ -203,6 +231,9 @@ jobs:
             ln -s /Applications "dist-macos/Applications"
             cp apps/desktop/src-tauri/installer/macos/uninstall-cleanup.sh "dist-macos/Uninstall Audora.command"
             chmod +x "dist-macos/Uninstall Audora.command"
+            if [[ -n "${APPLE_CERTIFICATE:-}" && -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+              codesign --force --options runtime --timestamp --sign "${APPLE_SIGNING_IDENTITY}" "dist-macos/Uninstall Audora.command"
+            fi
             if command -v SetFile >/dev/null 2>&1; then
               SetFile -a C "dist-macos" || true
             fi
@@ -270,6 +301,7 @@ jobs:
               SETUP_EXE="release-artifacts/Audora_${CLEAN_VERSION}_windows-x86_64-setup.exe"
               cat > dist-windows/audora-installer.nsi <<NSIS
           !include "MUI2.nsh"
+          !include "../apps/desktop/src-tauri/installer/windows/nsis-hooks.nsh"
           Name "Audora ${CLEAN_VERSION}"
           OutFile "../${SETUP_EXE}"
           InstallDir "\$LOCALAPPDATA\\Programs\\Audora"
@@ -294,10 +326,7 @@ jobs:
           SectionEnd
 
           Section "Uninstall"
-            IfFileExists "\$INSTDIR\\Audora.exe" 0 +2
-              nsExec::ExecToLog '"\$INSTDIR\\Audora.exe" --uninstall-cleanup'
-            RMDir /r "\$APPDATA\\com.audora.desktop"
-            RMDir /r "\$LOCALAPPDATA\\com.audora.desktop"
+            !insertmacro NSIS_HOOK_PREUNINSTALL
             Delete "\$SMPROGRAMS\\Audora\\Audora.lnk"
             RMDir "\$SMPROGRAMS\\Audora"
             Delete "\$DESKTOP\\Audora.lnk"

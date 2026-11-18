@@ -44,7 +44,7 @@ impl NotesRepository for SqliteNotesRepository {
                 params![
                     id,
                     input.media_id,
-                    i64::try_from(input.position_ms).unwrap_or(0),
+                    i64::try_from(input.position_ms).unwrap_or(i64::MAX),
                     i64::from(input.is_quick_marker),
                     input.body,
                     now_iso,

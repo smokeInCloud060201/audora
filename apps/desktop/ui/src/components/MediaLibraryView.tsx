@@ -1,4 +1,5 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ipcClient } from "../api/ipc";
 import type {
   AppErrorPayload,
@@ -14,8 +15,10 @@ import {
   formatDurationMs,
   formatHumanDate,
 } from "../utils/format";
+import { useModalFocusTrap } from "../utils/useModalFocusTrap";
 import {
   IconArrowRight,
+  IconClose,
   IconFolderOpen,
   IconMoreHorizontal,
   IconPlay,
@@ -51,6 +54,7 @@ interface MediaLibraryViewProps {
   onBrowseRelinkFile: (mediaId: string) => void;
   onClearMissingTarget: () => void;
   timestampPrecision: TimestampPrecision;
+  onModalOpenChange?: (open: boolean) => void;
 }
 
 export const MediaLibraryView = React.memo(function MediaLibraryView({
@@ -82,7 +86,53 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
   onBrowseRelinkFile,
   onClearMissingTarget,
   timestampPrecision,
+  onModalOpenChange,
 }: MediaLibraryViewProps): React.ReactElement {
+  const [pendingRemoveItem, setPendingRemoveItem] = useState<MediaItem | null>(null);
+  const removeDialogRef = useRef<HTMLDivElement | null>(null);
+  const cancelRemoveBtnRef = useRef<HTMLButtonElement | null>(null);
+  useModalFocusTrap(Boolean(pendingRemoveItem), removeDialogRef, cancelRemoveBtnRef);
+
+  useEffect(() => {
+    const isOpen = Boolean(pendingRemoveItem);
+    onModalOpenChange?.(isOpen);
+    return () => {
+      onModalOpenChange?.(false);
+    };
+  }, [pendingRemoveItem, onModalOpenChange]);
+
+  useEffect(() => {
+    if (!pendingRemoveItem) return undefined;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setPendingRemoveItem(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [pendingRemoveItem]);
+
+  const confirmRemoveItem = () => {
+    if (!pendingRemoveItem) return;
+    const targetId = pendingRemoveItem.id;
+    ipcClient.removeMedia(targetId);
+    setPendingRemoveItem(null);
+    if (missingMediaTarget?.id === targetId) {
+      onClearMissingTarget();
+    }
+    onUpdateSnapshot(ipcClient.getPlaybackSnapshot());
+    onBumpLibraryVersion();
+  };
+
+  const pendingRemoveNoteCount = pendingRemoveItem
+    ? Math.max(
+        pendingRemoveItem.note_count,
+        missingMediaTarget?.id === pendingRemoveItem.id
+          ? missingTargetNotes.length
+          : 0,
+      )
+    : 0;
   const mediaById = useMemo(() => {
     const map = new Map<string, MediaItem>();
     for (const m of allMedia) {
@@ -107,7 +157,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
             gap: 28,
           }}
         >
-          <div>
+          <div style={{ minWidth: 0 }}>
             <span
               style={{
                 display: "inline-block",
@@ -134,6 +184,8 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
             </p>
             <div
               style={{
+                minWidth: 0,
+                overflowWrap: "anywhere",
                 padding: 12,
                 borderRadius: 8,
                 background: "var(--bg-inset)",
@@ -145,7 +197,9 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
               <div style={{ color: "var(--text-tertiary)", marginBottom: 4 }}>
                 Last known location
               </div>
-              <code>{missingMediaTarget.path}</code>
+              <code style={{ display: "block", minWidth: 0, overflowWrap: "anywhere" }}>
+                {missingMediaTarget.path}
+              </code>
             </div>
 
             <label
@@ -206,13 +260,9 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
               </button>
               <button
                 type="button"
-                className="btn-secondary"
-                onClick={() => {
-                  ipcClient.removeMedia(missingMediaTarget.id);
-                  onClearMissingTarget();
-                  onUpdateSnapshot(ipcClient.getPlaybackSnapshot());
-                  onBumpLibraryVersion();
-                }}
+                className="btn-danger-subtle"
+                style={{ height: 34, padding: "0 12px" }}
+                onClick={() => setPendingRemoveItem(missingMediaTarget)}
               >
                 Remove from library
               </button>
@@ -228,6 +278,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
 
           <div
             style={{
+              minWidth: 0,
               padding: 20,
               borderRadius: 10,
               background: "var(--bg-surface-2)",
@@ -501,6 +552,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                               type="button"
                               className="jump-link-btn"
                               aria-label={`Actions for ${item.display_name}`}
+                              aria-haspopup="menu"
                               aria-expanded={isMenuOpen}
                               onClick={(e) => {
                                 const rect = e.currentTarget.getBoundingClientRect();
@@ -518,12 +570,15 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                             </button>
                             {isMenuOpen && (
                               <div
+                                role="menu"
+                                aria-label={`Actions for ${item.display_name}`}
                                 className={`media-row-menu ${
                                   libraryMenuPlacement === "up" ? "open-up" : "open-down"
                                 }`}
                               >
                                 <button
                                   type="button"
+                                  role="menuitem"
                                   className="btn-secondary"
                                   onClick={() => onSelectLibraryItem(item, true)}
                                 >
@@ -531,6 +586,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                 </button>
                                 <button
                                   type="button"
+                                  role="menuitem"
                                   className="btn-secondary"
                                   onClick={() => {
                                     onUpdateSnapshot(ipcClient.addToQueue(item.id));
@@ -541,6 +597,7 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                 </button>
                                 <button
                                   type="button"
+                                  role="menuitem"
                                   className="btn-secondary"
                                   onClick={() => {
                                     onAddToPlaylist(item);
@@ -552,10 +609,12 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                 {!isMissing && (
                                   <button
                                     type="button"
+                                    role="menuitem"
                                     className="btn-secondary"
                                     onClick={() => {
                                       ipcClient.markMediaMissing(item.id);
                                       onSetOpenLibraryMenuId(null);
+                                      onUpdateSnapshot(ipcClient.getPlaybackSnapshot());
                                       onBumpLibraryVersion();
                                     }}
                                   >
@@ -564,12 +623,11 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
                                 )}
                                 <button
                                   type="button"
+                                  role="menuitem"
                                   className="btn-secondary"
                                   onClick={() => {
-                                    ipcClient.removeMedia(item.id);
                                     onSetOpenLibraryMenuId(null);
-                                    onUpdateSnapshot(ipcClient.getPlaybackSnapshot());
-                                    onBumpLibraryVersion();
+                                    setPendingRemoveItem(item);
                                   }}
                                 >
                                   Remove from library
@@ -648,6 +706,78 @@ export const MediaLibraryView = React.memo(function MediaLibraryView({
           )}
         </>
       )}
+
+      {pendingRemoveItem &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="modal-backdrop"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirm remove from library"
+            data-testid="confirm-remove-media-modal"
+          >
+            <div ref={removeDialogRef} className="modal-dialog">
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <h2 style={{ margin: 0, fontSize: 17 }}>Remove from library?</h2>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ width: 30, height: 30, padding: 0 }}
+                  aria-label="Close confirmation dialog"
+                  onClick={() => setPendingRemoveItem(null)}
+                >
+                  <IconClose size={14} />
+                </button>
+              </div>
+              <p style={{ margin: 0, fontSize: 13, color: "var(--text-secondary)" }}>
+                {pendingRemoveNoteCount > 0 ? (
+                  <>
+                    Removing <strong>{pendingRemoveItem.display_name}</strong> from your
+                    library will permanently delete{" "}
+                    <strong>
+                      {pendingRemoveNoteCount} saved{" "}
+                      {pendingRemoveNoteCount === 1 ? "note" : "notes"}
+                    </strong>{" "}
+                    associated with it. Your media file on disk will not be modified or
+                    deleted.
+                  </>
+                ) : (
+                  <>
+                    Remove <strong>{pendingRemoveItem.display_name}</strong> from your
+                    Audora library? Your media file on disk will not be modified or
+                    deleted.
+                  </>
+                )}
+              </p>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button
+                  ref={cancelRemoveBtnRef}
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => setPendingRemoveItem(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn-danger-subtle"
+                  style={{ height: 34, padding: "0 14px" }}
+                  onClick={confirmRemoveItem}
+                >
+                  Remove from library
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 });

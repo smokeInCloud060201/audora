@@ -1,6 +1,14 @@
 # cargo-deny configuration for Audora (Apache-2.0 project policy)
 # Enforces ADR 0002: permissive and weak-copyleft file-scoped crates only; no GPL/AGPL/SSPL.
 
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
 [advisories]
 version = 2
 yanked = "deny"

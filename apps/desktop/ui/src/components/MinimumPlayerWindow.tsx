@@ -7,7 +7,7 @@ import type {
   TimestampPrecision,
 } from "../types/domain";
 import {
-  formatAriaTimestamp,
+  formatAriaProgress,
   formatDurationMs,
   progressPercent,
 } from "../utils/format";
@@ -72,8 +72,9 @@ export const MinimumPlayerWindow = React.memo(function MinimumPlayerWindow({
           data-tauri-drag-region
           data-node-id="20:3"
           onMouseDown={(e) => {
+            if (e.button !== 0 || e.detail !== 1) return;
             const target = e.target as HTMLElement | null;
-            if (target?.closest("button")) return;
+            if (target?.closest("button, input, a, select, textarea, [role='button']")) return;
             ipcClient.dragNativeWindow();
           }}
         >
@@ -180,8 +181,9 @@ export const MinimumPlayerWindow = React.memo(function MinimumPlayerWindow({
             <div className="minimum-scrubber-wrap">
               <input
                 type="range"
+                data-seek-scrubber="true"
                 aria-label="Seek timeline"
-                aria-valuetext={formatAriaTimestamp(displayPositionMs)}
+                aria-valuetext={formatAriaProgress(displayPositionMs, snapshot.duration_ms)}
                 className="minimum-scrubber"
                 disabled={!activeMedia}
                 min={0}

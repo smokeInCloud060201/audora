@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ipcClient } from "../api/ipc";
 import type {
   AppErrorPayload,
@@ -49,6 +50,7 @@ interface PlaylistsViewProps {
   onPlaylistDeleted: (deleted: Playlist) => void;
   onCollapse: () => void;
   timestampPrecision: TimestampPrecision;
+  onModalOpenChange?: (open: boolean) => void;
 }
 
 export const PlaylistsView = React.memo(function PlaylistsView({
@@ -64,6 +66,7 @@ export const PlaylistsView = React.memo(function PlaylistsView({
   onPlaylistDeleted,
   onCollapse,
   timestampPrecision,
+  onModalOpenChange,
 }: PlaylistsViewProps): React.ReactElement {
   const [sidebarFilter, setSidebarFilter] = useState<string>("");
 
@@ -83,8 +86,18 @@ export const PlaylistsView = React.memo(function PlaylistsView({
   const composerNameRef = useRef<HTMLInputElement | null>(null);
   const addMediaDialogRef = useRef<HTMLDivElement | null>(null);
   const addMediaSearchRef = useRef<HTMLInputElement | null>(null);
+  const hasOpenPlaylistModal =
+    Boolean(composerMode) ||
+    (isAddMediaOpen && Boolean(activePlaylistSafe(playlists, selectedPlaylistId)));
   useModalFocusTrap(Boolean(composerMode), composerDialogRef, composerNameRef);
   useModalFocusTrap(isAddMediaOpen && Boolean(activePlaylistSafe(playlists, selectedPlaylistId)), addMediaDialogRef, addMediaSearchRef);
+
+  useEffect(() => {
+    onModalOpenChange?.(hasOpenPlaylistModal);
+    return () => {
+      onModalOpenChange?.(false);
+    };
+  }, [hasOpenPlaylistModal, onModalOpenChange]);
 
   useEffect(() => {
     if (!composerMode && !isAddMediaOpen) return undefined;
@@ -633,231 +646,238 @@ export const PlaylistsView = React.memo(function PlaylistsView({
       </aside>
 
       {/* Create / Edit Playlist Modal */}
-      {composerMode && (
-        <div
-          className="modal-backdrop"
-          role="dialog"
-          aria-modal="true"
-          aria-label={composerMode === "create" ? "Create playlist" : "Edit playlist"}
-          data-testid="playlist-composer-modal"
-        >
-          <form ref={composerDialogRef} className="modal-dialog" onSubmit={handleSaveComposer}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <h2 style={{ margin: 0, fontSize: 17 }}>
-                {composerMode === "create" ? "New playlist" : "Edit playlist details"}
-              </h2>
-              <button
-                type="button"
-                className="btn-secondary"
-                style={{ width: 30, height: 30, padding: 0 }}
-                aria-label="Close modal"
-                onClick={() => setComposerMode(null)}
-              >
-                <IconClose size={14} />
-              </button>
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <label
-                htmlFor="playlist-name-input"
-                style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}
-              >
-                Name
-              </label>
-              <input
-                ref={composerNameRef}
-                id="playlist-name-input"
-                type="text"
-                placeholder="e.g. Sound Design Masterclass"
-                value={nameDraft}
-                onChange={(e) => setNameDraft(e.target.value)}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  borderRadius: 8,
-                  border: "1px solid var(--border-control)",
-                  background: "var(--bg-inset)",
-                  color: "var(--text-primary)",
-                  fontSize: 13,
-                }}
-              />
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <label
-                htmlFor="playlist-desc-input"
-                style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}
-              >
-                Description (optional)
-              </label>
-              <textarea
-                id="playlist-desc-input"
-                className="note-textarea"
-                style={{ minHeight: 74 }}
-                placeholder="Notes or context about this collection…"
-                value={descDraft}
-                onChange={(e) => setDescDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-                    handleSaveComposer(e);
-                  }
-                }}
-              />
-            </div>
-
-            {composerError && (
-              <div role="alert" style={{ fontSize: 12, color: "var(--status-error-text)" }}>
-                {composerError}
-              </div>
-            )}
-
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => setComposerMode(null)}
-              >
-                Cancel
-              </button>
-              <button type="submit" className="btn-primary">
-                {composerMode === "create" ? "Create playlist" : "Save changes"}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {/* Add Media from Library Multi-Select Modal */}
-      {isAddMediaOpen && activePlaylist && (
-        <div
-          className="modal-backdrop"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Add media from library"
-          data-testid="playlist-add-media-modal"
-        >
-          <div ref={addMediaDialogRef} className="source-picker-dialog" style={{ width: 540 }}>
-            <div className="source-picker-header">
-              <div>
-                <h2 style={{ margin: 0, fontSize: 16 }}>
-                  Add media to “{activePlaylist.name}”
+      {composerMode &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="modal-backdrop"
+            role="dialog"
+            aria-modal="true"
+            aria-label={composerMode === "create" ? "Create playlist" : "Edit playlist"}
+            data-testid="playlist-composer-modal"
+          >
+            <form ref={composerDialogRef} className="modal-dialog" onSubmit={handleSaveComposer}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <h2 style={{ margin: 0, fontSize: 17 }}>
+                  {composerMode === "create" ? "New playlist" : "Edit playlist details"}
                 </h2>
-                <p style={{ margin: "2px 0 0 0", fontSize: 12, color: "var(--text-tertiary)" }}>
-                  Select one or more items from your local library
-                </p>
-              </div>
-              <button
-                type="button"
-                className="btn-secondary"
-                style={{ width: 30, height: 30, padding: 0 }}
-                aria-label="Close modal"
-                onClick={() => setIsAddMediaOpen(false)}
-              >
-                <IconClose size={14} />
-              </button>
-            </div>
-
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input
-                ref={addMediaSearchRef}
-                type="search"
-                aria-label="Search library items"
-                placeholder="Search library…"
-                value={pickerSearch}
-                onChange={(e) => setPickerSearch(e.target.value)}
-                className="source-picker-filter"
-                style={{ flex: 1 }}
-              />
-              {(["all", "video", "audio"] as LibraryFilter[]).map((f) => (
-                <button
-                  key={f}
-                  type="button"
-                  className="filter-pill"
-                  aria-pressed={pickerFilter === f}
-                  onClick={() => setPickerFilter(f)}
-                >
-                  {f.charAt(0).toUpperCase() + f.slice(1)}
-                </button>
-              ))}
-            </div>
-
-            <div className="playlist-picker-list">
-              {candidateLibraryItems.length === 0 ? (
-                <div className="source-picker-empty" style={{ padding: "24px 12px" }}>
-                  {allMedia.length === 0
-                    ? "Your library has no media files yet."
-                    : "All matching library items are already in this playlist."}
-                </div>
-              ) : (
-                candidateLibraryItems.map((item) => {
-                  const checked = selectedMediaIds.includes(item.id);
-                  return (
-                    <button
-                      key={item.id}
-                      type="button"
-                      role="checkbox"
-                      aria-checked={checked}
-                      className="playlist-picker-row"
-                      onClick={() => toggleCandidateSelection(item.id)}
-                    >
-                      <div style={{ minWidth: 0, flex: 1 }}>
-                        <div
-                          style={{
-                            fontSize: 13,
-                            fontWeight: 600,
-                            color: "var(--text-primary)",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {item.display_name}
-                        </div>
-                        <div
-                          className="tabular-nums"
-                          style={{ fontSize: 11, color: "var(--text-tertiary)" }}
-                        >
-                          {item.media_kind.toUpperCase()} ·{" "}
-                          {formatDurationMs(item.duration_ms, timestampPrecision)}
-                        </div>
-                      </div>
-                      <span
-                        className={`playlist-check-indicator ${checked ? "checked" : ""}`}
-                        aria-hidden="true"
-                      >
-                        {checked ? <IconCheck size={13} /> : <IconPlus size={13} />}
-                      </span>
-                    </button>
-                  );
-                })
-              )}
-            </div>
-
-            <div className="source-picker-footer">
-              <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
-                {selectedMediaIds.length} selected
-              </span>
-              <div style={{ display: "flex", gap: 10 }}>
                 <button
                   type="button"
                   className="btn-secondary"
-                  onClick={() => setIsAddMediaOpen(false)}
+                  style={{ width: 30, height: 30, padding: 0 }}
+                  aria-label="Close modal"
+                  onClick={() => setComposerMode(null)}
+                >
+                  <IconClose size={14} />
+                </button>
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <label
+                  htmlFor="playlist-name-input"
+                  style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}
+                >
+                  Name
+                </label>
+                <input
+                  ref={composerNameRef}
+                  id="playlist-name-input"
+                  type="text"
+                  placeholder="e.g. Sound Design Masterclass"
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  style={{
+                    width: "100%",
+                    padding: "10px 12px",
+                    borderRadius: 8,
+                    border: "1px solid var(--border-control)",
+                    background: "var(--bg-inset)",
+                    color: "var(--text-primary)",
+                    fontSize: 13,
+                  }}
+                />
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <label
+                  htmlFor="playlist-desc-input"
+                  style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}
+                >
+                  Description (optional)
+                </label>
+                <textarea
+                  id="playlist-desc-input"
+                  className="note-textarea"
+                  style={{ minHeight: 74 }}
+                  placeholder="Notes or context about this collection…"
+                  value={descDraft}
+                  onChange={(e) => setDescDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                      handleSaveComposer(e);
+                    }
+                  }}
+                />
+              </div>
+
+              {composerError && (
+                <div role="alert" style={{ fontSize: 12, color: "var(--status-error-text)" }}>
+                  {composerError}
+                </div>
+              )}
+
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => setComposerMode(null)}
                 >
                   Cancel
                 </button>
-                <button
-                  type="button"
-                  className="btn-primary"
-                  disabled={selectedMediaIds.length === 0}
-                  onClick={handleConfirmAddMedia}
-                >
-                  Add {selectedMediaIds.length > 0 ? `(${selectedMediaIds.length})` : ""}
+                <button type="submit" className="btn-primary">
+                  {composerMode === "create" ? "Create playlist" : "Save changes"}
                 </button>
               </div>
+            </form>
+          </div>,
+          document.body,
+        )}
+
+      {/* Add Media from Library Multi-Select Modal */}
+      {isAddMediaOpen &&
+        activePlaylist &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="modal-backdrop"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Add media from library"
+            data-testid="playlist-add-media-modal"
+          >
+            <div ref={addMediaDialogRef} className="source-picker-dialog" style={{ width: 540 }}>
+              <div className="source-picker-header">
+                <div>
+                  <h2 style={{ margin: 0, fontSize: 16 }}>
+                    Add media to “{activePlaylist.name}”
+                  </h2>
+                  <p style={{ margin: "2px 0 0 0", fontSize: 12, color: "var(--text-tertiary)" }}>
+                    Select one or more items from your local library
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ width: 30, height: 30, padding: 0 }}
+                  aria-label="Close modal"
+                  onClick={() => setIsAddMediaOpen(false)}
+                >
+                  <IconClose size={14} />
+                </button>
+              </div>
+
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  ref={addMediaSearchRef}
+                  type="search"
+                  aria-label="Search library items"
+                  placeholder="Search library…"
+                  value={pickerSearch}
+                  onChange={(e) => setPickerSearch(e.target.value)}
+                  className="source-picker-filter"
+                  style={{ flex: 1 }}
+                />
+                {(["all", "video", "audio"] as LibraryFilter[]).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    className="filter-pill"
+                    aria-pressed={pickerFilter === f}
+                    onClick={() => setPickerFilter(f)}
+                  >
+                    {f.charAt(0).toUpperCase() + f.slice(1)}
+                  </button>
+                ))}
+              </div>
+
+              <div className="playlist-picker-list" role="group" aria-label="Library media items">
+                {candidateLibraryItems.length === 0 ? (
+                  <div className="source-picker-empty" style={{ padding: "24px 12px" }}>
+                    {allMedia.length === 0
+                      ? "Your library has no media files yet."
+                      : "All matching library items are already in this playlist."}
+                  </div>
+                ) : (
+                  candidateLibraryItems.map((item) => {
+                    const checked = selectedMediaIds.includes(item.id);
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        role="checkbox"
+                        aria-checked={checked}
+                        className="playlist-picker-row"
+                        onClick={() => toggleCandidateSelection(item.id)}
+                      >
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div
+                            style={{
+                              fontSize: 13,
+                              fontWeight: 600,
+                              color: "var(--text-primary)",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {item.display_name}
+                          </div>
+                          <div
+                            className="tabular-nums"
+                            style={{ fontSize: 11, color: "var(--text-tertiary)" }}
+                          >
+                            {item.media_kind.toUpperCase()} ·{" "}
+                            {formatDurationMs(item.duration_ms, timestampPrecision)}
+                          </div>
+                        </div>
+                        <span
+                          className={`playlist-check-indicator ${checked ? "checked" : ""}`}
+                          aria-hidden="true"
+                        >
+                          {checked ? <IconCheck size={13} /> : <IconPlus size={13} />}
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+
+              <div className="source-picker-footer">
+                <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
+                  {selectedMediaIds.length} selected
+                </span>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => setIsAddMediaOpen(false)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    disabled={selectedMediaIds.length === 0}
+                    onClick={handleConfirmAddMedia}
+                  >
+                    Add {selectedMediaIds.length > 0 ? `(${selectedMediaIds.length})` : ""}
+                  </button>
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </>
   );
 });

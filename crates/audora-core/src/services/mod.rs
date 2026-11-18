@@ -331,15 +331,18 @@ impl AudoraAppService {
         // Keep the first opened item active without double-spawning external probers (`M-5`).
         if opened_items.len() > 1 {
             let first = &opened_items[0];
-            if let Ok(mut snap) = self.snapshot.lock() {
-                self.load_queued_track_locked(&mut snap, &first.id, false);
+            if let Ok(loaded_snap) = self.load_queued_track(&first.id, false) {
                 if let Ok(settings) = self.settings_repo.load_settings() {
                     if settings.resume_where_left_off && !first.completed {
                         let ack = self
                             .playback_backend
-                            .seek(snap.generation, first.last_position_ms)
+                            .seek(loaded_snap.generation, first.last_position_ms)
                             .unwrap_or(first.last_position_ms);
-                        snap.position_ms = ack;
+                        if let Ok(mut snap) = self.snapshot.lock() {
+                            if snap.generation == loaded_snap.generation {
+                                snap.position_ms = ack;
+                            }
+                        }
                     }
                 }
             }
@@ -485,23 +488,46 @@ impl AudoraAppService {
         None
     }
 
-    fn load_queued_track_locked(
-        &self,
-        snap: &mut PlaybackSnapshot,
-        next_id: &str,
-        auto_play: bool,
-    ) {
-        if let Ok(Some(item)) = self.media_repo.get_by_id(next_id) {
+    fn load_queued_track(&self, next_id: &str, auto_play: bool) -> AppResult<PlaybackSnapshot> {
+        let (next_gen, was_idle) = {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+            let was_idle = snap.state == PlaybackState::Idle;
             let next_gen = snap.generation.saturating_add(1);
-            let p = Path::new(&item.path);
-            if !p.is_file() {
-                let _ = self.media_repo.update_availability(
-                    &item.id,
-                    Availability::Missing,
-                    &now_timestamp_string(),
-                );
-                let _ = self.playback_backend.stop();
-                snap.generation = next_gen;
+            snap.generation = next_gen;
+            snap.media_id = Some(next_id.to_owned());
+            snap.position_ms = 0;
+            snap.error = None;
+            if !was_idle {
+                snap.state = PlaybackState::Loading;
+            }
+            (next_gen, was_idle)
+        };
+
+        let item_opt = self.media_repo.get_by_id(next_id).ok().flatten();
+        let Some(item) = item_opt else {
+            let snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+            return Ok(snap.clone());
+        };
+
+        let p = Path::new(&item.path);
+        if !p.is_file() {
+            let _ = self.media_repo.update_availability(
+                &item.id,
+                Availability::Missing,
+                &now_timestamp_string(),
+            );
+            let _ = self.playback_backend.stop();
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+            if snap.generation == next_gen {
                 snap.media_id = Some(next_id.to_owned());
                 snap.position_ms = 0;
                 snap.state = PlaybackState::Failed;
@@ -509,14 +535,21 @@ impl AudoraAppService {
                     AppError::media_unavailable("Queued media file is missing from disk.")
                         .to_payload(),
                 );
-                return;
             }
-            let loaded_dur = self
-                .playback_backend
-                .load(p, next_gen)
-                .ok()
-                .and_then(|m| m.duration_ms);
-            snap.generation = next_gen;
+            return Ok(snap.clone());
+        }
+
+        let loaded_dur = self
+            .playback_backend
+            .load(p, next_gen)
+            .ok()
+            .and_then(|m| m.duration_ms);
+
+        let mut snap = self
+            .snapshot
+            .lock()
+            .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+        if snap.generation == next_gen {
             snap.media_id = Some(next_id.to_owned());
             snap.duration_ms = loaded_dur.or(item.duration_ms);
             snap.position_ms = 0;
@@ -524,53 +557,63 @@ impl AudoraAppService {
             if auto_play {
                 let _ = self.playback_backend.play(next_gen);
                 snap.state = PlaybackState::Playing;
-            } else if snap.state != PlaybackState::Idle {
+            } else if !was_idle {
                 snap.state = PlaybackState::Paused;
             }
-        } else {
-            snap.media_id = Some(next_id.to_owned());
-            snap.position_ms = 0;
         }
+        Ok(snap.clone())
     }
 
     /// Removes a media item from the active session queue without deleting its library record.
     pub fn remove_from_queue(&self, media_id: &str) -> AppResult<PlaybackSnapshot> {
-        let mut snap = self
-            .snapshot
-            .lock()
-            .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
-        let current_idx = snap.queue.iter().position(|id| id == media_id);
-        let was_playing = snap.state == PlaybackState::Playing;
-        snap.queue.retain(|id| id != media_id);
+        let (was_playing, ordered_candidates) = {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+            let current_idx = snap.queue.iter().position(|id| id == media_id);
+            let was_playing = snap.state == PlaybackState::Playing;
+            let was_active = snap.media_id.as_deref() == Some(media_id);
+            snap.queue.retain(|id| id != media_id);
 
-        if snap.media_id.as_deref() == Some(media_id) {
+            if !was_active {
+                return Ok(snap.clone());
+            }
             if snap.queue.is_empty() {
                 let _ = self.playback_backend.stop();
                 snap.media_id = None;
                 snap.duration_ms = None;
                 snap.state = PlaybackState::Idle;
                 snap.position_ms = 0;
-            } else {
-                let start_idx = current_idx
-                    .unwrap_or(0)
-                    .min(snap.queue.len().saturating_sub(1));
-                let len = snap.queue.len();
-                let next_playable = (0..len)
-                    .map(|offset| &snap.queue[(start_idx + offset) % len])
-                    .find(|id| self.check_queued_item_playable(id))
-                    .cloned();
-                if let Some(next_id) = next_playable {
-                    self.load_queued_track_locked(&mut snap, &next_id, was_playing);
-                } else {
-                    let _ = self.playback_backend.stop();
-                    snap.media_id = None;
-                    snap.duration_ms = None;
-                    snap.state = PlaybackState::Idle;
-                    snap.position_ms = 0;
-                }
+                return Ok(snap.clone());
             }
+            let start_idx = current_idx
+                .unwrap_or(0)
+                .min(snap.queue.len().saturating_sub(1));
+            let len = snap.queue.len();
+            let ordered: Vec<String> = (0..len)
+                .map(|offset| snap.queue[(start_idx + offset) % len].clone())
+                .collect();
+            (was_playing, ordered)
+        };
+
+        let next_playable = ordered_candidates
+            .into_iter()
+            .find(|id| self.check_queued_item_playable(id));
+        if let Some(next_id) = next_playable {
+            self.load_queued_track(&next_id, was_playing)
+        } else {
+            let _ = self.playback_backend.stop();
+            let mut snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| AppError::internal("Playback snapshot lock poisoned"))?;
+            snap.media_id = None;
+            snap.duration_ms = None;
+            snap.state = PlaybackState::Idle;
+            snap.position_ms = 0;
+            Ok(snap.clone())
         }
-        Ok(snap.clone())
     }
 
     /// Marks a media item as `Missing` when its underlying file is moved or offline.
@@ -704,15 +747,17 @@ impl AudoraAppService {
             PlaybackCommand::Next => {
                 if let Some(current_id) = snap.media_id.clone() {
                     let was_playing = snap.state == PlaybackState::Playing;
+                    let current_pos = snap.position_ms;
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
                         if let Some(next_id) = self.resolve_next_playable_queue_id(&snap, idx) {
+                            drop(snap);
                             let _ = self.media_repo.update_progress(
                                 &current_id,
-                                snap.position_ms,
+                                current_pos,
                                 false,
                                 &now_timestamp_string(),
                             );
-                            self.load_queued_track_locked(&mut snap, &next_id, was_playing);
+                            return self.load_queued_track(&next_id, was_playing);
                         }
                     }
                 }
@@ -731,25 +776,26 @@ impl AudoraAppService {
                     }
                 } else if let Some(current_id) = snap.media_id.clone() {
                     let was_playing = snap.state == PlaybackState::Playing;
+                    let current_pos = snap.position_ms;
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
                         if let Some(prev_id) = self.resolve_previous_playable_queue_id(&snap, idx) {
+                            drop(snap);
                             let _ = self.media_repo.update_progress(
                                 &current_id,
-                                snap.position_ms,
+                                current_pos,
                                 false,
                                 &now_timestamp_string(),
                             );
-                            self.load_queued_track_locked(&mut snap, &prev_id, was_playing);
-                        } else {
-                            let acknowledged = self.playback_backend.seek(gen, 0)?;
-                            snap.position_ms = acknowledged;
-                            let _ = self.media_repo.update_progress(
-                                &current_id,
-                                acknowledged,
-                                false,
-                                &now_timestamp_string(),
-                            );
+                            return self.load_queued_track(&prev_id, was_playing);
                         }
+                        let acknowledged = self.playback_backend.seek(gen, 0)?;
+                        snap.position_ms = acknowledged;
+                        let _ = self.media_repo.update_progress(
+                            &current_id,
+                            acknowledged,
+                            false,
+                            &now_timestamp_string(),
+                        );
                     }
                 }
             }
@@ -829,7 +875,8 @@ impl AudoraAppService {
                 } else if let Some(current_id) = snap.media_id.clone() {
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
                         if let Some(next_id) = self.resolve_next_playable_queue_id(&snap, idx) {
-                            self.load_queued_track_locked(&mut snap, &next_id, true);
+                            drop(snap);
+                            return self.load_queued_track(&next_id, true);
                         }
                     }
                 }
@@ -1373,7 +1420,7 @@ impl AudoraAppService {
                 .map(|d| d.as_millis())
                 .unwrap_or(0),
         )
-        .unwrap_or(0);
+        .unwrap_or(i64::MAX);
 
         let manifest_path = self.staged_manifest_path();
         let manifest: Option<ReleaseManifestDto> = if manifest_path.is_file() {
@@ -1581,9 +1628,19 @@ pub fn compare_semver(a: &str, b: &str) -> CmpOrdering {
 }
 
 /// Parses a GitHub Releases `/repos/{owner}/{repo}/releases/latest` JSON payload into a
-/// `ReleaseManifestDto`, selecting the highest-priority platform installer asset (`C-5`) and extracting
-/// its explicit 64-hex `sha256:` digest (leaving `sha256` empty so `verified == false` when absent).
+/// `ReleaseManifestDto` for the current host OS and CPU architecture (`C-5`).
 pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto> {
+    parse_github_release_json_for_target(raw_json, std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Parses a GitHub Releases JSON payload for a specific `(target_os, target_arch)` pair,
+/// selecting only compatible target-OS and target-architecture (or universal/untagged) installer
+/// assets, and falling back to `(html_url, 0, "")` (`verified == false`) if none exist.
+pub fn parse_github_release_json_for_target(
+    raw_json: &str,
+    target_os: &str,
+    target_arch: &str,
+) -> AppResult<ReleaseManifestDto> {
     let v: serde_json::Value = serde_json::from_str(raw_json)
         .map_err(|e| AppError::validation(format!("Invalid GitHub release JSON payload: {e}")))?;
 
@@ -1620,23 +1677,15 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
         .to_owned();
 
     // `(priority_rank, url, size, sha256)` — lower `priority_rank` wins so `.app.tar.gz` beats `.dmg`
-    // regardless of GitHub asset upload order (`C-5`).
-    let mut best_arch_match: Option<(usize, String, u64, String)> = None;
-    let mut best_os_match: Option<(usize, String, u64, String)> = None;
-    let mut fallback: Option<(String, u64, String)> = None;
+    // regardless of GitHub asset upload order (`C-5`). Never pick foreign-OS or wrong-arch binaries.
+    let mut best_exact_arch: Option<(usize, String, u64, String)> = None;
+    let mut best_universal: Option<(usize, String, u64, String)> = None;
 
     if let Some(assets) = v.get("assets").and_then(serde_json::Value::as_array) {
-        let os_suffixes: &[&str] = if cfg!(target_os = "macos") {
-            &[".app.tar.gz", ".dmg"]
-        } else if cfg!(target_os = "windows") {
-            &["-setup.exe", ".msi", "-portable.zip", ".exe"]
-        } else {
-            &[".deb", ".appimage", ".tar.gz"]
-        };
-        let arch_hint = if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else {
-            "x86_64"
+        let os_suffixes: &[&str] = match target_os {
+            "macos" => &[".app.tar.gz", ".dmg"],
+            "windows" => &["-setup.exe", ".msi", "-portable.zip", ".exe"],
+            _ => &[".deb", ".appimage", ".tar.gz"],
         };
 
         for asset in assets {
@@ -1648,6 +1697,25 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
             if name.ends_with(".json") || name.ends_with(".sha256") || name.ends_with(".sig") {
                 continue;
             }
+            let foreign_os = match target_os {
+                "macos" => {
+                    name.contains("windows") || name.contains("win64") || name.contains("linux")
+                }
+                "windows" => {
+                    name.contains("macos") || name.contains("darwin") || name.contains("linux")
+                }
+                _ => {
+                    name.ends_with(".app.tar.gz")
+                        || name.contains("macos")
+                        || name.contains("darwin")
+                        || name.contains("windows")
+                        || name.contains("win64")
+                }
+            };
+            if foreign_os {
+                continue;
+            }
+
             let url = asset
                 .get("browser_download_url")
                 .and_then(serde_json::Value::as_str)
@@ -1666,31 +1734,36 @@ pub fn parse_github_release_json(raw_json: &str) -> AppResult<ReleaseManifestDto
                 .filter(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
                 .map_or_else(String::new, str::to_ascii_lowercase);
 
-            if fallback.is_none() {
-                fallback = Some((url.to_owned(), size, asset_sha.clone()));
-            }
-
             if let Some(rank) = os_suffixes.iter().position(|ext| name.ends_with(ext)) {
-                let matches_arch = name.contains(arch_hint)
-                    || (!name.contains("aarch64") && !name.contains("x86_64"));
-                if matches_arch {
-                    if best_arch_match
+                let has_arm64 = name.contains("aarch64") || name.contains("arm64");
+                let has_x64 =
+                    name.contains("x86_64") || name.contains("amd64") || name.contains("x64");
+                let is_universal = name.contains("universal") || (!has_arm64 && !has_x64);
+                let exact_arch = match target_arch {
+                    "aarch64" => has_arm64 && !name.contains("universal"),
+                    "x86_64" => has_x64 && !name.contains("universal"),
+                    other => name.contains(other),
+                };
+
+                if exact_arch {
+                    if best_exact_arch
                         .as_ref()
                         .is_none_or(|(r, _, _, _)| rank < *r)
                     {
-                        best_arch_match = Some((rank, url.to_owned(), size, asset_sha));
+                        best_exact_arch = Some((rank, url.to_owned(), size, asset_sha));
                     }
-                } else if best_os_match.as_ref().is_none_or(|(r, _, _, _)| rank < *r) {
-                    best_os_match = Some((rank, url.to_owned(), size, asset_sha));
+                } else if is_universal
+                    && best_universal.as_ref().is_none_or(|(r, _, _, _)| rank < *r)
+                {
+                    best_universal = Some((rank, url.to_owned(), size, asset_sha));
                 }
             }
         }
     }
 
-    let (download_url, package_size_bytes, sha256) = best_arch_match
-        .or(best_os_match)
+    let (download_url, package_size_bytes, sha256) = best_exact_arch
+        .or(best_universal)
         .map(|(_, u, s, h)| (u, s, h))
-        .or(fallback)
         .unwrap_or((html_url, 0, String::new()));
 
     Ok(ReleaseManifestDto {
@@ -1747,7 +1820,7 @@ pub fn cleanup_all_app_artifacts(app_data_dir: &Path) -> AppResult<CleanupSummar
                 | "webview"
                 | "logs"
                 | "cache"
-        ) || (name.starts_with("audora.sqlite.")
+        ) || ((name.starts_with("audora.sqlite.") || name.starts_with("audora.sqlite-wal."))
             && (name.ends_with(".bak") || name.ends_with(".bak.tmp")))
     }
 
@@ -1779,7 +1852,23 @@ pub fn cleanup_all_app_artifacts(app_data_dir: &Path) -> AppResult<CleanupSummar
     }
 
     // Only removes `app_data_dir` itself if it is now completely empty.
-    let _ = fs::remove_dir(app_data_dir);
+    if fs::remove_dir(app_data_dir).is_ok() {
+        let is_data_leaf = app_data_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("data"));
+        if is_data_leaf {
+            if let Some(parent) = app_data_dir.parent() {
+                if parent
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case("com.audora.desktop"))
+                {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+        }
+    }
     Ok(CleanupSummaryDto {
         removed_paths,
         bytes_reclaimed,

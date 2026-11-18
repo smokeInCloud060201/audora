@@ -169,7 +169,8 @@ fn normalize_utc_iso8601(s: &str) -> Option<String> {
     let rest = &s[19..];
     let millis_str = if rest == "Z" {
         "000".to_owned()
-    } else if let Some(frac) = rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z')) {
+    } else {
+        let frac = rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z'))?;
         if frac.is_empty() || frac.len() > 9 || !frac.bytes().all(|c| c.is_ascii_digit()) {
             return None;
         }
@@ -178,8 +179,6 @@ fn normalize_utc_iso8601(s: &str) -> Option<String> {
             2 => format!("{frac}0"),
             _ => frac.get(..3)?.to_owned(),
         }
-    } else {
-        return None;
     };
     Some(format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis_str}Z"

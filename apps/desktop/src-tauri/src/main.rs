@@ -2103,7 +2103,7 @@ fn handle_http_connection(mut stream: TcpStream, ctx: &LoopbackServerContext) {
 
     let (raw_path, raw_query) = raw_target
         .split_once('?')
-        .map_or((raw_target.as_str(), ""), |(p, q)| (p, q));
+        .unwrap_or((raw_target.as_str(), ""));
 
     let mut query_token: Option<String> = None;
     for pair in raw_query.split('&') {
@@ -2981,6 +2981,7 @@ fn resolve_github_release_asset_sha256(repo: &str, tag: &str, asset_name: &str) 
     None
 }
 
+#[cfg(unix)]
 fn verify_dir_no_escaping_symlinks(canon_root: &Path, dir: &Path, depth: usize) -> bool {
     if depth > 64 {
         return false;
@@ -3010,6 +3011,7 @@ fn verify_dir_no_escaping_symlinks(canon_root: &Path, dir: &Path, depth: usize) 
     true
 }
 
+#[cfg(unix)]
 fn verify_macos_staged_bundle_no_escaping_symlinks(staged_app: &Path) -> bool {
     let Ok(root_meta) = fs::symlink_metadata(staged_app) else {
         return false;
@@ -3023,6 +3025,7 @@ fn verify_macos_staged_bundle_no_escaping_symlinks(staged_app: &Path) -> bool {
     verify_dir_no_escaping_symlinks(&canon_root, &canon_root, 0)
 }
 
+#[cfg(unix)]
 fn inspect_macos_codesign_identity(bundle: &Path) -> Option<(Option<String>, Option<String>)> {
     let output = Command::new("/usr/bin/codesign")
         .args(["-dv", "--verbose=2"])
@@ -3048,6 +3051,7 @@ fn inspect_macos_codesign_identity(bundle: &Path) -> Option<(Option<String>, Opt
     Some((identifier, team_id))
 }
 
+#[cfg(unix)]
 fn verify_macos_staged_bundle_signature(staged_app: &Path, target_app: &Path) -> bool {
     let verify_ok = Command::new("/usr/bin/codesign")
         .args(["--verify", "--deep", "--strict"])
@@ -4020,6 +4024,7 @@ fn perform_native_self_update(
     }
 }
 
+#[cfg(unix)]
 fn resolve_current_macos_app_bundle() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     for ancestor in exe.ancestors() {

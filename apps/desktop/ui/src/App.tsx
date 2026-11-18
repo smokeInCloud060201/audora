@@ -409,6 +409,9 @@ export function App(): React.ReactElement {
   useEffect(() => {
     const el = mediaElementRef.current;
     if (!el) return;
+    if ("defaultPlaybackRate" in el) {
+      el.defaultPlaybackRate = snapshot.rate;
+    }
     el.playbackRate = snapshot.rate;
     if ("preservesPitch" in el) {
       el.preservesPitch = true;
@@ -419,7 +422,7 @@ export function App(): React.ReactElement {
     if (!isPointerScrubbingRef.current) {
       const targetSec = snapshot.position_ms / 1000;
       const drift = Number.isFinite(el.currentTime) ? Math.abs(el.currentTime - targetSec) : 0;
-      if (hasExplicitSeek || drift > 1.25) {
+      if (hasExplicitSeek || el.ended || drift > 1.25) {
         appliedSeekGenRef.current = seekGenerationRef.current;
         try {
           el.currentTime = targetSec;
@@ -436,6 +439,7 @@ export function App(): React.ReactElement {
       el.pause();
     }
   }, [
+    snapshot.generation,
     snapshot.state,
     snapshot.rate,
     snapshot.volume,
@@ -1211,11 +1215,19 @@ export function App(): React.ReactElement {
     }
   };
 
-  const handleMediaStreamError = () => {
-    const failedMedia = activeMedia;
+  const handleMediaStreamError = (mediaId: string, mediaGen: number) => {
+    const initialSnap = ipcClient.getPlaybackSnapshot();
+    if (initialSnap.media_id !== mediaId || initialSnap.generation !== mediaGen) {
+      return;
+    }
+    const failedMedia = ipcClient.getMediaById(mediaId);
     if (!failedMedia) return;
     void (async () => {
       const probe = await ipcClient.probeNativeMediaDuration(failedMedia.path);
+      const currentSnap = ipcClient.getPlaybackSnapshot();
+      if (currentSnap.media_id !== mediaId || currentSnap.generation !== mediaGen) {
+        return;
+      }
       if (probe && probe.exists) {
         // File exists on disk (`C-7`): surface `AV-104` decode failure instead of marking missing!
         const nextSnap = ipcClient.markPlaybackDecodeFailed(failedMedia.id);
@@ -1245,40 +1257,96 @@ export function App(): React.ReactElement {
     })();
   };
 
-  const handleMediaEndedSync = () => {
+  const handleMediaEndedSync = (mediaId: string, mediaGen: number) => {
+    const beforeSnap = ipcClient.getPlaybackSnapshot();
+    if (beforeSnap.media_id !== mediaId || beforeSnap.generation !== mediaGen) {
+      return;
+    }
     bumpExplicitSeek();
-    setSnapshot(ipcClient.handleMediaEnded());
+    setSnapshot(ipcClient.handleMediaEnded(mediaId, mediaGen));
     setLibraryVersion((v) => v + 1);
   };
 
   const handleMediaLoadedMetadata = (
     el: HTMLVideoElement | HTMLAudioElement,
+    mediaId: string,
+    mediaGen: number,
   ) => {
+    const latestSnap = ipcClient.getPlaybackSnapshot();
+    if (latestSnap.media_id !== mediaId || latestSnap.generation !== mediaGen) {
+      return;
+    }
+    if ("defaultPlaybackRate" in el) {
+      el.defaultPlaybackRate = latestSnap.rate;
+    }
+    el.playbackRate = latestSnap.rate;
+    if ("preservesPitch" in el) {
+      el.preservesPitch = true;
+    }
+    el.volume = latestSnap.volume;
+    el.muted = latestSnap.muted;
+
     const probedDurationMs =
       Number.isFinite(el.duration) && el.duration > 0 ? el.duration * 1000 : undefined;
-    if (snapshot.position_ms > 0) {
+    if (latestSnap.position_ms > 0) {
       try {
-        el.currentTime = snapshot.position_ms / 1000;
+        el.currentTime = latestSnap.position_ms / 1000;
       } catch {
         // Ignore seek before ready state
       }
     }
-    if (snapshot.state === "playing" && el.paused) {
+    setSnapshot(
+      ipcClient.syncMediaElementPosition(
+        latestSnap.position_ms,
+        probedDurationMs,
+        mediaId,
+        mediaGen,
+      ),
+    );
+    if (latestSnap.state === "playing" && el.paused) {
       void el.play().catch(() => {
         // Ignore autoplay restrictions in headless browsers
       });
     }
-    setSnapshot(
-      ipcClient.syncMediaElementPosition(snapshot.position_ms, probedDurationMs),
-    );
   };
 
-  const handleMediaTimeUpdate = (el: HTMLVideoElement | HTMLAudioElement) => {
+  const handleMediaCanPlay = (
+    el: HTMLVideoElement | HTMLAudioElement,
+    mediaId: string,
+    mediaGen: number,
+  ) => {
+    const latestSnap = ipcClient.getPlaybackSnapshot();
+    if (latestSnap.media_id !== mediaId || latestSnap.generation !== mediaGen) {
+      return;
+    }
+    if (el.playbackRate !== latestSnap.rate) {
+      el.playbackRate = latestSnap.rate;
+    }
+    if (latestSnap.state === "playing" && el.paused) {
+      void el.play().catch(() => {
+        // Ignore autoplay restrictions in headless browsers
+      });
+    }
+  };
+
+  const handleMediaTimeUpdate = (
+    el: HTMLVideoElement | HTMLAudioElement,
+    mediaId: string,
+    mediaGen: number,
+  ) => {
     const nextSnap = ipcClient.syncMediaElementPosition(
       el.currentTime * 1000,
       Number.isFinite(el.duration) ? el.duration * 1000 : undefined,
+      mediaId,
+      mediaGen,
     );
-    if (nextSnap.state === "ended" && !el.paused) {
+    if (nextSnap.generation !== mediaGen) {
+      if (nextSnap.media_id !== mediaId && !el.paused) {
+        el.pause();
+      }
+      bumpExplicitSeek();
+      setLibraryVersion((v) => v + 1);
+    } else if (nextSnap.state === "ended" && !el.paused) {
       el.pause();
       setLibraryVersion((v) => v + 1);
     }
@@ -1292,12 +1360,21 @@ export function App(): React.ReactElement {
     <>
       {activeMedia?.media_kind === "audio" && activeMedia.stream_url && (
         <audio
+          key={activeMedia.id}
           ref={mediaElementRef as React.RefObject<HTMLAudioElement>}
           src={activeMedia.stream_url}
-          onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-          onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
-          onEnded={handleMediaEndedSync}
-          onError={handleMediaStreamError}
+          autoPlay={snapshot.state === "playing"}
+          onLoadedMetadata={(e) =>
+            handleMediaLoadedMetadata(e.currentTarget, activeMedia.id, snapshot.generation)
+          }
+          onCanPlay={(e) =>
+            handleMediaCanPlay(e.currentTarget, activeMedia.id, snapshot.generation)
+          }
+          onTimeUpdate={(e) =>
+            handleMediaTimeUpdate(e.currentTarget, activeMedia.id, snapshot.generation)
+          }
+          onEnded={() => handleMediaEndedSync(activeMedia.id, snapshot.generation)}
+          onError={() => handleMediaStreamError(activeMedia.id, snapshot.generation)}
         />
       )}
 
@@ -1574,8 +1651,10 @@ export function App(): React.ReactElement {
                   >
                     {activeMedia?.stream_url && (
                       <video
+                        key={activeMedia.id}
                         ref={mediaElementRef as React.RefObject<HTMLVideoElement>}
                         src={activeMedia.stream_url}
+                        autoPlay={snapshot.state === "playing"}
                         style={{
                           position: "absolute",
                           inset: 0,
@@ -1584,10 +1663,25 @@ export function App(): React.ReactElement {
                           objectFit: "contain",
                           zIndex: 0,
                         }}
-                        onLoadedMetadata={(e) => handleMediaLoadedMetadata(e.currentTarget)}
-                        onTimeUpdate={(e) => handleMediaTimeUpdate(e.currentTarget)}
-                        onEnded={handleMediaEndedSync}
-                        onError={handleMediaStreamError}
+                        onLoadedMetadata={(e) =>
+                          handleMediaLoadedMetadata(
+                            e.currentTarget,
+                            activeMedia.id,
+                            snapshot.generation,
+                          )
+                        }
+                        onCanPlay={(e) =>
+                          handleMediaCanPlay(e.currentTarget, activeMedia.id, snapshot.generation)
+                        }
+                        onTimeUpdate={(e) =>
+                          handleMediaTimeUpdate(
+                            e.currentTarget,
+                            activeMedia.id,
+                            snapshot.generation,
+                          )
+                        }
+                        onEnded={() => handleMediaEndedSync(activeMedia.id, snapshot.generation)}
+                        onError={() => handleMediaStreamError(activeMedia.id, snapshot.generation)}
                       />
                     )}
                     {(!activeMedia || !activeMedia.stream_url) && !unsupportedError && (

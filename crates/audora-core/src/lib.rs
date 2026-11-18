@@ -1503,4 +1503,73 @@ Properties:
         let opus_path = create_dummy_media_file(&temp, "tricky.opus", &opus);
         assert_eq!(probe_container_duration_ms(&opus_path), Some(5_000));
     }
+
+    #[test]
+    fn ended_event_auto_advances_past_missing_queued_files_and_restarts_from_zero_after_final_end()
+    {
+        let temp = TempDir::new().expect("tempdir");
+        let f1 = create_dummy_media_file(&temp, "01_part1.mp3", b"audio-1");
+        let f2 = create_dummy_media_file(&temp, "02_missing.mp3", b"audio-2");
+        let f3 = create_dummy_media_file(&temp, "03_part3.mp3", b"audio-3");
+
+        let (dispatcher, _) = build_test_dispatcher().expect("dispatcher");
+        let opened = dispatcher
+            .open_media_batch(&[
+                f1.to_string_lossy().into_owned(),
+                f2.to_string_lossy().into_owned(),
+                f3.to_string_lossy().into_owned(),
+            ])
+            .expect("open 3 tracks");
+        assert_eq!(opened.len(), 3);
+
+        // Delete Track 2 on disk while it is still queued
+        fs::remove_file(&f2).expect("remove track 2 from disk");
+
+        // Start playing Track 1 and emit `BackendEvent::Ended`
+        let playing_snap = dispatcher
+            .playback_command(PlaybackCommand::Play)
+            .expect("play track 1");
+        assert_eq!(
+            playing_snap.media_id.as_deref(),
+            Some(opened[0].id.as_str())
+        );
+
+        let after_first_end = dispatcher
+            .service()
+            .apply_backend_event(playing_snap.generation, BackendEvent::Ended)
+            .expect("track 1 ended");
+
+        // Must mark Track 2 as Missing, skip it, and auto-play Track 3 at 0 ms!
+        assert_eq!(
+            after_first_end.media_id.as_deref(),
+            Some(opened[2].id.as_str())
+        );
+        assert_eq!(after_first_end.state, PlaybackState::Playing);
+        assert_eq!(after_first_end.position_ms, 0);
+
+        let library_items = dispatcher
+            .search_library(None, LibraryFilter::All)
+            .expect("list library")
+            .media_items;
+        let t2_record = library_items
+            .iter()
+            .find(|m| m.id == opened[1].id)
+            .expect("track 2 record");
+        assert_eq!(t2_record.availability, Availability::Missing);
+
+        // Emit `BackendEvent::Ended` on final Track 3 (Repeat Off) -> transitions to `Ended`
+        let after_final_end = dispatcher
+            .service()
+            .apply_backend_event(after_first_end.generation, BackendEvent::Ended)
+            .expect("track 3 ended");
+        assert_eq!(after_final_end.state, PlaybackState::Ended);
+        assert_eq!(after_final_end.position_ms, 180_000);
+
+        // Toggling play after `Ended` seeks back to 0 ms and plays cleanly
+        let replayed = dispatcher
+            .playback_command(PlaybackCommand::TogglePlayPause)
+            .expect("replay after ended");
+        assert_eq!(replayed.state, PlaybackState::Playing);
+        assert_eq!(replayed.position_ms, 0);
+    }
 }

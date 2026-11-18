@@ -1117,12 +1117,9 @@ export class AudoraIpcClient {
     switch (cmd.action) {
       case "play":
         if (this.snapshot.media_id) {
-          if (
-            this.snapshot.state === "ended" &&
-            this.snapshot.duration_ms !== null &&
-            this.snapshot.position_ms >= this.snapshot.duration_ms
-          ) {
+          if (this.snapshot.state === "ended") {
             this.snapshot.position_ms = 0;
+            this.snapshot.generation += 1;
           }
           this.snapshot.state = "playing";
         }
@@ -1136,12 +1133,9 @@ export class AudoraIpcClient {
           this.snapshot.state = "paused";
           this.persistProgressAndSession({ immediate: true });
         } else if (this.snapshot.media_id) {
-          if (
-            this.snapshot.state === "ended" &&
-            this.snapshot.duration_ms !== null &&
-            this.snapshot.position_ms >= this.snapshot.duration_ms
-          ) {
+          if (this.snapshot.state === "ended") {
             this.snapshot.position_ms = 0;
+            this.snapshot.generation += 1;
           }
           this.snapshot.state = "playing";
         }
@@ -1205,12 +1199,11 @@ export class AudoraIpcClient {
           this.persistProgressAndSession();
         } else if (this.snapshot.media_id) {
           const wasPlaying = this.snapshot.state === "playing";
-          const idx = this.snapshot.queue.indexOf(this.snapshot.media_id);
-          if (idx > 0) {
-            this.selectMediaById(this.snapshot.queue[idx - 1]!, { autoPlay: wasPlaying });
-          } else if (this.snapshot.repeat_mode === "all" && this.snapshot.queue.length > 0) {
-            this.selectMediaById(this.snapshot.queue[this.snapshot.queue.length - 1]!, {
+          const prevCandidate = this.findPreviousPlayableQueueItem();
+          if (prevCandidate) {
+            this.selectMediaById(prevCandidate.id, {
               autoPlay: wasPlaying,
+              startFromBeginning: true,
             });
           } else {
             // Restart Track 1 from `0ms` even under 3s (`M-5` parity with `audora-core`).
@@ -1246,7 +1239,7 @@ export class AudoraIpcClient {
     const duration = this.snapshot.duration_ms;
 
     if (duration !== null && nextPos >= duration) {
-      return this.handleMediaEnded();
+      return this.handleMediaEnded(this.snapshot.media_id, this.snapshot.generation);
     }
 
     this.snapshot.position_ms = nextPos;
@@ -1260,8 +1253,20 @@ export class AudoraIpcClient {
 
   /**
    * Syncs position and optional probed duration from an active HTML5 `<video>` or `<audio>` element.
+   * Ignores stale events emitted by a prior track or load generation.
    */
-  public syncMediaElementPosition(positionMs: number, durationMs?: number): PlaybackSnapshot {
+  public syncMediaElementPosition(
+    positionMs: number,
+    durationMs?: number,
+    expectedMediaId?: string,
+    expectedGeneration?: number,
+  ): PlaybackSnapshot {
+    if (
+      (expectedMediaId !== undefined && this.snapshot.media_id !== expectedMediaId) ||
+      (expectedGeneration !== undefined && this.snapshot.generation !== expectedGeneration)
+    ) {
+      return structuredClone(this.snapshot);
+    }
     const active = this.media.find((m) => m.id === this.snapshot.media_id);
     const activeExt = active?.path
       ? (active.path.split(".").pop()?.toLowerCase() ?? "")
@@ -1312,7 +1317,7 @@ export class AudoraIpcClient {
       roundedPos >= effectiveDuration &&
       this.snapshot.state === "playing"
     ) {
-      return this.handleMediaEnded();
+      return this.handleMediaEnded(this.snapshot.media_id ?? undefined, this.snapshot.generation);
     }
     this.snapshot.position_ms =
       effectiveDuration !== null && effectiveDuration > 0
@@ -1327,8 +1332,21 @@ export class AudoraIpcClient {
 
   /**
    * Handles end-of-stream (`Ended`), marking the media item complete and honoring `Repeat` and `Shuffle`.
+   * Ignores duplicate or stale end notifications from an older media item or load generation.
    */
-  public handleMediaEnded(): PlaybackSnapshot {
+  public handleMediaEnded(
+    expectedMediaId?: string,
+    expectedGeneration?: number,
+  ): PlaybackSnapshot {
+    if (
+      !this.snapshot.media_id ||
+      this.snapshot.state === "ended" ||
+      (expectedMediaId !== undefined && this.snapshot.media_id !== expectedMediaId) ||
+      (expectedGeneration !== undefined && this.snapshot.generation !== expectedGeneration)
+    ) {
+      return structuredClone(this.snapshot);
+    }
+
     const active = this.media.find((m) => m.id === this.snapshot.media_id);
     if (active) {
       active.completed = true;
@@ -1336,6 +1354,7 @@ export class AudoraIpcClient {
     }
 
     if (this.snapshot.repeat_mode === "one") {
+      this.snapshot.generation += 1;
       this.snapshot.position_ms = 0;
       this.snapshot.state = "playing";
       if (active) {
@@ -1370,6 +1389,41 @@ export class AudoraIpcClient {
     return structuredClone(this.snapshot);
   }
 
+  private isQueueCandidatePlayable(candidateId: string | undefined): MediaItem | null {
+    if (!candidateId) return null;
+    const candidate = this.media.find((m) => m.id === candidateId);
+    if (!candidate || candidate.availability !== "available") {
+      return null;
+    }
+    if (candidate.source_folder_id) {
+      const disabledFolders = this.disabledSourceFolderIds();
+      if (disabledFolders.has(candidate.source_folder_id)) {
+        return null;
+      }
+    }
+    return candidate;
+  }
+
+  private findPreviousPlayableQueueItem(): MediaItem | null {
+    if (!this.snapshot.media_id) return null;
+    const len = this.snapshot.queue.length;
+    if (len === 0) return null;
+    const idx = this.snapshot.queue.indexOf(this.snapshot.media_id);
+    if (idx < 0) return null;
+
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      const found = this.isQueueCandidatePlayable(this.snapshot.queue[i]);
+      if (found) return found;
+    }
+    if (this.snapshot.repeat_mode === "all") {
+      for (let i = len - 1; i >= idx; i -= 1) {
+        const found = this.isQueueCandidatePlayable(this.snapshot.queue[i]);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
   private advanceQueue(autoPlay: boolean): boolean {
     if (!this.snapshot.media_id) return false;
     const len = this.snapshot.queue.length;
@@ -1378,27 +1432,53 @@ export class AudoraIpcClient {
     const idx = this.snapshot.queue.indexOf(this.snapshot.media_id);
     if (idx < 0) return false;
 
-    let nextIdx = -1;
     if (this.snapshot.shuffle && len > 1) {
-      nextIdx = nextShuffleIndex(idx, len);
-    } else if (idx + 1 < len) {
-      nextIdx = idx + 1;
-    } else if (this.snapshot.repeat_mode === "all" && len > 0) {
-      nextIdx = 0;
+      let cursor = idx;
+      for (let step = 0; step < len - 1; step += 1) {
+        cursor = nextShuffleIndex(cursor, len);
+        if (cursor < 0) break;
+        const candidate = this.isQueueCandidatePlayable(this.snapshot.queue[cursor]);
+        if (candidate) {
+          this.selectMediaById(candidate.id, { autoPlay, startFromBeginning: true });
+          return true;
+        }
+      }
+      if (this.snapshot.repeat_mode === "all") {
+        const selfCandidate = this.isQueueCandidatePlayable(this.snapshot.queue[idx]);
+        if (selfCandidate) {
+          this.selectMediaById(selfCandidate.id, { autoPlay, startFromBeginning: true });
+          return true;
+        }
+      }
+      return false;
     }
 
-    if (nextIdx >= 0) {
-      const candidateId = this.snapshot.queue[nextIdx];
-      const candidate = this.media.find((m) => m.id === candidateId);
-      if (candidate && candidate.availability === "available") {
-        this.selectMediaById(candidate.id, { autoPlay });
+    if (this.snapshot.repeat_mode === "all") {
+      for (let offset = 1; offset <= len; offset += 1) {
+        const candidateIdx = (idx + offset) % len;
+        const candidate = this.isQueueCandidatePlayable(this.snapshot.queue[candidateIdx]);
+        if (candidate) {
+          this.selectMediaById(candidate.id, { autoPlay, startFromBeginning: true });
+          return true;
+        }
+      }
+      return false;
+    }
+
+    for (let candidateIdx = idx + 1; candidateIdx < len; candidateIdx += 1) {
+      const candidate = this.isQueueCandidatePlayable(this.snapshot.queue[candidateIdx]);
+      if (candidate) {
+        this.selectMediaById(candidate.id, { autoPlay, startFromBeginning: true });
         return true;
       }
     }
     return false;
   }
 
-  public selectMediaById(mediaId: string, options?: { autoPlay?: boolean }): MediaItem {
+  public selectMediaById(
+    mediaId: string,
+    options?: { autoPlay?: boolean; startFromBeginning?: boolean },
+  ): MediaItem {
     const item = this.media.find((m) => m.id === mediaId);
     if (!item) {
       throw this.makeError(
@@ -1426,8 +1506,17 @@ export class AudoraIpcClient {
     this.snapshot.generation += 1;
     this.snapshot.media_id = item.id;
     this.snapshot.duration_ms = item.duration_ms;
+    const nearEnd =
+      item.duration_ms !== null &&
+      item.duration_ms > 500 &&
+      item.last_position_ms >= item.duration_ms - 500;
     this.snapshot.position_ms =
-      this.settings.resume_where_left_off && !item.completed ? item.last_position_ms : 0;
+      !options?.startFromBeginning &&
+      this.settings.resume_where_left_off &&
+      !item.completed &&
+      !nearEnd
+        ? item.last_position_ms
+        : 0;
     if (!hadActiveMedia || !Number.isFinite(this.snapshot.rate) || this.snapshot.rate < 0.5 || this.snapshot.rate > 2.0) {
       this.snapshot.rate = this.settings.default_playback_speed;
     }
@@ -1616,17 +1705,38 @@ export class AudoraIpcClient {
 
   public removeFromQueue(mediaId: string): PlaybackSnapshot {
     const currentIdx = this.snapshot.queue.indexOf(mediaId);
+    const wasPlaying = this.snapshot.state === "playing";
     this.snapshot.queue = this.snapshot.queue.filter((id) => id !== mediaId);
     let selectedNext = false;
     if (this.snapshot.media_id === mediaId) {
       if (this.snapshot.queue.length === 0) {
         this.snapshot.media_id = null;
+        this.snapshot.duration_ms = null;
         this.snapshot.state = "idle";
         this.snapshot.position_ms = 0;
       } else {
-        const nextIdx = Math.min(Math.max(0, currentIdx), this.snapshot.queue.length - 1);
-        this.selectMediaById(this.snapshot.queue[nextIdx]);
-        selectedNext = true;
+        const startIdx = Math.min(Math.max(0, currentIdx), this.snapshot.queue.length - 1);
+        let nextPlayable: MediaItem | null = null;
+        for (let offset = 0; offset < this.snapshot.queue.length; offset += 1) {
+          const idx = (startIdx + offset) % this.snapshot.queue.length;
+          const candidate = this.isQueueCandidatePlayable(this.snapshot.queue[idx]);
+          if (candidate) {
+            nextPlayable = candidate;
+            break;
+          }
+        }
+        if (nextPlayable) {
+          this.selectMediaById(nextPlayable.id, {
+            autoPlay: wasPlaying,
+            startFromBeginning: true,
+          });
+          selectedNext = true;
+        } else {
+          this.snapshot.media_id = null;
+          this.snapshot.duration_ms = null;
+          this.snapshot.state = "idle";
+          this.snapshot.position_ms = 0;
+        }
       }
     }
     if (
@@ -3112,7 +3222,7 @@ export class AudoraIpcClient {
       firstId = orderedQueue[0]!;
     }
 
-    this.selectMediaById(firstId);
+    this.selectMediaById(firstId, { startFromBeginning: true });
     this.snapshot.queue = orderedQueue;
     this.snapshot.shuffle = useShuffle;
     this.persistProgressAndSession();

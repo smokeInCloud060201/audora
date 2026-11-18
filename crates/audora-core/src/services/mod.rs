@@ -393,6 +393,97 @@ impl AudoraAppService {
         Some((idx + step) % len)
     }
 
+    fn check_queued_item_playable(&self, media_id: &str) -> bool {
+        let Ok(Some(item)) = self.media_repo.get_by_id(media_id) else {
+            return false;
+        };
+        if item.availability == Availability::Missing {
+            return false;
+        }
+        if !Path::new(&item.path).is_file() {
+            let _ = self.media_repo.update_availability(
+                &item.id,
+                Availability::Missing,
+                &now_timestamp_string(),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn resolve_next_playable_queue_id(
+        &self,
+        snap: &PlaybackSnapshot,
+        idx: usize,
+    ) -> Option<String> {
+        let len = snap.queue.len();
+        if len == 0 {
+            return None;
+        }
+        if snap.shuffle && len > 1 {
+            let mut cursor = idx;
+            for _ in 0..(len - 1) {
+                let Some(next_idx) = Self::next_shuffle_index(cursor, len) else {
+                    break;
+                };
+                cursor = next_idx;
+                let candidate_id = &snap.queue[cursor];
+                if self.check_queued_item_playable(candidate_id) {
+                    return Some(candidate_id.clone());
+                }
+            }
+            if snap.repeat_mode == RepeatMode::All
+                && self.check_queued_item_playable(&snap.queue[idx])
+            {
+                return Some(snap.queue[idx].clone());
+            }
+            return None;
+        }
+        if snap.repeat_mode == RepeatMode::All {
+            for offset in 1..=len {
+                let candidate_idx = (idx + offset) % len;
+                let candidate_id = &snap.queue[candidate_idx];
+                if self.check_queued_item_playable(candidate_id) {
+                    return Some(candidate_id.clone());
+                }
+            }
+            return None;
+        }
+        for candidate_idx in (idx + 1)..len {
+            let candidate_id = &snap.queue[candidate_idx];
+            if self.check_queued_item_playable(candidate_id) {
+                return Some(candidate_id.clone());
+            }
+        }
+        None
+    }
+
+    fn resolve_previous_playable_queue_id(
+        &self,
+        snap: &PlaybackSnapshot,
+        idx: usize,
+    ) -> Option<String> {
+        let len = snap.queue.len();
+        if len == 0 {
+            return None;
+        }
+        for candidate_idx in (0..idx).rev() {
+            let candidate_id = &snap.queue[candidate_idx];
+            if self.check_queued_item_playable(candidate_id) {
+                return Some(candidate_id.clone());
+            }
+        }
+        if snap.repeat_mode == RepeatMode::All {
+            for candidate_idx in (idx..len).rev() {
+                let candidate_id = &snap.queue[candidate_idx];
+                if self.check_queued_item_playable(candidate_id) {
+                    return Some(candidate_id.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn load_queued_track_locked(
         &self,
         snap: &mut PlaybackSnapshot,
@@ -459,11 +550,23 @@ impl AudoraAppService {
                 snap.state = PlaybackState::Idle;
                 snap.position_ms = 0;
             } else {
-                let next_idx = current_idx
+                let start_idx = current_idx
                     .unwrap_or(0)
                     .min(snap.queue.len().saturating_sub(1));
-                let next_id = snap.queue[next_idx].clone();
-                self.load_queued_track_locked(&mut snap, &next_id, was_playing);
+                let len = snap.queue.len();
+                let next_playable = (0..len)
+                    .map(|offset| &snap.queue[(start_idx + offset) % len])
+                    .find(|id| self.check_queued_item_playable(id))
+                    .cloned();
+                if let Some(next_id) = next_playable {
+                    self.load_queued_track_locked(&mut snap, &next_id, was_playing);
+                } else {
+                    let _ = self.playback_backend.stop();
+                    snap.media_id = None;
+                    snap.duration_ms = None;
+                    snap.state = PlaybackState::Idle;
+                    snap.position_ms = 0;
+                }
             }
         }
         Ok(snap.clone())
@@ -501,6 +604,10 @@ impl AudoraAppService {
                 if snap.media_id.is_none() {
                     return Err(AppError::validation("No media is loaded for playback"));
                 }
+                if snap.state == PlaybackState::Ended {
+                    let ack = self.playback_backend.seek(gen, 0)?;
+                    snap.position_ms = ack;
+                }
                 self.playback_backend.play(gen)?;
                 snap.state = PlaybackState::Playing;
             }
@@ -531,6 +638,10 @@ impl AudoraAppService {
                         );
                     }
                 } else if snap.media_id.is_some() {
+                    if snap.state == PlaybackState::Ended {
+                        let ack = self.playback_backend.seek(gen, 0)?;
+                        snap.position_ms = ack;
+                    }
                     self.playback_backend.play(gen)?;
                     snap.state = PlaybackState::Playing;
                 }
@@ -593,24 +704,13 @@ impl AudoraAppService {
                 if let Some(current_id) = snap.media_id.clone() {
                     let was_playing = snap.state == PlaybackState::Playing;
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
-                        let len = snap.queue.len();
-                        let next_idx = if snap.shuffle && len > 1 {
-                            Self::next_shuffle_index(idx, len)
-                        } else if idx + 1 < len {
-                            Some(idx + 1)
-                        } else if snap.repeat_mode == RepeatMode::All && len > 0 {
-                            Some(0)
-                        } else {
-                            None
-                        };
-                        if let Some(i) = next_idx {
+                        if let Some(next_id) = self.resolve_next_playable_queue_id(&snap, idx) {
                             let _ = self.media_repo.update_progress(
                                 &current_id,
                                 snap.position_ms,
                                 false,
                                 &now_timestamp_string(),
                             );
-                            let next_id = snap.queue[i].clone();
                             self.load_queued_track_locked(&mut snap, &next_id, was_playing);
                         }
                     }
@@ -631,21 +731,13 @@ impl AudoraAppService {
                 } else if let Some(current_id) = snap.media_id.clone() {
                     let was_playing = snap.state == PlaybackState::Playing;
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
-                        let prev_idx = if idx > 0 {
-                            Some(idx - 1)
-                        } else if snap.repeat_mode == RepeatMode::All && !snap.queue.is_empty() {
-                            Some(snap.queue.len() - 1)
-                        } else {
-                            None
-                        };
-                        if let Some(i) = prev_idx {
+                        if let Some(prev_id) = self.resolve_previous_playable_queue_id(&snap, idx) {
                             let _ = self.media_repo.update_progress(
                                 &current_id,
                                 snap.position_ms,
                                 false,
                                 &now_timestamp_string(),
                             );
-                            let prev_id = snap.queue[i].clone();
                             self.load_queued_track_locked(&mut snap, &prev_id, was_playing);
                         } else {
                             let acknowledged = self.playback_backend.seek(gen, 0)?;
@@ -735,18 +827,7 @@ impl AudoraAppService {
                     snap.state = PlaybackState::Playing;
                 } else if let Some(current_id) = snap.media_id.clone() {
                     if let Some(idx) = snap.queue.iter().position(|id| id == &current_id) {
-                        let len = snap.queue.len();
-                        let next_idx = if snap.shuffle && len > 1 {
-                            Self::next_shuffle_index(idx, len)
-                        } else if idx + 1 < len {
-                            Some(idx + 1)
-                        } else if snap.repeat_mode == RepeatMode::All && len > 0 {
-                            Some(0)
-                        } else {
-                            None
-                        };
-                        if let Some(i) = next_idx {
-                            let next_id = snap.queue[i].clone();
+                        if let Some(next_id) = self.resolve_next_playable_queue_id(&snap, idx) {
                             self.load_queued_track_locked(&mut snap, &next_id, true);
                         }
                     }

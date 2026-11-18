@@ -4565,6 +4565,7 @@ export class AudoraIpcClient {
                 ok?: boolean;
                 status?: string;
                 message?: string;
+                deferred_install?: boolean;
               };
               if (res.status !== 404 || payload.status) {
                 handledByNativeBridge = true;
@@ -4577,7 +4578,10 @@ export class AudoraIpcClient {
                   );
                 }
                 if (payload.status === "restarting") {
-                  if (getNativePlatformInfo().os === "windows") {
+                  if (
+                    payload.deferred_install === true ||
+                    getNativePlatformInfo().os === "windows"
+                  ) {
                     return {
                       status: {
                         ...preCheck,
@@ -4585,7 +4589,7 @@ export class AudoraIpcClient {
                       },
                       message:
                         payload.message ??
-                        `Audora v${clean} verified. Closing to run installer…`,
+                        `Audora v${clean} verified. Closing to install and reopen…`,
                     };
                   }
                   this.stagedRestartVersion = clean;

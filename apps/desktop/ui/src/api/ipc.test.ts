@@ -980,4 +980,89 @@ describe("AudoraIpcClient queue auto-advance on playback completion", () => {
       );
     }
   });
+
+  it("defers installed_version persistence when native update uses deferred_install (Windows/Linux deb)", async () => {
+    const manifestJson = JSON.stringify({
+      tag_name: "v2.1.0",
+      name: "Audora 2.1.0",
+      body: "Release notes",
+      assets: [
+        {
+          name: "Audora_2.1.0_macos-aarch64.dmg",
+          browser_download_url:
+            "https://github.com/smokeInCloud060201/audora/releases/download/v2.1.0/Audora_2.1.0_macos-aarch64.dmg",
+          size: 12_000_000,
+          digest:
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        },
+      ],
+    });
+
+    let deferredFlag = true;
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 AppleWebKit/605.1.15" });
+    vi.stubGlobal("window", {
+      location: { hostname: "127.0.0.1", origin: "http://127.0.0.1:41234" },
+      __AUDORA_SESSION_TOKEN__: "test-token",
+      __AUDORA_PLATFORM__: {
+        os: "linux",
+        arch: "x86_64",
+        data_dir: "/tmp/audora-test",
+      },
+      localStorage: {
+        getItem: () => null,
+        setItem: () => {},
+        removeItem: () => {},
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/__audora_state") {
+          return new Response("{}", {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url === "/__audora_update") {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              status: "restarting",
+              deferred_install: deferredFlag,
+              message: "Closing to install and reopen…",
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+
+    const client = new AudoraIpcClient(true);
+    await client.ensureHydratedFromNative();
+    const initialInstalledVer = client.getSettings().installed_version;
+    client.stageGitHubReleaseJson(
+      manifestJson.replaceAll(
+        "Audora_2.1.0_macos-aarch64.dmg",
+        "Audora_2.1.0_linux-x86_64.deb",
+      ),
+    );
+    const deferredRes = await client.installNativeUpdate("2.1.0");
+    expect(deferredRes.status.staged_for_restart).toBe(true);
+    expect(client.getSettings().installed_version).toBe(initialInstalledVer);
+    expect(client.getSettings().installed_version).not.toBe("2.1.0");
+
+    deferredFlag = false;
+    const immediateRes = await client.installNativeUpdate("2.1.0");
+    expect(immediateRes.status.staged_for_restart).toBe(true);
+    expect(client.getSettings().installed_version).toBe("2.1.0");
+    vi.unstubAllGlobals();
+  });
 });

@@ -2419,14 +2419,19 @@ fn handle_http_connection(mut stream: TcpStream, ctx: &LoopbackServerContext) {
         }
 
         match perform_native_self_update(DEFAULT_GITHUB_RELEASE_REPO, &clean_ver, &expected_sha) {
-            Ok((status_code, msg, should_restart)) => {
+            Ok(outcome) => {
                 write_json_value(
                     &mut stream,
                     "200 OK",
-                    &json!({ "ok": true, "status": status_code, "message": msg }),
+                    &json!({
+                        "ok": true,
+                        "status": outcome.status,
+                        "message": outcome.message,
+                        "deferred_install": outcome.deferred_install,
+                    }),
                 );
                 drop(stream);
-                if should_restart {
+                if outcome.should_restart {
                     let close_proxy = ctx.proxy.clone();
                     thread::spawn(move || {
                         thread::sleep(Duration::from_millis(150));
@@ -2880,17 +2885,42 @@ fn handle_clipboard_request(stream: &mut TcpStream, method: &str, req_body: &[u8
     }
 }
 
+#[cfg(unix)]
+fn unix_tool_path(
+    usr_bin: &'static str,
+    bin: &'static str,
+    fallback: &'static str,
+) -> &'static str {
+    if Path::new(usr_bin).is_file() {
+        usr_bin
+    } else if Path::new(bin).is_file() {
+        bin
+    } else {
+        fallback
+    }
+}
+
+#[cfg(unix)]
+fn unix_curl_path() -> &'static str {
+    unix_tool_path("/usr/bin/curl", "/bin/curl", "curl")
+}
+
+#[cfg(unix)]
+fn unix_tar_path() -> &'static str {
+    unix_tool_path("/usr/bin/tar", "/bin/tar", "tar")
+}
+
 fn resolve_github_release_asset_sha256(repo: &str, tag: &str, asset_name: &str) -> Option<String> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    #[cfg(target_os = "macos")]
-    let mut cmd = Command::new("/usr/bin/curl");
+    #[cfg(unix)]
+    let mut cmd = Command::new(unix_curl_path());
     #[cfg(target_os = "windows")]
     let mut cmd = {
         let mut c = Command::new(windows_curl_path());
         configure_hidden_windows_command(&mut c);
         c
     };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(unix, target_os = "windows")))]
     let mut cmd = Command::new("curl");
 
     let mut child = cmd
@@ -2931,9 +2961,13 @@ fn resolve_github_release_asset_sha256(repo: &str, tag: &str, asset_name: &str) 
     let val: serde_json::Value = serde_json::from_slice(&stdout_buf).ok()?;
     let assets = val.get("assets")?.as_array()?;
     for asset in assets {
-        let name = asset.get("name").and_then(serde_json::Value::as_str)?;
+        let Some(name) = asset.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
         if name == asset_name {
-            let digest = asset.get("digest").and_then(serde_json::Value::as_str)?;
+            let Some(digest) = asset.get("digest").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
             let hex = digest
                 .trim()
                 .strip_prefix("sha256:")
@@ -3088,11 +3122,264 @@ fn verify_windows_installer_authenticode(setup_path: &Path) -> bool {
     trimmed == "UNSIGNED_CURRENT" || trimmed == "VALID_MATCH"
 }
 
+struct NativeSelfUpdateOutcome {
+    status: &'static str,
+    message: String,
+    should_restart: bool,
+    deferred_install: bool,
+}
+
+#[cfg(unix)]
+fn probe_dir_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let tok = generate_session_token();
+    let probe_path = dir.join(format!(".audora-write-test-{}", &tok[..12]));
+    match File::create(&probe_path) {
+        Ok(f) => {
+            drop(f);
+            let _ = fs::remove_file(&probe_path);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn copy_dir_recursive_no_symlinks(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
+    if depth > 32 {
+        return Err(std::io::Error::other("directory recursion depth exceeded"));
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected symlink in staged UI directory",
+            ));
+        }
+        let target = dst.join(entry.file_name());
+        if meta.is_dir() {
+            copy_dir_recursive_no_symlinks(&path, &target, depth + 1)?;
+        } else if meta.is_file() {
+            fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_unix_portable_tar_update(
+    staged_extract_dir: &Path,
+    current_exe: &Path,
+) -> Result<(), (&'static str, String)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !verify_macos_staged_bundle_no_escaping_symlinks(staged_extract_dir) {
+        return Err((
+            "signature_verification_failed",
+            "Downloaded Linux update archive contained an unsafe escaping symlink.".to_owned(),
+        ));
+    }
+
+    let new_bin = if staged_extract_dir.join("bin/audora").is_file() {
+        staged_extract_dir.join("bin/audora")
+    } else if staged_extract_dir.join("audora").is_file() {
+        staged_extract_dir.join("audora")
+    } else {
+        return Err((
+            "install_failed",
+            "Downloaded Linux archive did not contain an audora executable.".to_owned(),
+        ));
+    };
+
+    let new_ui = if staged_extract_dir
+        .join("share/audora/ui/index.html")
+        .is_file()
+    {
+        staged_extract_dir.join("share/audora/ui")
+    } else if staged_extract_dir.join("ui/index.html").is_file() {
+        staged_extract_dir.join("ui")
+    } else {
+        return Err((
+            "install_failed",
+            "Downloaded Linux archive did not contain compiled UI assets.".to_owned(),
+        ));
+    };
+
+    let Some(exe_dir) = current_exe.parent() else {
+        return Err((
+            "install_failed",
+            "Unable to determine current executable directory.".to_owned(),
+        ));
+    };
+
+    let is_share_layout = exe_dir.join("../share/audora/ui").is_dir()
+        || (exe_dir.file_name().and_then(|s| s.to_str()) == Some("bin")
+            && exe_dir.parent().is_some_and(|p| {
+                p.join("share/audora").is_dir() || probe_dir_writable(&p.join("share"))
+            }));
+    let target_ui = if is_share_layout {
+        exe_dir.join("../share/audora/ui")
+    } else {
+        exe_dir.join("ui")
+    };
+    let Some(ui_parent) = target_ui.parent() else {
+        return Err((
+            "install_failed",
+            "Unable to resolve target UI asset directory.".to_owned(),
+        ));
+    };
+    if fs::create_dir_all(ui_parent).is_err() {
+        return Err((
+            "install_permission_denied",
+            format!(
+                "Insufficient permissions to update {}.",
+                ui_parent.display()
+            ),
+        ));
+    }
+
+    let ui_stage = ui_parent.join(".audora-ui.new");
+    let ui_backup = ui_parent.join(".audora-ui.prev");
+    let _ = fs::remove_dir_all(&ui_stage);
+    let _ = fs::remove_dir_all(&ui_backup);
+
+    if copy_dir_recursive_no_symlinks(&new_ui, &ui_stage, 0).is_err() {
+        let _ = fs::remove_dir_all(&ui_stage);
+        return Err((
+            "install_failed",
+            "Failed to stage updated UI assets in target directory.".to_owned(),
+        ));
+    }
+
+    let had_existing_ui = target_ui.exists();
+    if had_existing_ui && fs::rename(&target_ui, &ui_backup).is_err() {
+        let _ = fs::remove_dir_all(&ui_stage);
+        return Err((
+            "install_permission_denied",
+            format!(
+                "Insufficient permissions to replace {}.",
+                target_ui.display()
+            ),
+        ));
+    }
+
+    if fs::rename(&ui_stage, &target_ui).is_err() {
+        if had_existing_ui && ui_backup.exists() {
+            let _ = fs::rename(&ui_backup, &target_ui);
+        }
+        let _ = fs::remove_dir_all(&ui_stage);
+        return Err((
+            "install_failed",
+            format!("Failed to swap UI assets at {}.", target_ui.display()),
+        ));
+    }
+
+    let bin_stage = exe_dir.join(".audora.bin.new");
+    let _ = fs::remove_file(&bin_stage);
+    let bin_swapped = fs::copy(&new_bin, &bin_stage).is_ok()
+        && fs::set_permissions(&bin_stage, fs::Permissions::from_mode(0o755)).is_ok()
+        && fs::rename(&bin_stage, current_exe).is_ok();
+
+    if !bin_swapped {
+        let _ = fs::remove_file(&bin_stage);
+        let _ = fs::remove_dir_all(&target_ui);
+        if had_existing_ui && ui_backup.exists() {
+            let _ = fs::rename(&ui_backup, &target_ui);
+        }
+        return Err((
+            "install_permission_denied",
+            format!(
+                "Insufficient permissions to replace executable {}.",
+                current_exe.display()
+            ),
+        ));
+    }
+
+    let _ = fs::remove_dir_all(&ui_backup);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_detached_unix_binary_relauncher(wait_pid: u32, target_exe: &Path) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .env("AUDORA_PID", wait_pid.to_string())
+        .env("AUDORA_RELAUNCH_EXE", target_exe)
+        .args([
+            "-c",
+            r#"trap '' HUP INT TERM; i=0; while kill -0 "$AUDORA_PID" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done; sleep 0.25; "$AUDORA_RELAUNCH_EXE" </dev/null >/dev/null 2>&1 &"#,
+        ]);
+    cmd.spawn().map(|_| ())
+}
+
+#[cfg(unix)]
+fn spawn_detached_linux_deb_updater(
+    wait_pid: u32,
+    deb_path: &Path,
+    staging_dir: &Path,
+    pkexec_bin: &Path,
+    dpkg_bin: &Path,
+    relaunch_exe: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .env("AUDORA_PID", wait_pid.to_string())
+        .env("AUDORA_DEB_PATH", deb_path)
+        .env("AUDORA_STAGING_DIR", staging_dir)
+        .env("AUDORA_PKEXEC", pkexec_bin)
+        .env("AUDORA_DPKG", dpkg_bin)
+        .env("AUDORA_RELAUNCH_EXE", relaunch_exe)
+        .args([
+            "-c",
+            r#"trap '' HUP INT TERM; i=0; while kill -0 "$AUDORA_PID" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done; "$AUDORA_PKEXEC" "$AUDORA_DPKG" -i "$AUDORA_DEB_PATH" >/dev/null 2>&1; rc=$?; rm -rf "$AUDORA_STAGING_DIR" 2>/dev/null || true; if [ "$rc" -eq 0 ] && [ -x "$AUDORA_RELAUNCH_EXE" ]; then "$AUDORA_RELAUNCH_EXE" </dev/null >/dev/null 2>&1 & fi"#,
+        ]);
+    cmd.spawn().map(|_| ())
+}
+
+#[cfg(unix)]
+fn spawn_detached_macos_relauncher(
+    wait_pid: u32,
+    target_app: &Path,
+    open_bin: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .env("AUDORA_PID", wait_pid.to_string())
+        .env("AUDORA_TARGET_APP", target_app)
+        .env("AUDORA_OPEN_BIN", open_bin)
+        .args([
+            "-c",
+            r#"trap '' HUP INT TERM; i=0; while kill -0 "$AUDORA_PID" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.1; i=$((i + 1)); done; sleep 0.3; "$AUDORA_OPEN_BIN" -n "$AUDORA_TARGET_APP" >/dev/null 2>&1 || "$AUDORA_OPEN_BIN" "$AUDORA_TARGET_APP" >/dev/null 2>&1 || "$AUDORA_TARGET_APP/Contents/MacOS/audora" </dev/null >/dev/null 2>&1 &"#,
+        ]);
+    cmd.spawn().map(|_| ())
+}
+
 fn perform_native_self_update(
     repo: &str,
     version: &str,
     expected_sha256: &str,
-) -> Result<(&'static str, String, bool), (&'static str, String)> {
+) -> Result<NativeSelfUpdateOutcome, (&'static str, String)> {
     let tag = format!("v{version}");
     let rand_tok = generate_session_token();
     let rand_suffix = &rand_tok[..16];
@@ -3126,286 +3413,610 @@ fn perform_native_self_update(
         "-o",
     ];
 
-    if cfg!(target_os = "macos") {
-        let mac_arch = if cfg!(target_arch = "x86_64") {
-            "x86_64"
-        } else {
-            "aarch64"
-        };
-        let archive_candidates = [
-            format!("Audora_{version}_macos-{mac_arch}.app.tar.gz"),
-            format!("Audora_{version}_macos-universal.app.tar.gz"),
-        ];
+    #[cfg(unix)]
+    {
+        if cfg!(target_os = "macos") {
+            let mac_arch = if cfg!(target_arch = "x86_64") {
+                "x86_64"
+            } else {
+                "aarch64"
+            };
+            let archive_candidates = [
+                format!("Audora_{version}_macos-{mac_arch}.app.tar.gz"),
+                format!("Audora_{version}_macos-universal.app.tar.gz"),
+            ];
 
-        for archive_name in &archive_candidates {
-            let archive_url =
-                format!("https://github.com/{repo}/releases/download/{tag}/{archive_name}");
-            let archive_path = staging_dir.join(archive_name);
+            for archive_name in &archive_candidates {
+                let archive_url =
+                    format!("https://github.com/{repo}/releases/download/{tag}/{archive_name}");
+                let archive_path = staging_dir.join(archive_name);
 
-            info!(url = %archive_url, "Downloading macOS update bundle");
-            let curl_ok = Command::new("/usr/bin/curl")
-                .args(curl_common_args)
-                .arg(&archive_path)
-                .arg(&archive_url)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+                info!(url = %archive_url, "Downloading macOS update bundle");
+                let curl_ok = Command::new(unix_curl_path())
+                    .args(curl_common_args)
+                    .arg(&archive_path)
+                    .arg(&archive_url)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
 
-            if !curl_ok || !archive_path.is_file() {
-                let _ = fs::remove_file(&archive_path);
-                continue;
-            }
+                if !curl_ok || !archive_path.is_file() {
+                    let _ = fs::remove_file(&archive_path);
+                    continue;
+                }
 
-            let actual_sha = compute_file_sha256_hex(&archive_path).unwrap_or_default();
-            let resolved_archive_sha =
-                resolve_github_release_asset_sha256(repo, &tag, archive_name);
-            let sha_ok = constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
-                || resolved_archive_sha
-                    .as_deref()
-                    .is_some_and(|s| constant_time_eq(actual_sha.as_bytes(), s.as_bytes()));
-            if !sha_ok {
-                let _ = fs::remove_dir_all(&staging_dir);
-                return Err((
-                    "checksum_verification_failed",
-                    "Downloaded update bundle failed SHA-256 integrity verification.".to_owned(),
-                ));
-            }
-
-            let tar_ok = Command::new("/usr/bin/tar")
-                .args(["--no-same-owner", "-xzf"])
-                .arg(&archive_path)
-                .arg("-C")
-                .arg(&staging_dir)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            let staged_app = staging_dir.join("Audora.app");
-            let staged_is_real_dir = fs::symlink_metadata(&staged_app)
-                .is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir());
-            if tar_ok && staged_is_real_dir {
-                if !verify_macos_staged_bundle_no_escaping_symlinks(&staged_app) {
+                let actual_sha = compute_file_sha256_hex(&archive_path).unwrap_or_default();
+                let resolved_archive_sha =
+                    resolve_github_release_asset_sha256(repo, &tag, archive_name);
+                let sha_ok = constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
+                    || resolved_archive_sha
+                        .as_deref()
+                        .is_some_and(|s| constant_time_eq(actual_sha.as_bytes(), s.as_bytes()));
+                if !sha_ok {
                     let _ = fs::remove_dir_all(&staging_dir);
                     return Err((
-                        "signature_verification_failed",
-                        "Downloaded macOS bundle contained an unsafe escaping symlink.".to_owned(),
+                        "checksum_verification_failed",
+                        "Downloaded update bundle failed SHA-256 integrity verification."
+                            .to_owned(),
                     ));
                 }
 
-                let target_app = resolve_current_macos_app_bundle()
-                    .unwrap_or_else(|| PathBuf::from("/Applications/Audora.app"));
-                if !verify_macos_staged_bundle_signature(&staged_app, &target_app) {
-                    let _ = fs::remove_dir_all(&staging_dir);
-                    return Err((
-                        "signature_verification_failed",
-                        "Downloaded macOS bundle failed codesign identity verification.".to_owned(),
-                    ));
-                }
+                let tar_ok = Command::new(unix_tar_path())
+                    .args(["--no-same-owner", "-xzf"])
+                    .arg(&archive_path)
+                    .arg("-C")
+                    .arg(&staging_dir)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
 
-                let backup_app = target_app.with_extension("app.previous");
-                let _ = fs::remove_dir_all(&backup_app);
+                let staged_app = staging_dir.join("Audora.app");
+                let staged_is_real_dir = fs::symlink_metadata(&staged_app)
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir());
+                if tar_ok && staged_is_real_dir {
+                    if !verify_macos_staged_bundle_no_escaping_symlinks(&staged_app) {
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        return Err((
+                            "signature_verification_failed",
+                            "Downloaded macOS bundle contained an unsafe escaping symlink."
+                                .to_owned(),
+                        ));
+                    }
 
-                if target_app.exists() && fs::rename(&target_app, &backup_app).is_err() {
-                    let _ = fs::remove_dir_all(&staging_dir);
-                    return Err((
-                        "install_permission_denied",
-                        format!(
-                            "Insufficient permissions to replace {}. Move Audora to a writable folder or install manually.",
-                            target_app.display()
-                        ),
-                    ));
-                }
+                    let target_app = resolve_current_macos_app_bundle()
+                        .unwrap_or_else(|| PathBuf::from("/Applications/Audora.app"));
+                    if !verify_macos_staged_bundle_signature(&staged_app, &target_app) {
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        return Err((
+                            "signature_verification_failed",
+                            "Downloaded macOS bundle failed codesign identity verification."
+                                .to_owned(),
+                        ));
+                    }
 
-                let moved = fs::rename(&staged_app, &target_app).is_ok()
-                    || Command::new("/usr/bin/ditto")
-                        .arg(&staged_app)
-                        .arg(&target_app)
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-
-                if moved {
+                    let backup_app = target_app.with_extension("app.previous");
                     let _ = fs::remove_dir_all(&backup_app);
-                    let _ = fs::remove_dir_all(&staging_dir);
-                    let target_for_relaunch = target_app.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(900));
-                        let _ = Command::new("/usr/bin/open")
-                            .arg("-n")
-                            .arg(&target_for_relaunch)
-                            .spawn();
-                    });
 
-                    return Ok((
-                        "restarting",
-                        format!(
-                            "Audora {version} SHA-256 & signature verified, installed to {}, and restarting…",
-                            target_app.display()
-                        ),
-                        true,
-                    ));
-                }
+                    if target_app.exists() && fs::rename(&target_app, &backup_app).is_err() {
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        return Err((
+                            "install_permission_denied",
+                            format!(
+                                "Insufficient permissions to replace {}. Move Audora to a writable folder or install manually.",
+                                target_app.display()
+                            ),
+                        ));
+                    }
 
-                if backup_app.exists() {
-                    let _ = fs::remove_dir_all(&target_app);
-                    let _ = fs::rename(&backup_app, &target_app);
-                }
-                let _ = fs::remove_dir_all(&staging_dir);
-                return Err((
-                    "install_failed",
-                    format!(
-                        "Failed to move verified bundle into {}. Existing installation was restored.",
-                        target_app.display()
-                    ),
-                ));
-            }
-        }
+                    let moved = fs::rename(&staged_app, &target_app).is_ok()
+                        || Command::new("/usr/bin/ditto")
+                            .arg(&staged_app)
+                            .arg(&target_app)
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
 
-        let dmg_candidates = [
-            format!("Audora_{version}_macos-{mac_arch}.dmg"),
-            format!("Audora_{version}_macos-universal.dmg"),
-        ];
+                    if moved {
+                        let _ = fs::remove_dir_all(&backup_app);
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        if let Err(err) = spawn_detached_macos_relauncher(
+                            std::process::id(),
+                            &target_app,
+                            Path::new("/usr/bin/open"),
+                        ) {
+                            warn!(
+                                error = %err,
+                                "Failed to spawn macOS relaunch helper after update"
+                            );
+                            return Ok(NativeSelfUpdateOutcome {
+                                status: "installed_manual_reopen",
+                                message: format!(
+                                    "Audora {version} was installed to {}. Please reopen Audora.",
+                                    target_app.display()
+                                ),
+                                should_restart: false,
+                                deferred_install: false,
+                            });
+                        }
 
-        for dmg_name in &dmg_candidates {
-            let dmg_url = format!("https://github.com/{repo}/releases/download/{tag}/{dmg_name}");
-            let dmg_staged = staging_dir.join(dmg_name);
+                        return Ok(NativeSelfUpdateOutcome {
+                            status: "restarting",
+                            message: format!(
+                                "Audora {version} SHA-256 & signature verified, installed to {}, and restarting…",
+                                target_app.display()
+                            ),
+                            should_restart: true,
+                            deferred_install: false,
+                        });
+                    }
 
-            let dmg_ok = Command::new("/usr/bin/curl")
-                .args(curl_common_args)
-                .arg(&dmg_staged)
-                .arg(&dmg_url)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            if !dmg_ok || !dmg_staged.is_file() {
-                let _ = fs::remove_file(&dmg_staged);
-                continue;
-            }
-
-            let actual_sha = compute_file_sha256_hex(&dmg_staged).unwrap_or_default();
-            let resolved_dmg_sha = resolve_github_release_asset_sha256(repo, &tag, dmg_name);
-            let dmg_sha_ok = constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
-                || resolved_dmg_sha
-                    .as_deref()
-                    .is_some_and(|s| constant_time_eq(actual_sha.as_bytes(), s.as_bytes()));
-            if dmg_sha_ok {
-                let downloads_dir = env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join("Downloads"))
-                    .unwrap_or_else(|| staging_dir.clone());
-                let dmg_dest = downloads_dir.join(dmg_name);
-                if fs::symlink_metadata(&dmg_dest).is_ok_and(|m| m.file_type().is_symlink()) {
-                    let _ = fs::remove_file(&dmg_dest);
-                }
-                if fs::copy(&dmg_staged, &dmg_dest).is_err() {
+                    if backup_app.exists() {
+                        let _ = fs::remove_dir_all(&target_app);
+                        let _ = fs::rename(&backup_app, &target_app);
+                    }
                     let _ = fs::remove_dir_all(&staging_dir);
                     return Err((
                         "install_failed",
                         format!(
-                            "Failed to copy verified installer to {}.",
-                            dmg_dest.display()
+                            "Failed to move verified bundle into {}. Existing installation was restored.",
+                            target_app.display()
                         ),
                     ));
                 }
+            }
+
+            let dmg_candidates = [
+                format!("Audora_{version}_macos-{mac_arch}.dmg"),
+                format!("Audora_{version}_macos-universal.dmg"),
+            ];
+
+            for dmg_name in &dmg_candidates {
+                let dmg_url =
+                    format!("https://github.com/{repo}/releases/download/{tag}/{dmg_name}");
+                let dmg_staged = staging_dir.join(dmg_name);
+
+                let dmg_ok = Command::new(unix_curl_path())
+                    .args(curl_common_args)
+                    .arg(&dmg_staged)
+                    .arg(&dmg_url)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if !dmg_ok || !dmg_staged.is_file() {
+                    let _ = fs::remove_file(&dmg_staged);
+                    continue;
+                }
+
+                let actual_sha = compute_file_sha256_hex(&dmg_staged).unwrap_or_default();
+                let resolved_dmg_sha = resolve_github_release_asset_sha256(repo, &tag, dmg_name);
+                let dmg_sha_ok =
+                    constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
+                        || resolved_dmg_sha
+                            .as_deref()
+                            .is_some_and(|s| constant_time_eq(actual_sha.as_bytes(), s.as_bytes()));
+                if dmg_sha_ok {
+                    let downloads_dir = env::var_os("HOME")
+                        .map(|h| PathBuf::from(h).join("Downloads"))
+                        .unwrap_or_else(|| staging_dir.clone());
+                    let dmg_dest = downloads_dir.join(dmg_name);
+                    if fs::symlink_metadata(&dmg_dest).is_ok_and(|m| m.file_type().is_symlink()) {
+                        let _ = fs::remove_file(&dmg_dest);
+                    }
+                    if fs::copy(&dmg_staged, &dmg_dest).is_err() {
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        return Err((
+                            "install_failed",
+                            format!(
+                                "Failed to copy verified installer to {}.",
+                                dmg_dest.display()
+                            ),
+                        ));
+                    }
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    let _ = Command::new("/usr/bin/open").arg(&dmg_dest).spawn();
+                    return Ok(NativeSelfUpdateOutcome {
+                        status: "downloaded_installer",
+                        message: format!("Verified SHA-256 and mounted {dmg_name} in ~/Downloads."),
+                        should_restart: false,
+                        deferred_install: false,
+                    });
+                }
                 let _ = fs::remove_dir_all(&staging_dir);
-                let _ = Command::new("/usr/bin/open").arg(&dmg_dest).spawn();
-                return Ok((
-                    "downloaded_installer",
-                    format!("Verified SHA-256 and mounted {dmg_name} in ~/Downloads."),
-                    false,
+                return Err((
+                    "checksum_verification_failed",
+                    "Downloaded DMG failed SHA-256 integrity verification.".to_owned(),
                 ));
             }
-            let _ = fs::remove_dir_all(&staging_dir);
-            return Err((
-                "checksum_verification_failed",
-                "Downloaded DMG failed SHA-256 integrity verification.".to_owned(),
-            ));
+        } else if cfg!(target_os = "linux") {
+            let linux_arch = if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            };
+            let current_exe = env::current_exe().ok();
+            let writable_portable = current_exe.as_ref().is_some_and(|exe| {
+                !exe.starts_with("/usr/") && exe.parent().is_some_and(probe_dir_writable)
+            });
+
+            if writable_portable {
+                if let Some(ref exe_path) = current_exe {
+                    let tar_name = format!("Audora_{version}_linux-{linux_arch}.tar.gz");
+                    let tar_url =
+                        format!("https://github.com/{repo}/releases/download/{tag}/{tar_name}");
+                    let tar_path = staging_dir.join(&tar_name);
+                    let curl_ok = Command::new(unix_curl_path())
+                        .args(curl_common_args)
+                        .arg(&tar_path)
+                        .arg(&tar_url)
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+
+                    if curl_ok && tar_path.is_file() {
+                        let actual_sha = compute_file_sha256_hex(&tar_path).unwrap_or_default();
+                        let resolved_tar_sha =
+                            resolve_github_release_asset_sha256(repo, &tag, &tar_name);
+                        let sha_ok =
+                            constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
+                                || resolved_tar_sha.as_deref().is_some_and(|s| {
+                                    constant_time_eq(actual_sha.as_bytes(), s.as_bytes())
+                                });
+                        if !sha_ok {
+                            let _ = fs::remove_dir_all(&staging_dir);
+                            return Err((
+                                "checksum_verification_failed",
+                                "Downloaded Linux update archive failed SHA-256 integrity verification."
+                                    .to_owned(),
+                            ));
+                        }
+
+                        let extract_dir = staging_dir.join("extracted");
+                        if fs::create_dir_all(&extract_dir).is_ok() {
+                            let tar_ok = Command::new(unix_tar_path())
+                                .args(["--no-same-owner", "-xzf"])
+                                .arg(&tar_path)
+                                .arg("-C")
+                                .arg(&extract_dir)
+                                .status()
+                                .map(|s| s.success())
+                                .unwrap_or(false);
+                            if tar_ok {
+                                if let Err(err) =
+                                    apply_unix_portable_tar_update(&extract_dir, exe_path)
+                                {
+                                    let _ = fs::remove_dir_all(&staging_dir);
+                                    return Err(err);
+                                }
+                                let _ = fs::remove_dir_all(&staging_dir);
+                                if let Err(err) = spawn_detached_unix_binary_relauncher(
+                                    std::process::id(),
+                                    exe_path,
+                                ) {
+                                    warn!(
+                                        error = %err,
+                                        "Failed to spawn Linux portable relaunch helper"
+                                    );
+                                    return Ok(NativeSelfUpdateOutcome {
+                                        status: "installed_manual_reopen",
+                                        message: format!(
+                                            "Audora {version} was installed to {}. Please reopen Audora.",
+                                            exe_path.display()
+                                        ),
+                                        should_restart: false,
+                                        deferred_install: false,
+                                    });
+                                }
+                                return Ok(NativeSelfUpdateOutcome {
+                                    status: "restarting",
+                                    message: format!(
+                                        "Audora {version} SHA-256 verified, installed to {}, and restarting…",
+                                        exe_path.display()
+                                    ),
+                                    should_restart: true,
+                                    deferred_install: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            let has_gui = env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+                || env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+            let pkexec_bin = Path::new("/usr/bin/pkexec");
+            let dpkg_bin = if Path::new("/usr/bin/dpkg").is_file() {
+                Some(Path::new("/usr/bin/dpkg"))
+            } else if Path::new("/bin/dpkg").is_file() {
+                Some(Path::new("/bin/dpkg"))
+            } else {
+                None
+            };
+
+            if has_gui && pkexec_bin.is_file() {
+                if let (Some(dpkg_path), Some(relaunch_exe)) = (dpkg_bin, current_exe.as_ref()) {
+                    let deb_name = format!("Audora_{version}_linux-{linux_arch}.deb");
+                    let deb_url =
+                        format!("https://github.com/{repo}/releases/download/{tag}/{deb_name}");
+                    let deb_path = staging_dir.join(&deb_name);
+                    let curl_ok = Command::new(unix_curl_path())
+                        .args(curl_common_args)
+                        .arg(&deb_path)
+                        .arg(&deb_url)
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+
+                    if curl_ok && deb_path.is_file() {
+                        let actual_sha = compute_file_sha256_hex(&deb_path).unwrap_or_default();
+                        let resolved_deb_sha =
+                            resolve_github_release_asset_sha256(repo, &tag, &deb_name);
+                        let sha_ok =
+                            constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
+                                || resolved_deb_sha.as_deref().is_some_and(|s| {
+                                    constant_time_eq(actual_sha.as_bytes(), s.as_bytes())
+                                });
+                        if !sha_ok {
+                            let _ = fs::remove_dir_all(&staging_dir);
+                            return Err((
+                                "checksum_verification_failed",
+                                "Downloaded Linux .deb package failed SHA-256 integrity verification."
+                                    .to_owned(),
+                            ));
+                        }
+                        if let Ok(()) = spawn_detached_linux_deb_updater(
+                            std::process::id(),
+                            &deb_path,
+                            &staging_dir,
+                            pkexec_bin,
+                            dpkg_path,
+                            relaunch_exe,
+                        ) {
+                            return Ok(NativeSelfUpdateOutcome {
+                                status: "restarting",
+                                message: format!(
+                                    "Audora {version} verified. Closing to install {deb_name} and reopen…"
+                                ),
+                                should_restart: true,
+                                deferred_install: true,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         let _ = fs::remove_dir_all(&staging_dir);
         let release_page = format!("https://github.com/{repo}/releases/tag/{tag}");
         open_external_https_url(&release_page);
-        return Ok((
-            "opened_release",
-            format!("Opened GitHub release {tag} in your browser to complete installation."),
-            false,
-        ));
+        Ok(NativeSelfUpdateOutcome {
+            status: "opened_release",
+            message: format!(
+                "Opened GitHub release {tag} in your browser to complete installation."
+            ),
+            should_restart: false,
+            deferred_install: false,
+        })
     }
 
     #[cfg(target_os = "windows")]
     {
-        let setup_name = format!("Audora_{version}_windows-x86_64-setup.exe");
-        let setup_url = format!("https://github.com/{repo}/releases/download/{tag}/{setup_name}");
-        let setup_path = staging_dir.join(&setup_name);
-        let mut curl_cmd = Command::new(windows_curl_path());
-        configure_hidden_windows_command(&mut curl_cmd);
-        let curl_ok = curl_cmd
-            .args(curl_common_args)
-            .arg(&setup_path)
-            .arg(&setup_url)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let win_arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+        let current_exe = env::current_exe().ok();
+        let is_standalone_portable = current_exe.as_ref().is_some_and(|exe| {
+            exe.parent().is_some_and(|dir| {
+                dir.join("ui").join("index.html").is_file() && !dir.join("Uninstall.exe").exists()
+            })
+        });
 
-        if curl_ok && setup_path.is_file() {
-            let actual_sha = compute_file_sha256_hex(&setup_path).unwrap_or_default();
-            let sha_ok = constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes());
-            if !sha_ok {
-                let _ = fs::remove_dir_all(&staging_dir);
-                return Err((
-                    "checksum_verification_failed",
-                    "Downloaded Windows installer failed SHA-256 integrity verification."
-                        .to_owned(),
-                ));
+        if !is_standalone_portable {
+            let setup_name = format!("Audora_{version}_windows-{win_arch}-setup.exe");
+            let setup_url =
+                format!("https://github.com/{repo}/releases/download/{tag}/{setup_name}");
+            let setup_path = staging_dir.join(&setup_name);
+            let mut curl_cmd = Command::new(windows_curl_path());
+            configure_hidden_windows_command(&mut curl_cmd);
+            let curl_ok = curl_cmd
+                .args(curl_common_args)
+                .arg(&setup_path)
+                .arg(&setup_url)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if curl_ok && setup_path.is_file() {
+                let actual_sha = compute_file_sha256_hex(&setup_path).unwrap_or_default();
+                let resolved_setup_sha =
+                    resolve_github_release_asset_sha256(repo, &tag, &setup_name);
+                let sha_ok = constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
+                    || resolved_setup_sha
+                        .as_deref()
+                        .is_some_and(|s| constant_time_eq(actual_sha.as_bytes(), s.as_bytes()));
+                if !sha_ok {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err((
+                        "checksum_verification_failed",
+                        "Downloaded Windows installer failed SHA-256 integrity verification."
+                            .to_owned(),
+                    ));
+                }
+                if !verify_windows_installer_authenticode(&setup_path) {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err((
+                        "signature_verification_failed",
+                        "Downloaded Windows installer failed Authenticode verification.".to_owned(),
+                    ));
+                }
+                let relaunch_exe = current_exe.unwrap_or_default();
+                let mut launch_cmd = Command::new(windows_powershell_path());
+                configure_detached_windows_command(&mut launch_cmd);
+                let _ = launch_cmd
+                    .current_dir(env::temp_dir())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-WindowStyle",
+                        "Hidden",
+                        "-Command",
+                        r#"Wait-Process -Id $env:AUDORA_PID -Timeout 15 -ErrorAction SilentlyContinue; $p = Start-Process -FilePath $env:AUDORA_SETUP_EXE -ArgumentList '/S' -Wait -PassThru; if (-not $p -or $p.ExitCode -ne 0) { $p = Start-Process -FilePath $env:AUDORA_SETUP_EXE -Wait -PassThru }; if ($env:AUDORA_STAGING_DIR) { Remove-Item -LiteralPath $env:AUDORA_STAGING_DIR -Recurse -Force -ErrorAction SilentlyContinue }; if ($p -and $p.ExitCode -eq 0) { $targetExe = $null; $reg = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Audora' -ErrorAction SilentlyContinue; if ($reg -and $reg.InstallLocation) { $cand = Join-Path $reg.InstallLocation 'Audora.exe'; if (Test-Path -LiteralPath $cand) { $targetExe = $cand } }; if (-not $targetExe -and $reg -and $reg.UninstallString) { $uDir = Split-Path -Parent ($reg.UninstallString.Trim('"')); if ($uDir) { $cand = Join-Path $uDir 'Audora.exe'; if (Test-Path -LiteralPath $cand) { $targetExe = $cand } } }; if (-not $targetExe -and $env:LOCALAPPDATA) { $cand = Join-Path $env:LOCALAPPDATA 'Programs\Audora\Audora.exe'; if (Test-Path -LiteralPath $cand) { $targetExe = $cand } }; if (-not $targetExe -and $env:AUDORA_RELAUNCH_EXE -and (Test-Path -LiteralPath $env:AUDORA_RELAUNCH_EXE)) { $targetExe = $env:AUDORA_RELAUNCH_EXE }; if ($targetExe) { Start-Process -FilePath $targetExe } }"#,
+                    ])
+                    .env("AUDORA_PID", std::process::id().to_string())
+                    .env("AUDORA_STAGING_DIR", &staging_dir)
+                    .env("AUDORA_SETUP_EXE", &setup_path)
+                    .env("AUDORA_RELAUNCH_EXE", &relaunch_exe)
+                    .spawn();
+                return Ok(NativeSelfUpdateOutcome {
+                    status: "restarting",
+                    message: format!(
+                        "Verified and installing {setup_name}. Reopening automatically…"
+                    ),
+                    should_restart: true,
+                    deferred_install: true,
+                });
             }
-            if !verify_windows_installer_authenticode(&setup_path) {
-                let _ = fs::remove_dir_all(&staging_dir);
-                return Err((
-                    "signature_verification_failed",
-                    "Downloaded Windows installer failed Authenticode verification.".to_owned(),
-                ));
+        }
+
+        if let Some(ref exe_path) = current_exe {
+            if let Some(exe_dir) = exe_path.parent() {
+                let zip_name = format!("Audora_{version}_windows-{win_arch}-portable.zip");
+                let zip_url =
+                    format!("https://github.com/{repo}/releases/download/{tag}/{zip_name}");
+                let zip_path = staging_dir.join(&zip_name);
+                let mut curl_cmd = Command::new(windows_curl_path());
+                configure_hidden_windows_command(&mut curl_cmd);
+                let curl_ok = curl_cmd
+                    .args(curl_common_args)
+                    .arg(&zip_path)
+                    .arg(&zip_url)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if curl_ok && zip_path.is_file() {
+                    let actual_sha = compute_file_sha256_hex(&zip_path).unwrap_or_default();
+                    let resolved_zip_sha =
+                        resolve_github_release_asset_sha256(repo, &tag, &zip_name);
+                    let sha_ok =
+                        constant_time_eq(actual_sha.as_bytes(), expected_sha256.as_bytes())
+                            || resolved_zip_sha.as_deref().is_some_and(|s| {
+                                constant_time_eq(actual_sha.as_bytes(), s.as_bytes())
+                            });
+                    if !sha_ok {
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        return Err((
+                            "checksum_verification_failed",
+                            "Downloaded Windows portable archive failed SHA-256 integrity verification."
+                                .to_owned(),
+                        ));
+                    }
+
+                    let portable_out = staging_dir.join("portable");
+                    let _ = fs::create_dir_all(&portable_out);
+                    let mut expand_cmd = Command::new(windows_powershell_path());
+                    configure_hidden_windows_command(&mut expand_cmd);
+                    let expand_ok = expand_cmd
+                        .current_dir(env::temp_dir())
+                        .stdin(Stdio::null())
+                        .args([
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-WindowStyle",
+                            "Hidden",
+                            "-Command",
+                            "Expand-Archive -LiteralPath $env:AUDORA_ZIP -DestinationPath $env:AUDORA_PORTABLE_OUT -Force",
+                        ])
+                        .env("AUDORA_ZIP", &zip_path)
+                        .env("AUDORA_PORTABLE_OUT", &portable_out)
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+
+                    let staged_exe = if portable_out.join("Audora.exe").is_file() {
+                        Some(portable_out.join("Audora.exe"))
+                    } else if portable_out.join("Audora").join("Audora.exe").is_file() {
+                        Some(portable_out.join("Audora").join("Audora.exe"))
+                    } else {
+                        None
+                    };
+
+                    if expand_ok {
+                        if let Some(staged_exe_path) = staged_exe {
+                            if !verify_windows_installer_authenticode(&staged_exe_path) {
+                                let _ = fs::remove_dir_all(&staging_dir);
+                                return Err((
+                                    "signature_verification_failed",
+                                    "Downloaded Windows portable binary failed Authenticode verification."
+                                        .to_owned(),
+                                ));
+                            }
+                            let src_dir = staged_exe_path
+                                .parent()
+                                .unwrap_or(portable_out.as_path())
+                                .to_path_buf();
+                            let mut launch_cmd = Command::new(windows_powershell_path());
+                            configure_detached_windows_command(&mut launch_cmd);
+                            let _ = launch_cmd
+                                .current_dir(env::temp_dir())
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .args([
+                                    "-NoProfile",
+                                    "-NonInteractive",
+                                    "-WindowStyle",
+                                    "Hidden",
+                                    "-Command",
+                                    "Wait-Process -Id $env:AUDORA_PID -Timeout 15 -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 300; Copy-Item -Path (Join-Path $env:AUDORA_SRC_DIR '*') -Destination $env:AUDORA_DEST_DIR -Recurse -Force; if ($env:AUDORA_STAGING_DIR) { Remove-Item -LiteralPath $env:AUDORA_STAGING_DIR -Recurse -Force -ErrorAction SilentlyContinue }; if ($env:AUDORA_RELAUNCH_EXE -and (Test-Path -LiteralPath $env:AUDORA_RELAUNCH_EXE)) { Start-Process -FilePath $env:AUDORA_RELAUNCH_EXE }",
+                                ])
+                                .env("AUDORA_PID", std::process::id().to_string())
+                                .env("AUDORA_SRC_DIR", &src_dir)
+                                .env("AUDORA_DEST_DIR", exe_dir)
+                                .env("AUDORA_STAGING_DIR", &staging_dir)
+                                .env("AUDORA_RELAUNCH_EXE", exe_path)
+                                .spawn();
+                            return Ok(NativeSelfUpdateOutcome {
+                                status: "restarting",
+                                message: format!(
+                                    "Verified {zip_name}. Updating portable installation and reopening…"
+                                ),
+                                should_restart: true,
+                                deferred_install: true,
+                            });
+                        }
+                    }
+                }
             }
-            // Spawn detached launcher waiting for `AUDORA_PID` to exit before NSIS overwrites `Audora.exe` (`C-5`).
-            let relaunch_exe = env::current_exe().unwrap_or_default();
-            let mut launch_cmd = Command::new(windows_powershell_path());
-            configure_hidden_windows_command(&mut launch_cmd);
-            let _ = launch_cmd
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-Command",
-                    "Wait-Process -Id $env:AUDORA_PID -Timeout 15 -ErrorAction SilentlyContinue; $p = Start-Process -FilePath $env:AUDORA_SETUP_EXE -Wait -PassThru; if ($env:AUDORA_STAGING_DIR) { Remove-Item -LiteralPath $env:AUDORA_STAGING_DIR -Recurse -Force -ErrorAction SilentlyContinue }; if ($p -and $p.ExitCode -eq 0 -and $env:AUDORA_RELAUNCH_EXE -and (Test-Path -LiteralPath $env:AUDORA_RELAUNCH_EXE)) { Start-Process -FilePath $env:AUDORA_RELAUNCH_EXE }",
-                ])
-                .env("AUDORA_PID", std::process::id().to_string())
-                .env("AUDORA_STAGING_DIR", &staging_dir)
-                .env("AUDORA_SETUP_EXE", &setup_path)
-                .env("AUDORA_RELAUNCH_EXE", &relaunch_exe)
-                .spawn();
-            return Ok((
-                "restarting",
-                format!("Verified and launched {setup_name}."),
-                true,
-            ));
         }
 
         let _ = fs::remove_dir_all(&staging_dir);
         let release_page = format!("https://github.com/{repo}/releases/tag/{tag}");
         open_external_https_url(&release_page);
-        return Ok(("opened_release", format!("Opened {release_page}."), false));
+        Ok(NativeSelfUpdateOutcome {
+            status: "opened_release",
+            message: format!("Opened {release_page}."),
+            should_restart: false,
+            deferred_install: false,
+        })
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = fs::remove_dir_all(&staging_dir);
         let release_page = format!("https://github.com/{repo}/releases/tag/{tag}");
         open_external_https_url(&release_page);
-        Ok((
-            "opened_release",
-            format!("Opened {release_page} in your browser."),
-            false,
-        ))
+        Ok(NativeSelfUpdateOutcome {
+            status: "opened_release",
+            message: format!("Opened {release_page} in your browser."),
+            should_restart: false,
+            deferred_install: false,
+        })
     }
 }
 
@@ -3911,6 +4522,14 @@ fn probe_media_duration_ms(path: &Path) -> Option<u64> {
 fn configure_hidden_windows_command(cmd: &mut Command) -> &mut Command {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+#[cfg(target_os = "windows")]
+fn configure_detached_windows_command(cmd: &mut Command) -> &mut Command {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     cmd
 }
 
@@ -5137,6 +5756,236 @@ mod tests {
         let allowlist = Mutex::new(MediaAllowlist::default());
         let descriptors = build_native_drop_descriptors(&many_paths, &allowlist);
         assert_eq!(descriptors.len(), MAX_NATIVE_DROP_PATHS);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_macos_relauncher_waits_for_pid_exit_and_launches_updated_bundle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            env::temp_dir().join(format!("audora_relaunch_test_{}", generate_session_token()));
+        let mock_app = dir.join("Audora.app");
+        let macos_dir = mock_app.join("Contents").join("MacOS");
+        fs::create_dir_all(&macos_dir).unwrap();
+
+        let open_marker = dir.join("open_marker.txt");
+        let fallback_marker = dir.join("binary_fallback_marker.txt");
+
+        let mock_open_ok = dir.join("mock_open_ok.sh");
+        fs::write(
+            &mock_open_ok,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n",
+                open_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&mock_open_ok, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mock_app_bin = macos_dir.join("audora");
+        fs::write(
+            &mock_app_bin,
+            format!(
+                "#!/bin/sh\nprintf 'launched' > '{}'\n",
+                fallback_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&mock_app_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 1. Primary path: wait until target PID exits, then run `open -n <Audora.app>`.
+        let mut child = Command::new("/bin/sleep").arg("0.4").spawn().unwrap();
+        let wait_pid = child.id();
+        let reaper = thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        spawn_detached_macos_relauncher(wait_pid, &mock_app, &mock_open_ok).unwrap();
+
+        // While the target PID is still alive, relaunch must NOT trigger early.
+        thread::sleep(Duration::from_millis(120));
+        assert!(!open_marker.exists());
+
+        let deadline = Instant::now() + Duration::from_millis(4000);
+        while !open_marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+        }
+        let _ = reaper.join();
+        assert!(open_marker.exists(), "expected open marker to be written");
+        let recorded = fs::read_to_string(&open_marker).unwrap();
+        assert_eq!(recorded, format!("-n {}", mock_app.display()));
+
+        // 2. Fallback path: when `open` fails, launches `Audora.app/Contents/MacOS/audora`.
+        let mock_open_fail = dir.join("mock_open_fail.sh");
+        fs::write(&mock_open_fail, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&mock_open_fail, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child2 = Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        let wait_pid2 = child2.id();
+        let reaper2 = thread::spawn(move || {
+            let _ = child2.wait();
+        });
+        spawn_detached_macos_relauncher(wait_pid2, &mock_app, &mock_open_fail).unwrap();
+
+        let deadline2 = Instant::now() + Duration::from_millis(4000);
+        while !fallback_marker.exists() && Instant::now() < deadline2 {
+            thread::sleep(Duration::from_millis(40));
+        }
+        let _ = reaper2.join();
+        assert!(
+            fallback_marker.exists(),
+            "expected fallback binary marker when open exits non-zero"
+        );
+        assert_eq!(fs::read_to_string(&fallback_marker).unwrap(), "launched");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_portable_tar_update_and_detached_relauncher_replace_and_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = env::temp_dir().join(format!(
+            "audora_unix_portable_update_test_{}",
+            generate_session_token()
+        ));
+        let root = dir.join("install");
+        let bin_dir = root.join("bin");
+        let ui_dir = root.join("share").join("audora").join("ui");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&ui_dir).unwrap();
+
+        let exe_path = bin_dir.join("audora");
+        fs::write(&exe_path, "#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&exe_path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(ui_dir.join("index.html"), "<html>old</html>").unwrap();
+
+        let extract_dir = dir.join("extract");
+        let staged_bin_dir = extract_dir.join("bin");
+        let staged_ui_dir = extract_dir.join("share").join("audora").join("ui");
+        fs::create_dir_all(&staged_bin_dir).unwrap();
+        fs::create_dir_all(&staged_ui_dir).unwrap();
+
+        let relaunch_marker = dir.join("relaunched.txt");
+        fs::write(
+            staged_bin_dir.join("audora"),
+            format!(
+                "#!/bin/sh\nprintf 'new-ok' > '{}'\n",
+                relaunch_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::write(staged_ui_dir.join("index.html"), "<html>new</html>").unwrap();
+
+        apply_unix_portable_tar_update(&extract_dir, &exe_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(ui_dir.join("index.html")).unwrap(),
+            "<html>new</html>"
+        );
+        assert!(!ui_dir.with_file_name(".audora-ui.prev").exists());
+        assert!(!ui_dir.with_file_name(".audora-ui.new").exists());
+        assert!(!bin_dir.join(".audora.bin.new").exists());
+
+        let mut child = Command::new("/bin/sleep").arg("0.25").spawn().unwrap();
+        let wait_pid = child.id();
+        let reaper = thread::spawn(move || {
+            let _ = child.wait();
+        });
+        spawn_detached_unix_binary_relauncher(wait_pid, &exe_path).unwrap();
+
+        thread::sleep(Duration::from_millis(90));
+        assert!(!relaunch_marker.exists());
+
+        let deadline = Instant::now() + Duration::from_millis(4000);
+        while !relaunch_marker.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+        }
+        let _ = reaper.join();
+        assert_eq!(fs::read_to_string(&relaunch_marker).unwrap(), "new-ok");
+
+        // Also verify `spawn_detached_linux_deb_updater` cleans staging and relaunches only on exit 0.
+        let deb_staging_ok = dir.join("deb_stage_ok");
+        fs::create_dir_all(&deb_staging_ok).unwrap();
+        let deb_file_ok = deb_staging_ok.join("audora.deb");
+        fs::write(&deb_file_ok, b"deb").unwrap();
+
+        let deb_relaunch_marker = dir.join("deb_relaunch.txt");
+        let deb_exe = dir.join("deb_audora.sh");
+        fs::write(
+            &deb_exe,
+            format!(
+                "#!/bin/sh\nprintf 'deb-ok' > '{}'\n",
+                deb_relaunch_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&deb_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mock_dpkg = dir.join("mock_dpkg.sh");
+        fs::write(&mock_dpkg, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&mock_dpkg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mock_pkexec_ok = dir.join("mock_pkexec_ok.sh");
+        fs::write(&mock_pkexec_ok, "#!/bin/sh\n\"$@\"\n").unwrap();
+        fs::set_permissions(&mock_pkexec_ok, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child2 = Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        let wait_pid2 = child2.id();
+        let reaper2 = thread::spawn(move || {
+            let _ = child2.wait();
+        });
+        spawn_detached_linux_deb_updater(
+            wait_pid2,
+            &deb_file_ok,
+            &deb_staging_ok,
+            &mock_pkexec_ok,
+            &mock_dpkg,
+            &deb_exe,
+        )
+        .unwrap();
+        let deadline2 = Instant::now() + Duration::from_millis(4000);
+        while !deb_relaunch_marker.exists() && Instant::now() < deadline2 {
+            thread::sleep(Duration::from_millis(40));
+        }
+        let _ = reaper2.join();
+        assert!(!deb_staging_ok.exists());
+        assert_eq!(fs::read_to_string(&deb_relaunch_marker).unwrap(), "deb-ok");
+
+        let _ = fs::remove_file(&deb_relaunch_marker);
+        let deb_staging_fail = dir.join("deb_stage_fail");
+        fs::create_dir_all(&deb_staging_fail).unwrap();
+        let deb_file_fail = deb_staging_fail.join("audora.deb");
+        fs::write(&deb_file_fail, b"deb").unwrap();
+        let mock_pkexec_fail = dir.join("mock_pkexec_fail.sh");
+        fs::write(&mock_pkexec_fail, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&mock_pkexec_fail, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child3 = Command::new("/bin/sleep").arg("0.05").spawn().unwrap();
+        let wait_pid3 = child3.id();
+        let reaper3 = thread::spawn(move || {
+            let _ = child3.wait();
+        });
+        spawn_detached_linux_deb_updater(
+            wait_pid3,
+            &deb_file_fail,
+            &deb_staging_fail,
+            &mock_pkexec_fail,
+            &mock_dpkg,
+            &deb_exe,
+        )
+        .unwrap();
+        let deadline3 = Instant::now() + Duration::from_millis(4000);
+        while deb_staging_fail.exists() && Instant::now() < deadline3 {
+            thread::sleep(Duration::from_millis(40));
+        }
+        let _ = reaper3.join();
+        thread::sleep(Duration::from_millis(120));
+        assert!(!deb_staging_fail.exists());
+        assert!(!deb_relaunch_marker.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

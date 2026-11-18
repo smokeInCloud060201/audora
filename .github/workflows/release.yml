@@ -324,6 +324,7 @@ jobs:
           Name "Audora ${CLEAN_VERSION}"
           OutFile "../${SETUP_EXE}"
           InstallDir "\$LOCALAPPDATA\\Programs\\Audora"
+          InstallDirRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "InstallLocation"
           RequestExecutionLevel user
           !insertmacro MUI_PAGE_DIRECTORY
           !insertmacro MUI_PAGE_INSTFILES
@@ -344,6 +345,7 @@ jobs:
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayName" "Audora"
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayVersion" "${CLEAN_VERSION}"
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "DisplayIcon" '"\$INSTDIR\\Audora.ico"'
+            WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "InstallLocation" "\$INSTDIR"
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "Publisher" "Audora Contributors"
             WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Audora" "UninstallString" '"\$INSTDIR\\Uninstall.exe"'
           SectionEnd

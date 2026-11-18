@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ authors = ["Audora Contributors"]
 repository = "https://github.com/smokeInCloud060201/audora"
 
 [workspace.dependencies]
-audora-core = { version = "1.1.1", path = "crates/audora-core" }
+audora-core = { version = "1.1.2", path = "crates/audora-core" }
 getrandom = "0.2"
 rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

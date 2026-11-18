@@ -2,6 +2,17 @@
 
 All notable changes to Audora are documented in this file.
 
+## [1.1.2] - 2026-11-18
+
+### Fixed
+- **Automatic Queue Advancement on Track Completion:** Fixed end-of-stream playback transitions so finishing an audio or video file automatically advances to and plays the next available item in the session queue (`00:00` start, honoring **Repeat Off / All / One** and **Shuffle**).
+  - Guarded `timeupdate`, `ended`, `loadedmetadata`, `canplay`, and `error` media element callbacks by `mediaId` and load `generation` to eliminate a double-end race on `.mp4` / `.m4a` / `.m4v` / `.mov` streams that previously skipped or immediately ended the next queued track.
+  - Keyed `<audio>` and `<video>` elements by `activeMedia.id` with `autoPlay` and restored `defaultPlaybackRate`, `playbackRate`, `preservesPitch`, `volume`, and `muted` on metadata load for reliable `WKWebView` transitions without speed resets.
+  - Updated queue navigation (`Ended`, `Next`, `Previous`, and `removeFromQueue`) across both UI IPC and `audora-core` to automatically skip missing/offline or disabled-folder items to reach the next playable track, and clamped near-EOF `Resume where I left off` positions on direct Library opens.
+
+### Documentation
+- **User-Friendly README & Developer Guide:** Refreshed `README.md` for end users and added a dedicated `DEVELOPMENT.md` guide covering local setup, architecture, testing, and release packaging.
+
 ## [1.1.1] - 2026-11-17
 
 ### Fixed

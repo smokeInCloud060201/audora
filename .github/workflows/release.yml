@@ -84,6 +84,7 @@ jobs:
           pnpm verify:release
 
       - name: Build release workspace binaries & run release tests
+        shell: bash
         run: |
           cargo test --workspace --release
           cargo build --workspace --release

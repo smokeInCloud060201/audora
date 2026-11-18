@@ -77,6 +77,7 @@ jobs:
           pnpm audit --audit-level=high --ignore GHSA-fc5q-39xc-vjpf
 
       - name: Frontend typecheck, unit tests, production bundle & release gate
+        shell: bash
         run: |
           pnpm typecheck
           pnpm test:ui

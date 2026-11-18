@@ -2457,7 +2457,7 @@ Properties:
         assert_eq!(failed_snap.duration_ms, None);
         assert_eq!(failed_snap.position_ms, 0);
 
-        // `open_media_batch` pre-validates remote URLs and preserves trailing spaces in paths
+        // `open_media_batch` pre-validates remote URLs, strips leading whitespace + CRLF, and preserves POSIX trailing spaces
         assert_eq!(
             dispatcher
                 .open_media_batch(&["rtmp://evil.example/live".to_owned()])
@@ -2465,13 +2465,24 @@ Properties:
                 .code,
             ErrorCode::ValidationFailed
         );
-        let spaced_dir = temp.path().join("Folder Space ");
+        let spaced_dir = temp.path().join("Folder With Spaces");
         fs::create_dir_all(&spaced_dir).expect("spaced dir");
-        create_dummy_media_file(&temp, "Folder Space /clip.mp4", b"clip-bytes");
+        create_dummy_media_file(&temp, "Folder With Spaces/clip.mp4", b"clip-bytes");
         let spaced_opened = dispatcher
-            .open_media_batch(&[spaced_dir.to_str().unwrap().to_owned()])
-            .expect("open folder with trailing space");
+            .open_media_batch(&[format!("  {}\r\n", spaced_dir.to_str().unwrap())])
+            .expect("open folder with interior spaces and CRLF wrapper");
         assert_eq!(spaced_opened.len(), 1);
+
+        #[cfg(unix)]
+        {
+            let trailing_dir = temp.path().join("Folder Space ");
+            fs::create_dir_all(&trailing_dir).expect("trailing space dir");
+            create_dummy_media_file(&temp, "Folder Space /clip.mp4", b"clip-bytes");
+            let trailing_opened = dispatcher
+                .open_media_batch(&[trailing_dir.to_str().unwrap().to_owned()])
+                .expect("open folder with trailing space on unix");
+            assert_eq!(trailing_opened.len(), 1);
+        }
 
         // `SqliteMediaRepository::upsert_media` reloads via validated path & `relink_path` enforces AV-201 inside tx
         let repo = SqliteMediaRepository::new(v4_db.clone());
